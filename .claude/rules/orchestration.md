@@ -18,3 +18,8 @@ The main session is the orchestrator and manager. Implementation work goes to Op
 - **Parallelize when independent.** Backend and frontend run concurrently against the
   contract. Integration (running `npm run tauri dev`, release build) happens after both report.
 - **Scratch files** go in the session scratchpad directory, never in the repo.
+- **Keep a git history.** The repo is on `main`. Commit after each verified milestone (gate
+  passing), one logical change per commit: contract/spec changes separately from implementation,
+  backend and frontend halves separately when they land separately. Subagents do not commit; the
+  orchestrator commits after re-running the gate. Never push until the user provides the remote
+  and asks for it.
