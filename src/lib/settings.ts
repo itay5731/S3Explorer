@@ -5,6 +5,7 @@ import {
   AUTO_PART_SIZE_MIB,
   MIN_UPLOAD_PART_MIB,
   TRANSFER_SETTINGS_LIMITS,
+  type AppSettings,
   type TransferKind,
   type TransferSettings,
 } from "./types";
@@ -71,3 +72,18 @@ export function planParts(kind: TransferKind, partSizeMib: number | null, size: 
 
 /** Worst-case part size for memory estimates (Auto can use 16 MiB parts). */
 export const worstCasePartMib = (partSizeMib: number | null) => partSizeMib ?? AUTO_PART_SIZE_MIB.large;
+
+/** Full settings comparison (transfer fields plus the v0.3.0 fields). */
+export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
+  sameSettings(a, b) && a.theme === b.theme && a.checkUpdatesOnStartup === b.checkUpdatesOnStartup;
+
+/** Like `validateSettings`, also checking `theme` and `checkUpdatesOnStartup`. */
+export function validateAppSettings(s: AppSettings): { field: keyof AppSettings; message: string } | null {
+  const transfer = validateSettings(s);
+  if (transfer) return transfer;
+  if (s.theme !== "system" && s.theme !== "light" && s.theme !== "dark") {
+    return { field: "theme", message: "Must be one of system, light, dark." };
+  }
+  if (typeof s.checkUpdatesOnStartup !== "boolean") return { field: "checkUpdatesOnStartup", message: "Must be true or false." };
+  return null;
+}

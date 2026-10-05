@@ -1,15 +1,51 @@
-import { useEffect, useState, type FormEvent } from "react";
-import { ChevronRight, Eye, EyeOff, KeyRound, Loader2, RefreshCw, UserRound, Server, AlertCircle } from "lucide-react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
+} from "react";
+import {
+  AlertCircle,
+  AlertTriangle,
+  ArrowLeft,
+  ChevronRight,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Loader2,
+  LockKeyhole,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Server,
+  Trash2,
+  UserRound,
+} from "lucide-react";
 import * as api from "../lib/api";
-import type { AppError, ConnectionConfig, ProfileInfo } from "../lib/types";
+import {
+  SAVED_CONNECTION_NAME_MAX,
+  type AppError,
+  type ConnectionConfig,
+  type ProfileInfo,
+  type SavedConnection,
+} from "../lib/types";
+import { formatExact, formatRelative } from "../lib/format";
 import { setConnected, writePref } from "../store/app";
+import { toast } from "../store/toasts";
 import { Logo } from "./Logo";
 import { SettingsButton } from "./SettingsDialog";
 
 type Mode = "profile" | "static";
 
-/** What we remember between launches. Never contains secrets. */
-interface SavedConnection {
+/**
+ * The last unsaved connection, remembered between launches for people who don't save
+ * connections. Never contains secrets.
+ */
+interface LastUsed {
   mode: Mode;
   profile: string;
   profileRegion: string;
@@ -21,46 +57,358 @@ interface SavedConnection {
 }
 
 const PREF_KEY = "s3x.lastConnection";
+const KEYCHAIN_LINE = "Secret keys are stored in your operating system's keychain, not in a file.";
 
-function loadSaved(): SavedConnection {
-  const defaults: SavedConnection = {
-    mode: "profile",
-    profile: "",
-    profileRegion: "",
-    profileEndpoint: "",
-    accessKeyId: "",
-    region: "us-east-1",
-    endpoint: "",
-    forcePathStyle: true,
-  };
+const LAST_USED_DEFAULTS: LastUsed = {
+  mode: "profile",
+  profile: "",
+  profileRegion: "",
+  profileEndpoint: "",
+  accessKeyId: "",
+  region: "us-east-1",
+  endpoint: "",
+  forcePathStyle: true,
+};
+
+function loadLastUsed(): LastUsed {
   try {
     const raw = localStorage.getItem(PREF_KEY);
-    return raw ? { ...defaults, ...(JSON.parse(raw) as Partial<SavedConnection>) } : defaults;
+    return raw ? { ...LAST_USED_DEFAULTS, ...(JSON.parse(raw) as Partial<LastUsed>) } : LAST_USED_DEFAULTS;
   } catch {
-    return defaults;
+    return LAST_USED_DEFAULTS;
   }
 }
 
+// ---- display helpers -----------------------------------------------------------------
+
+function endpointHost(endpoint: string | null): string {
+  if (!endpoint) return "AWS";
+  try {
+    return new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint) ? endpoint : `https://${endpoint}`).host || endpoint;
+  } catch {
+    return endpoint;
+  }
+}
+
+const shortKey = (k: string) => (k.length > 12 ? `${k.slice(0, 4)}…${k.slice(-4)}` : k);
+
+/** Message for an error from a saved-connection command; keychain errors get specific advice. */
+function describeError(e: AppError, during: "save" | "connect"): string {
+  if (e.code !== "Keychain") return e.message;
+  const what =
+    during === "save"
+      ? "Couldn't save to your operating system's keychain."
+      : "Couldn't read the secret key from your operating system's keychain.";
+  return `${what} The keychain may be locked or unavailable. Unlock it (or sign in to your desktop session) and try again. Details: ${e.message}`;
+}
+
+const isMissingSecret = (e: AppError, c: SavedConnection) =>
+  e.code === "InvalidInput" && c.kind === "static" && (!c.hasSecret || /secret/i.test(e.message));
+
+// ---- saved connection row --------------------------------------------------------------
+
+function RowMenu({
+  conn,
+  anchor,
+  onEdit,
+  onDelete,
+  onClose,
+}: {
+  conn: SavedConnection;
+  anchor: RefObject<HTMLButtonElement | null>;
+  onEdit(): void;
+  onDelete(): void;
+  onClose(refocus: boolean): void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+
+  // Fixed position next to the trigger so the scrolling list never clips the menu.
+  useLayoutEffect(() => {
+    const a = anchor.current?.getBoundingClientRect();
+    const m = ref.current?.getBoundingClientRect();
+    if (!a || !m) return;
+    const below = a.bottom + 4;
+    const top = below + m.height > window.innerHeight - 6 ? Math.max(6, a.top - m.height - 4) : below;
+    setPos({ left: Math.max(6, Math.min(a.right - m.width, window.innerWidth - m.width - 6)), top });
+  }, [anchor]);
+
+  // Focus the first item once the menu is visible (hidden elements can't take focus).
+  const placed = pos !== null;
+  useEffect(() => {
+    if (placed) ref.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [placed]);
+
+  useEffect(() => {
+    const onDown = (e: MouseEvent) => {
+      if (!ref.current?.contains(e.target as Node) && !anchor.current?.contains(e.target as Node)) onClose(false);
+    };
+    const dismiss = () => onClose(false);
+    window.addEventListener("mousedown", onDown, true);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("blur", dismiss);
+    window.addEventListener("wheel", dismiss, { passive: true });
+    return () => {
+      window.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("blur", dismiss);
+      window.removeEventListener("wheel", dismiss);
+    };
+  }, [anchor, onClose]);
+
+  const onKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const btns = [...(ref.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+    const i = btns.indexOf(document.activeElement as HTMLButtonElement);
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      onClose(true);
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const next = e.key === "ArrowDown" ? (i + 1) % btns.length : (i - 1 + btns.length) % btns.length;
+      btns[next]?.focus();
+    } else if (e.key === "Tab") {
+      onClose(false);
+    }
+  };
+
+  return (
+    <div
+      ref={ref}
+      className="context-menu row-menu"
+      role="menu"
+      aria-label={`Actions for ${conn.name}`}
+      onKeyDown={onKey}
+      style={{ left: pos?.left ?? 0, top: pos?.top ?? 0, visibility: pos ? "visible" : "hidden" }}
+    >
+      <button type="button" role="menuitem" className="menu-item" onClick={onEdit}>
+        <Pencil size={14} />
+        <span className="menu-label">Edit…</span>
+      </button>
+      <button type="button" role="menuitem" className="menu-item danger" onClick={onDelete}>
+        <Trash2 size={14} />
+        <span className="menu-label">Delete…</span>
+      </button>
+    </div>
+  );
+}
+
+function SavedRow({
+  conn,
+  busy,
+  disabled,
+  menuOpen,
+  onConnect,
+  onToggleMenu,
+  onEdit,
+  onDelete,
+}: {
+  conn: SavedConnection;
+  busy: boolean;
+  disabled: boolean;
+  menuOpen: boolean;
+  onConnect(): void;
+  onToggleMenu(open: boolean): void;
+  onEdit(): void;
+  onDelete(): void;
+}) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const Icon = conn.kind === "profile" ? UserRound : KeyRound;
+  const meta: { text: string; mono?: boolean }[] = [{ text: endpointHost(conn.endpoint) }];
+  if (conn.region) meta.push({ text: conn.region });
+  if (conn.kind === "profile") meta.push({ text: `profile ${conn.profile ?? "?"}` });
+  else if (conn.accessKeyId) meta.push({ text: shortKey(conn.accessKeyId), mono: true });
+  const missing = conn.kind === "static" && !conn.hasSecret;
+  return (
+    <li className={`saved-row ${menuOpen ? "menu-open" : ""}`}>
+      <button
+        type="button"
+        className="saved-main"
+        onClick={onConnect}
+        disabled={disabled}
+        aria-label={`Connect to ${conn.name}`}
+        aria-describedby={`saved-meta-${conn.id}`}
+      >
+        <span className={`saved-icon ${conn.kind}`}>
+          <Icon size={15} />
+        </span>
+        <span className="saved-text">
+          <span className="saved-name">{conn.name}</span>
+          <span className="saved-meta" id={`saved-meta-${conn.id}`}>
+            {meta.map((m, i) => (
+              <span key={i} className={m.mono ? "mono" : undefined}>
+                {m.text}
+              </span>
+            ))}
+            {missing && <span className="saved-warn">secret missing</span>}
+          </span>
+        </span>
+        <span className="saved-used" title={conn.lastUsedAt ? `Last used ${formatExact(conn.lastUsedAt)}` : undefined}>
+          {conn.lastUsedAt ? formatRelative(conn.lastUsedAt) : "never used"}
+        </span>
+        {busy ? <Loader2 size={15} className="spin saved-go" /> : <ChevronRight size={15} className="saved-go" />}
+      </button>
+      <div className="saved-more">
+        <button
+          ref={triggerRef}
+          type="button"
+          className="icon-btn lg"
+          aria-label={`More actions for ${conn.name}`}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          disabled={disabled}
+          onClick={() => onToggleMenu(!menuOpen)}
+        >
+          <MoreHorizontal size={15} />
+        </button>
+        {menuOpen && (
+          <RowMenu
+            conn={conn}
+            anchor={triggerRef}
+            onEdit={onEdit}
+            onDelete={onDelete}
+            onClose={(refocus) => {
+              onToggleMenu(false);
+              if (refocus) triggerRef.current?.focus();
+            }}
+          />
+        )}
+      </div>
+    </li>
+  );
+}
+
+// ---- delete confirmation -----------------------------------------------------------------
+
+function DeleteSavedModal({ conn, onClose, onDeleted }: { conn: SavedConnection; onClose(): void; onDeleted(): void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<AppError | null>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const opener = document.activeElement as HTMLElement | null;
+    cancelRef.current?.focus();
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  }, []);
+
+  const confirm = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.deleteSavedConnection(conn.id);
+      toast.success(`Deleted “${conn.name}”`);
+      onDeleted();
+    } catch (e) {
+      setError(e as AppError);
+      setBusy(false);
+    }
+  };
+
+  const onKey = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Escape" && !busy) {
+      e.preventDefault();
+      onClose();
+    } else if (e.key === "Tab" && dialogRef.current) {
+      const items = [...dialogRef.current.querySelectorAll<HTMLButtonElement>("button:not([disabled])")];
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()} onKeyDown={onKey}>
+      <div ref={dialogRef} className="modal" role="alertdialog" aria-modal="true" aria-labelledby="del-saved-title" aria-describedby="del-saved-desc">
+        <div className="modal-head">
+          <div className="modal-icon danger">
+            <AlertTriangle size={18} />
+          </div>
+          <div>
+            <h2 id="del-saved-title">Delete “{conn.name}”?</h2>
+            <p className="muted small">The saved connection is removed from S3 Explorer.</p>
+          </div>
+        </div>
+        <p className="modal-text" id="del-saved-desc">
+          {conn.kind === "static" ? (
+            <>
+              The secret key stored for it in your operating system's keychain is <strong>removed too</strong>. Your
+              data in S3 is not affected.
+            </>
+          ) : (
+            <>Your AWS profile in ~/.aws is not changed, and your data in S3 is not affected.</>
+          )}
+        </p>
+        {error && (
+          <div className="form-error" role="alert">
+            <AlertCircle size={15} />
+            <span>{describeError(error, "save")}</span>
+          </div>
+        )}
+        <div className="modal-actions">
+          <button ref={cancelRef} type="button" className="btn" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button type="button" className="btn btn-danger" onClick={() => void confirm()} disabled={busy}>
+            {busy && <Loader2 size={14} className="spin" />} {busy ? "Deleting…" : "Delete"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- screen ------------------------------------------------------------------------------
+
+type View = "loading" | "saved" | "form";
+
 export function ConnectScreen() {
-  const [saved] = useState(loadSaved);
-  const [mode, setMode] = useState<Mode>(saved.mode);
+  const [lastUsed] = useState(loadLastUsed);
+  const [mode, setMode] = useState<Mode>(lastUsed.mode);
   const [profiles, setProfiles] = useState<ProfileInfo[] | null>(null);
   const [profilesError, setProfilesError] = useState<AppError | null>(null);
-  const [profile, setProfile] = useState(saved.profile);
-  const [profileRegion, setProfileRegion] = useState(saved.profileRegion);
-  const [profileEndpoint, setProfileEndpoint] = useState(saved.profileEndpoint);
-  const [showAdvanced, setShowAdvanced] = useState(!!(saved.profileRegion || saved.profileEndpoint));
+  const [profile, setProfile] = useState(lastUsed.profile);
+  const [profileRegion, setProfileRegion] = useState(lastUsed.profileRegion);
+  const [profileEndpoint, setProfileEndpoint] = useState(lastUsed.profileEndpoint);
+  const [showAdvanced, setShowAdvanced] = useState(!!(lastUsed.profileRegion || lastUsed.profileEndpoint));
 
-  const [accessKeyId, setAccessKeyId] = useState(saved.accessKeyId);
+  const [accessKeyId, setAccessKeyId] = useState(lastUsed.accessKeyId);
   const [secret, setSecret] = useState("");
   const [showSecret, setShowSecret] = useState(false);
   const [sessionToken, setSessionToken] = useState("");
-  const [region, setRegion] = useState(saved.region);
-  const [endpoint, setEndpoint] = useState(saved.endpoint);
-  const [forcePathStyle, setForcePathStyle] = useState(saved.forcePathStyle);
+  const [region, setRegion] = useState(lastUsed.region);
+  const [endpoint, setEndpoint] = useState(lastUsed.endpoint);
+  const [forcePathStyle, setForcePathStyle] = useState(lastUsed.forcePathStyle);
+
+  // Saved connections
+  const [saved, setSaved] = useState<SavedConnection[] | null>(null);
+  const [savedError, setSavedError] = useState<AppError | null>(null);
+  const [view, setView] = useState<View>("loading");
+  const [editing, setEditing] = useState<SavedConnection | null>(null);
+  const [editNotice, setEditNotice] = useState<string | null>(null);
+  const [saveChecked, setSaveChecked] = useState(false);
+  const [name, setName] = useState("");
+  const [nameTouched, setNameTouched] = useState(false);
+  const [saveError, setSaveError] = useState<AppError | null>(null);
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<SavedConnection | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<AppError | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
+
+  const nameRef = useRef<HTMLInputElement>(null);
+  const secretRef = useRef<HTMLInputElement>(null);
+  const cardRef = useRef<HTMLFormElement>(null);
 
   const loadProfiles = async () => {
     setProfiles(null);
@@ -78,39 +426,168 @@ export function ConnectScreen() {
     }
   };
 
+  const loadSaved = async (): Promise<SavedConnection[]> => {
+    try {
+      const list = await api.listSavedConnections();
+      setSaved(list);
+      setSavedError(null);
+      return list;
+    } catch (e) {
+      setSavedError(e as AppError);
+      setSaved((cur) => cur ?? []);
+      return saved ?? [];
+    }
+  };
+
   useEffect(() => {
     void loadProfiles();
+    void loadSaved().then((list) => setView(list.length ? "saved" : "form"));
   }, []);
 
-  const canSubmit =
-    !connecting &&
-    (mode === "profile" ? !!profile : !!accessKeyId.trim() && !!secret.trim() && !!region.trim());
+  const busy = connecting || busyId !== null;
+  const hasSaved = !!saved && saved.length > 0;
+  const tokenEntered = mode === "static" && !!sessionToken.trim();
+  /** Saving applies: always while editing; otherwise when the box is checked and no session token blocks it. */
+  const wantsSave = !!editing || (saveChecked && !tokenEntered);
+  const keepsSecret = !!editing && editing.kind === "static" && editing.hasSecret;
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!canSubmit) return;
-    const config: ConnectionConfig =
-      mode === "profile"
-        ? {
-            kind: "profile",
-            profile,
-            region: profileRegion.trim() || null,
-            endpoint: profileEndpoint.trim() || null,
-          }
-        : {
-            kind: "static",
-            accessKeyId: accessKeyId.trim(),
-            secretAccessKey: secret.trim(),
-            sessionToken: sessionToken.trim() || null,
-            region: region.trim(),
-            endpoint: endpoint.trim() || null,
-            forcePathStyle: endpoint.trim() ? forcePathStyle : undefined,
-          };
-    setConnecting(true);
+  const trimmedName = name.trim();
+  const nameError = !wantsSave
+    ? null
+    : !trimmedName
+      ? "Enter a name for this connection."
+      : [...trimmedName].length > SAVED_CONNECTION_NAME_MAX
+        ? `Use at most ${SAVED_CONNECTION_NAME_MAX} characters.`
+        : saved?.some((c) => c.id !== editing?.id && c.name.toLowerCase() === trimmedName.toLowerCase())
+          ? `A saved connection named “${trimmedName}” already exists.`
+          : null;
+
+  const secretOk = !!secret.trim() || keepsSecret;
+  const canSubmit = !busy && (mode === "profile" ? !!profile : !!accessKeyId.trim() && secretOk && !!region.trim());
+  /** An empty name is only flagged once the field was touched; other name problems show at once. */
+  const showNameError = !!nameError && (nameTouched || !!trimmedName);
+
+  const clearErrors = () => {
     setError(null);
+    setErrorText(null);
+    setSaveError(null);
+  };
+
+  const fillFromLastUsed = () => {
+    setMode(lastUsed.mode);
+    setProfile(lastUsed.profile || profiles?.find((p) => p.hasCredentials)?.name || "");
+    setProfileRegion(lastUsed.profileRegion);
+    setProfileEndpoint(lastUsed.profileEndpoint);
+    setShowAdvanced(!!(lastUsed.profileRegion || lastUsed.profileEndpoint));
+    setAccessKeyId(lastUsed.accessKeyId);
+    setRegion(lastUsed.region);
+    setEndpoint(lastUsed.endpoint);
+    setForcePathStyle(lastUsed.forcePathStyle);
+    setSecret("");
+    setSessionToken("");
+  };
+
+  const focusFirstField = () => requestAnimationFrame(() => cardRef.current?.querySelector<HTMLElement>("[data-autofocus]")?.focus());
+
+  const openNew = () => {
+    clearErrors();
+    setEditing(null);
+    setEditNotice(null);
+    setSaveChecked(false);
+    setName("");
+    setNameTouched(false);
+    fillFromLastUsed();
+    setView("form");
+    focusFirstField();
+  };
+
+  const openEdit = (c: SavedConnection, notice: string | null = null) => {
+    clearErrors();
+    setMenuFor(null);
+    setEditing(c);
+    setEditNotice(notice);
+    setName(c.name);
+    setNameTouched(false);
+    setMode(c.kind);
+    if (c.kind === "profile") {
+      setProfile(c.profile ?? "");
+      setProfileRegion(c.region ?? "");
+      setProfileEndpoint(c.endpoint ?? "");
+      setShowAdvanced(!!(c.region || c.endpoint));
+    } else {
+      setAccessKeyId(c.accessKeyId ?? "");
+      setRegion(c.region ?? "");
+      setEndpoint(c.endpoint ?? "");
+      setForcePathStyle(c.forcePathStyle);
+    }
+    setSecret("");
+    setShowSecret(false);
+    setSessionToken("");
+    setView("form");
+    requestAnimationFrame(() => (notice ? secretRef.current : nameRef.current)?.focus());
+  };
+
+  const backToSaved = () => {
+    clearErrors();
+    setEditing(null);
+    setEditNotice(null);
+    fillFromLastUsed();
+    setView(hasSaved ? "saved" : "form");
+  };
+
+  /** Default name offered when the user ticks "Save this connection". */
+  const suggestName = () => {
+    const base = mode === "profile" ? profile || "AWS profile" : endpoint.trim() ? endpointHost(endpoint.trim()) : `AWS ${region.trim() || "S3"}`;
+    const taken = new Set((saved ?? []).map((c) => c.name.toLowerCase()));
+    let candidate = base.slice(0, SAVED_CONNECTION_NAME_MAX);
+    for (let i = 2; taken.has(candidate.toLowerCase()); i++) candidate = `${base.slice(0, SAVED_CONNECTION_NAME_MAX - 5)} (${i})`;
+    return candidate;
+  };
+
+  const buildConfig = (): ConnectionConfig =>
+    mode === "profile"
+      ? { kind: "profile", profile, region: profileRegion.trim() || null, endpoint: profileEndpoint.trim() || null }
+      : {
+          kind: "static",
+          accessKeyId: accessKeyId.trim(),
+          secretAccessKey: secret.trim(),
+          sessionToken: wantsSave ? null : sessionToken.trim() || null,
+          region: region.trim(),
+          endpoint: endpoint.trim() || null,
+          forcePathStyle: endpoint.trim() ? forcePathStyle : undefined,
+        };
+
+  /** Connect through `connect_saved` (updates lastUsedAt). Opens Edit when the secret is missing. */
+  const connectSaved = async (c: SavedConnection, fromForm: boolean) => {
+    clearErrors();
+    if (fromForm) setConnecting(true);
+    else setBusyId(c.id);
+    try {
+      const info = await api.connectSaved(c.id);
+      setConnected(info);
+    } catch (e) {
+      const err = e as AppError;
+      setConnecting(false);
+      setBusyId(null);
+      const list = await loadSaved();
+      const fresh = list.find((x) => x.id === c.id) ?? c;
+      if (isMissingSecret(err, fresh)) {
+        openEdit(fresh, `The secret key for “${fresh.name}” isn't in the keychain any more. Enter it again to connect.`);
+        return;
+      }
+      setError(err);
+      setErrorText(describeError(err, "connect"));
+      if (fromForm) setEditing(fresh);
+    }
+  };
+
+  const connectWithoutSaving = async () => {
+    const config = buildConfig();
+    setConnecting(true);
+    clearErrors();
     try {
       const info = await api.connect(config);
-      const toSave: SavedConnection = {
+      const toRemember: LastUsed = {
         mode,
         profile,
         profileRegion: profileRegion.trim(),
@@ -120,35 +597,233 @@ export function ConnectScreen() {
         endpoint: endpoint.trim(),
         forcePathStyle,
       };
-      writePref(PREF_KEY, toSave);
+      writePref(PREF_KEY, toRemember);
       setConnected(info);
     } catch (err) {
       setError(err as AppError);
+      setErrorText((err as AppError).message);
       setConnecting(false);
     }
   };
+
+  const run = async (connectAfter: boolean) => {
+    setNameTouched(true);
+    if (!canSubmit) return;
+    if (wantsSave && nameError) {
+      nameRef.current?.focus();
+      return;
+    }
+    if (!wantsSave) {
+      await connectWithoutSaving();
+      return;
+    }
+    clearErrors();
+    setConnecting(true);
+    let stored: SavedConnection;
+    try {
+      // On update an empty secret keeps the stored one.
+      stored = await api.saveConnection({ id: editing?.id ?? null, name: trimmedName, config: buildConfig() });
+    } catch (e) {
+      // Nothing was saved; never fall back to connecting silently.
+      setSaveError(e as AppError);
+      setConnecting(false);
+      return;
+    }
+    setSaved((cur) => [...(cur ?? []).filter((c) => c.id !== stored.id), stored]);
+    // From here on this form edits the stored connection, so retrying never creates a duplicate.
+    setEditing(stored);
+    setSaveChecked(false);
+    setSecret("");
+    if (!connectAfter) {
+      setConnecting(false);
+      toast.success(`Saved “${stored.name}”`);
+      await loadSaved();
+      setEditing(null);
+      setEditNotice(null);
+      fillFromLastUsed();
+      setView("saved");
+      return;
+    }
+    await connectSaved(stored, true);
+  };
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void run(true);
+  };
+
+  // ---- render ----
+
+  const header = (
+    <div className="connect-head">
+      <Logo size={40} />
+      <div>
+        <h1>S3 Explorer</h1>
+        <p className="muted">Connect to Amazon S3 or any S3-compatible storage.</p>
+      </div>
+    </div>
+  );
+
+  const errorBox = (error || savedError) && (
+    <div className="form-error" role="alert">
+      <AlertCircle size={15} />
+      <span>{errorText ?? error?.message ?? `Couldn't load saved connections: ${savedError?.message}`}</span>
+    </div>
+  );
+
+  if (view === "loading") {
+    return (
+      <div className="connect-screen">
+        <div className="screen-corner">
+          <SettingsButton />
+        </div>
+        <div className="connect-card" aria-busy="true">
+          {header}
+          <div className="profile-list">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className="profile-row skeleton" />
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (view === "saved") {
+    return (
+      <div className="connect-screen">
+        <div className="screen-corner">
+          <SettingsButton />
+        </div>
+        <div className="connect-card">
+          {header}
+          <div className="connect-body">
+            <div className="field-label-row">
+              <span className="field-label" id="saved-title">
+                Saved connections
+              </span>
+              <button type="button" className="link-btn" onClick={openNew} disabled={busy}>
+                <Plus size={12} /> New connection
+              </button>
+            </div>
+            <ul className="saved-list" aria-labelledby="saved-title">
+              {saved!.map((c) => (
+                <SavedRow
+                  key={c.id}
+                  conn={c}
+                  busy={busyId === c.id}
+                  disabled={busy}
+                  menuOpen={menuFor === c.id}
+                  onConnect={() => void connectSaved(c, false)}
+                  onToggleMenu={(open) => setMenuFor(open ? c.id : null)}
+                  onEdit={() => openEdit(c)}
+                  onDelete={() => {
+                    setMenuFor(null);
+                    setDeleting(c);
+                  }}
+                />
+              ))}
+            </ul>
+            <p className="hint">
+              <LockKeyhole size={12} /> {KEYCHAIN_LINE}
+            </p>
+          </div>
+          {errorBox}
+        </div>
+        {deleting && (
+          <DeleteSavedModal
+            conn={deleting}
+            onClose={() => setDeleting(null)}
+            onDeleted={() => {
+              setDeleting(null);
+              void loadSaved().then((list) => {
+                if (!list.length) openNew();
+              });
+            }}
+          />
+        )}
+      </div>
+    );
+  }
+
+  const nameField = (
+    <label className="field">
+      <span className="field-label">Name</span>
+      <input
+        ref={nameRef}
+        value={name}
+        onChange={(e) => {
+          setName(e.target.value);
+          setSaveError(null);
+        }}
+        onBlur={() => setNameTouched(true)}
+        maxLength={SAVED_CONNECTION_NAME_MAX}
+        placeholder="e.g. Production"
+        spellCheck={false}
+        aria-invalid={showNameError || saveError?.code === "InvalidInput"}
+        aria-describedby="save-name-msg"
+      />
+    </label>
+  );
+
+  const nameMessage =
+    saveError && saveError.code === "InvalidInput" ? (
+      <p id="save-name-msg" className="hint err-text" role="alert">
+        {saveError.message}
+      </p>
+    ) : showNameError ? (
+      <p id="save-name-msg" className="hint err-text">
+        {nameError}
+      </p>
+    ) : (
+      <p id="save-name-msg" className="hint">
+        {mode === "static" ? (
+          <>
+            <LockKeyhole size={12} /> {KEYCHAIN_LINE}
+          </>
+        ) : (
+          "Saves the profile name, region and endpoint. Credentials stay in ~/.aws."
+        )}
+      </p>
+    );
 
   return (
     <div className="connect-screen">
       <div className="screen-corner">
         <SettingsButton />
       </div>
-      <form className="connect-card" onSubmit={submit}>
-        <div className="connect-head">
-          <Logo size={40} />
-          <div>
-            <h1>S3 Explorer</h1>
-            <p className="muted">Connect to Amazon S3 or any S3-compatible storage.</p>
-          </div>
-        </div>
+      <form ref={cardRef} className="connect-card" onSubmit={submit} noValidate>
+        {header}
 
-        <div className="segmented" role="tablist">
+        {(hasSaved || editing) && (
+          <div className="form-nav">
+            <button type="button" className="link-btn" onClick={backToSaved} disabled={busy}>
+              <ArrowLeft size={12} /> Saved connections
+            </button>
+            {editing && (
+              <span className="form-nav-title">
+                Editing <strong>{editing.name}</strong>
+              </span>
+            )}
+          </div>
+        )}
+
+        {editNotice && (
+          <div className="callout warn" role="alert">
+            <AlertTriangle size={15} />
+            <span>{editNotice}</span>
+          </div>
+        )}
+
+        <div className="segmented" role="tablist" aria-label="Connection type">
           <button
             type="button"
             role="tab"
             aria-selected={mode === "profile"}
             className={mode === "profile" ? "active" : ""}
             onClick={() => setMode("profile")}
+            disabled={!!editing && editing.kind !== "profile"}
+            data-autofocus={mode === "profile" ? "" : undefined}
           >
             <UserRound size={14} /> AWS profile
           </button>
@@ -158,6 +833,8 @@ export function ConnectScreen() {
             aria-selected={mode === "static"}
             className={mode === "static" ? "active" : ""}
             onClick={() => setMode("static")}
+            disabled={!!editing && editing.kind !== "static"}
+            data-autofocus={mode === "static" ? "" : undefined}
           >
             <KeyRound size={14} /> Access keys
           </button>
@@ -171,9 +848,8 @@ export function ConnectScreen() {
                 <RefreshCw size={12} /> Reload
               </button>
             </div>
-            <div className="profile-list" role="radiogroup">
-              {profiles === null &&
-                [0, 1, 2].map((i) => <div key={i} className="profile-row skeleton" />)}
+            <div className="profile-list" role="radiogroup" aria-label="AWS profiles">
+              {profiles === null && [0, 1, 2].map((i) => <div key={i} className="profile-row skeleton" />)}
               {profiles?.length === 0 && (
                 <div className="empty-note">
                   {profilesError ? profilesError.message : "No profiles found. Use access keys instead."}
@@ -202,7 +878,7 @@ export function ConnectScreen() {
               ))}
             </div>
 
-            <button type="button" className="disclosure" onClick={() => setShowAdvanced((v) => !v)}>
+            <button type="button" className="disclosure" onClick={() => setShowAdvanced((v) => !v)} aria-expanded={showAdvanced}>
               <ChevronRight size={14} className={showAdvanced ? "rot90" : ""} /> Advanced
             </button>
             {showAdvanced && (
@@ -235,9 +911,11 @@ export function ConnectScreen() {
               <span className="field-label">Secret access key</span>
               <div className="input-affix">
                 <input
+                  ref={secretRef}
                   type={showSecret ? "text" : "password"}
                   value={secret}
                   onChange={(e) => setSecret(e.target.value)}
+                  placeholder={keepsSecret ? "Leave blank to keep the saved secret" : undefined}
                   autoComplete="off"
                   spellCheck={false}
                   className="mono"
@@ -247,12 +925,14 @@ export function ConnectScreen() {
                 </button>
               </div>
             </label>
-            <label className="field">
-              <span className="field-label">
-                Session token <span className="optional">optional</span>
-              </span>
-              <input value={sessionToken} onChange={(e) => setSessionToken(e.target.value)} autoComplete="off" spellCheck={false} className="mono" />
-            </label>
+            {!editing && (
+              <label className="field">
+                <span className="field-label">
+                  Session token <span className="optional">optional</span>
+                </span>
+                <input value={sessionToken} onChange={(e) => setSessionToken(e.target.value)} autoComplete="off" spellCheck={false} className="mono" />
+              </label>
+            )}
             <div className="grid-2">
               <label className="field">
                 <span className="field-label">Region</span>
@@ -275,21 +955,83 @@ export function ConnectScreen() {
               <Server size={13} />
               Force path-style addressing
             </label>
-            <p className="hint">Secrets stay in memory and are never saved to disk by the UI.</p>
           </div>
         )}
 
-        {error && (
-          <div className="form-error">
+        <div className="save-box">
+          {editing ? (
+            <>
+              {nameField}
+              {nameMessage}
+            </>
+          ) : (
+            <>
+              <label className={`check ${tokenEntered ? "disabled" : ""}`}>
+                <input
+                  type="checkbox"
+                  checked={saveChecked && !tokenEntered}
+                  disabled={tokenEntered}
+                  aria-describedby={tokenEntered ? "save-token-note" : undefined}
+                  onChange={(e) => {
+                    setSaveChecked(e.target.checked);
+                    setSaveError(null);
+                    if (e.target.checked) {
+                      if (!name.trim()) setName(suggestName());
+                      requestAnimationFrame(() => nameRef.current?.select());
+                    }
+                  }}
+                />
+                Save this connection
+              </label>
+              {tokenEntered ? (
+                <p id="save-token-note" className="hint">
+                  Temporary credentials with a session token can't be saved.
+                </p>
+              ) : saveChecked ? (
+                <>
+                  {nameField}
+                  {nameMessage}
+                </>
+              ) : mode === "static" ? (
+                <p className="hint">Secrets stay in memory unless you save the connection.</p>
+              ) : null}
+            </>
+          )}
+        </div>
+
+        {saveError && saveError.code !== "InvalidInput" && (
+          <div className="form-error" role="alert">
             <AlertCircle size={15} />
-            <span>{error.message}</span>
+            <div className="form-error-body">
+              <span>
+                <strong>The connection was not saved.</strong> {describeError(saveError, "save")}
+              </span>
+              {!editing && (
+                <button type="button" className="btn" onClick={() => void connectWithoutSaving()} disabled={busy}>
+                  Connect without saving
+                </button>
+              )}
+            </div>
           </div>
         )}
+        {errorBox}
 
-        <button type="submit" className="btn btn-primary btn-block" disabled={!canSubmit}>
-          {connecting ? <Loader2 size={15} className="spin" /> : null}
-          {connecting ? "Connecting…" : "Connect"}
-        </button>
+        {editing ? (
+          <div className="form-actions">
+            <button type="button" className="btn" onClick={() => void run(false)} disabled={!canSubmit}>
+              Save
+            </button>
+            <button type="submit" className="btn btn-primary" disabled={!canSubmit}>
+              {connecting ? <Loader2 size={15} className="spin" /> : null}
+              {connecting ? "Connecting…" : "Save and connect"}
+            </button>
+          </div>
+        ) : (
+          <button type="submit" className="btn btn-primary btn-block" disabled={!canSubmit}>
+            {connecting ? <Loader2 size={15} className="spin" /> : null}
+            {connecting ? "Connecting…" : wantsSave ? "Save and connect" : "Connect"}
+          </button>
+        )}
       </form>
     </div>
   );

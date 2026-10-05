@@ -2,15 +2,18 @@
 // Inside Tauri every call goes through `invoke` / `listen`; in a plain browser
 // (`npm run dev`) everything is routed to the in-memory mock in `./mock.ts`.
 
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   TRANSFER_PROGRESS_EVENT,
+  UPDATE_PROGRESS_EVENT,
   type AppError,
+  type AppSettings,
   type Bucket,
   type ConnectionConfig,
   type ConnectionInfo,
@@ -19,8 +22,11 @@ import {
   type ListPage,
   type ObjectMeta,
   type ProfileInfo,
+  type SaveConnectionInput,
+  type SavedConnection,
   type Transfer,
-  type TransferSettings,
+  type UpdateInfo,
+  type UpdateProgress,
 } from "./types";
 
 export type Unlisten = () => void;
@@ -48,8 +54,19 @@ export interface Backend {
   removeTransfer(id: string): Promise<void>;
   listTransfers(): Promise<Transfer[]>;
   onTransferProgress(cb: (t: Transfer) => void): Promise<Unlisten>;
-  getSettings(): Promise<TransferSettings>;
-  updateSettings(settings: TransferSettings): Promise<TransferSettings>;
+  getSettings(): Promise<AppSettings>;
+  updateSettings(settings: AppSettings): Promise<AppSettings>;
+  // Saved connections
+  listSavedConnections(): Promise<SavedConnection[]>;
+  saveConnection(input: SaveConnectionInput): Promise<SavedConnection>;
+  deleteSavedConnection(id: string): Promise<void>;
+  connectSaved(id: string): Promise<ConnectionInfo>;
+  // Updates
+  checkForUpdate(): Promise<UpdateInfo>;
+  installUpdate(): Promise<void>;
+  onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<Unlisten>;
+  appVersion(): Promise<string>;
+  openExternal(url: string): Promise<void>;
   // Platform helpers (dialogs, paths, shell, drag & drop)
   pickFiles(): Promise<string[]>;
   pickSavePath(defaultName: string): Promise<string | null>;
@@ -63,7 +80,7 @@ export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in
 
 const ERROR_CODES: readonly string[] = [
   "NotConnected", "Auth", "NoSuchBucket", "NoSuchKey", "AccessDenied",
-  "Network", "Io", "Cancelled", "InvalidInput", "Unknown",
+  "Network", "Io", "Cancelled", "InvalidInput", "Keychain", "Unknown",
 ];
 
 /** Turn whatever `invoke` (or a plugin) rejected with into an `AppError`. */
@@ -100,8 +117,17 @@ const tauriBackend: Backend = {
   removeTransfer: (id) => invoke<void>("remove_transfer", { id }),
   listTransfers: () => invoke<Transfer[]>("list_transfers"),
   onTransferProgress: (cb) => listen<Transfer>(TRANSFER_PROGRESS_EVENT, (e) => cb(e.payload)),
-  getSettings: () => invoke<TransferSettings>("get_settings"),
-  updateSettings: (settings) => invoke<TransferSettings>("update_settings", { settings }),
+  getSettings: () => invoke<AppSettings>("get_settings"),
+  updateSettings: (settings) => invoke<AppSettings>("update_settings", { settings }),
+  listSavedConnections: () => invoke<SavedConnection[]>("list_saved_connections"),
+  saveConnection: (input) => invoke<SavedConnection>("save_connection", { input }),
+  deleteSavedConnection: (id) => invoke<void>("delete_saved_connection", { id }),
+  connectSaved: (id) => invoke<ConnectionInfo>("connect_saved", { id }),
+  checkForUpdate: () => invoke<UpdateInfo>("check_for_update"),
+  installUpdate: () => invoke<void>("install_update"),
+  onUpdateProgress: (cb) => listen<UpdateProgress>(UPDATE_PROGRESS_EVENT, (e) => cb(e.payload)),
+  appVersion: () => getVersion(),
+  openExternal: (url) => openUrl(url),
 
   async pickFiles() {
     const res = await open({ multiple: true, directory: false, title: "Upload files" });
@@ -179,7 +205,22 @@ export const removeTransfer = (id: string) => call("removeTransfer", id);
 export const listTransfers = () => call("listTransfers");
 export const onTransferProgress = (cb: (t: Transfer) => void) => call("onTransferProgress", cb);
 export const getSettings = () => call("getSettings");
-export const updateSettings = (settings: TransferSettings) => call("updateSettings", settings);
+export const updateSettings = (settings: AppSettings) => call("updateSettings", settings);
+
+export const listSavedConnections = () => call("listSavedConnections");
+export const saveConnection = (input: SaveConnectionInput) => call("saveConnection", input);
+export const deleteSavedConnection = (id: string) => call("deleteSavedConnection", id);
+export const connectSaved = (id: string) => call("connectSaved", id);
+
+export const checkForUpdate = () => call("checkForUpdate");
+export const installUpdate = () => call("installUpdate");
+export const onUpdateProgress = (cb: (p: UpdateProgress) => void) => call("onUpdateProgress", cb);
+export const appVersion = () => call("appVersion");
+/** Open an http(s) URL in the system browser. */
+export const openExternal = (url: string): Promise<void> =>
+  /^https:\/\//i.test(url)
+    ? call("openExternal", url)
+    : Promise.reject<void>({ code: "InvalidInput", message: "Only https links can be opened." } satisfies AppError);
 
 export const pickFiles = () => call("pickFiles");
 export const pickSavePath = (defaultName: string) => call("pickSavePath", defaultName);

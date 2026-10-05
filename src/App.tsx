@@ -7,7 +7,8 @@ import { ConnectScreen } from "./components/ConnectScreen";
 import { Explorer } from "./components/Explorer";
 import { Toasts } from "./components/Toasts";
 import { SettingsDialog } from "./components/SettingsDialog";
-import { loadSettings } from "./store/settings";
+import { loadSettings, useSettings } from "./store/settings";
+import { scheduleStartupCheck } from "./store/updates";
 
 export default function App() {
   const connected = useApp((s) => s.connection !== null);
@@ -15,9 +16,13 @@ export default function App() {
 
   useEffect(() => {
     let stop: (() => void) | null = null;
+    let cancelUpdateCheck: (() => void) | null = null;
     let disposed = false;
     // Settings work while disconnected, so load them independently of the connection.
-    void loadSettings();
+    void loadSettings().then(() => {
+      // Optional silent update check a few seconds after launch; never installs anything.
+      if (!disposed && useSettings.getState().settings?.checkUpdatesOnStartup) cancelUpdateCheck = scheduleStartupCheck();
+    });
     startTransferSync()
       .then((s) => (disposed ? s() : (stop = s)))
       .catch(() => {});
@@ -31,6 +36,7 @@ export default function App() {
     return () => {
       disposed = true;
       stop?.();
+      cancelUpdateCheck?.();
     };
   }, []);
 

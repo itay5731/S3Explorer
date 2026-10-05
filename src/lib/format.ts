@@ -1,6 +1,7 @@
 // Formatting and S3 key/path helpers. Pure functions only.
 
-const UNITS = ["B", "KB", "MB", "GB", "TB", "PB"];
+/** Binary units: sizes are computed in powers of 1024, so they are labelled KiB, MiB, ... */
+const UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 
 export function formatBytes(bytes: number, digits = 1): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
@@ -17,7 +18,7 @@ export function formatBytes(bytes: number, digits = 1): string {
 export function formatSpeed(bytesPerSec: number): string {
   if (!bytesPerSec) return "—";
   const mb = bytesPerSec / (1024 * 1024);
-  return `${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)} MB/s`;
+  return `${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)} MiB/s`;
 }
 
 export function formatDuration(seconds: number): string {
