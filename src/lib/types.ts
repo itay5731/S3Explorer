@@ -205,3 +205,6 @@ export type UpdatePhase = "downloading" | "installing" | "restarting";
 export interface UpdateProgress { phase: UpdatePhase; downloadedBytes: number; totalBytes: number | null }
 
 export const UPDATE_PROGRESS_EVENT = "update:progress";
+
+/** Downloads buffer at most this much per in-flight part; larger parts are streamed to disk. */
+export const DOWNLOAD_BUFFER_CAP_MIB = 16;

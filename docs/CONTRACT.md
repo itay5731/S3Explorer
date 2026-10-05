@@ -157,7 +157,8 @@ up to 8 concurrent parts.
 - Toolchain: `src-tauri/rust-toolchain.toml` pins rustc 1.94.1 (required by aws-sdk-s3 1.152).
 - `start_download` also returns `InvalidInput` when `destPath` is relative, contains a `..` component, or is the destination of another queued/running download (compared case-insensitively on Windows).
 - Downloads are consistency-checked: every GET sends `If-Match` with the ETag from `HeadObject`; a transfer fails if the object changed, if received bytes differ from the expected size, or if the server ignores `Range`.
-- Stalled connections: 30 s read timeout plus a 30 s idle timeout per body chunk; both surface as `Network` and are retried per part (3 attempts).
+- Stalled connections (downloads): a response that sends no bytes is cut off by the SDK's stalled-stream protection (about 5 s) or our 30 s idle timeout; both surface as `Network`. The part is retried and **resumes from the bytes already written** (`Range` from the resume offset, still with `If-Match`). A part fails only after 3 consecutive attempts that received nothing. `transferredBytes` never decreases.
+- Uploads: requests that carry a body (`PutObject`, `UploadPart`) run without a read timeout, because the SDK's read timeout would include the time spent sending the body and break slow links. They rely on connect timeout, TCP errors and stalled-stream protection.
 - Uploads stream each part from disk (no whole-part buffering). `CreateMultipartUpload` and `CompleteMultipartUpload` are not interruptible; cancel takes effect between them.
 - Frontend: local file names derived from S3 keys are sanitized (path separators, reserved characters and names, `.`/`..`) and de-duplicated case-insensitively before download.
 - Security: `tauri.conf.json` sets a restrictive CSP (`default-src 'self'`, `connect-src ipc: http://ipc.localhost`); `devCsp` is null so Vite HMR works in dev.
@@ -198,9 +199,11 @@ Semantics:
 - **Upload splitting:** S3 requires every non-final part to be at least 5 MiB and at most 10,000
   parts. Uploads therefore use `max(partSize, 5 MiB)`, grown further if needed to stay within
   10,000 parts; a file is multipart when larger than that effective part size. Auto keeps today's behavior.
-- **Memory:** a download holds up to `maxConcurrentParts × partSize` in RAM per running transfer
-  (uploads stream from disk). The UI shows this estimate and warns above 1 GiB total
-  (`maxConcurrentTransfers × maxConcurrentParts × partSize`).
+- **Memory:** a download holds up to `maxConcurrentParts × min(partSize, 16 MiB)` in RAM per running
+  transfer: parts up to 16 MiB are held whole and written once, larger parts are streamed to disk in
+  1 MiB batches (v0.3.0; before that memory grew with part size). Uploads stream from disk. The UI
+  shows this estimate (`DOWNLOAD_BUFFER_CAP_MIB` in `types.ts`) and warns above 1 GiB total
+  (`maxConcurrentTransfers × maxConcurrentParts × min(partSize, 16 MiB)`).
 - `Transfer.partsTotal` reflects the part size the transfer actually used.
 
 Implementation notes (settled during implementation):
