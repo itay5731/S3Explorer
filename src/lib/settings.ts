@@ -51,10 +51,15 @@ export function downloadPartBytes(partSizeMib: number | null, size: number): num
   return (size > GIB ? AUTO_PART_SIZE_MIB.large : AUTO_PART_SIZE_MIB.standard) * MIB;
 }
 
-/** Upload part size in bytes: at least the S3 minimum, grown to stay within 10,000 parts. */
+/**
+ * Upload part size in bytes, mirroring `upload_part_size` in src-tauri/src/transfers/plan.rs:
+ * `max(setting, 5 MiB)` (Auto: 8 MiB at every size; the 16 MiB step is download-only), doubled
+ * until the file fits in 10,000 parts.
+ */
 export function uploadPartBytes(partSizeMib: number | null, size: number): number {
-  let part = Math.max(downloadPartBytes(partSizeMib, size), MIN_UPLOAD_PART_MIB * MIB);
-  if (Math.ceil(size / part) > MAX_UPLOAD_PARTS) part = Math.ceil(size / MAX_UPLOAD_PARTS / MIB) * MIB;
+  let part =
+    partSizeMib === null ? AUTO_PART_SIZE_MIB.standard * MIB : Math.max(partSizeMib * MIB, MIN_UPLOAD_PART_MIB * MIB);
+  while (Math.ceil(size / part) > MAX_UPLOAD_PARTS) part *= 2;
   return part;
 }
 
