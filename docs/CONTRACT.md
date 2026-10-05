@@ -157,8 +157,8 @@ up to 8 concurrent parts.
 - Toolchain: `src-tauri/rust-toolchain.toml` pins rustc 1.94.1 (required by aws-sdk-s3 1.152).
 - `start_download` also returns `InvalidInput` when `destPath` is relative, contains a `..` component, or is the destination of another queued/running download (compared case-insensitively on Windows).
 - Downloads are consistency-checked: every GET sends `If-Match` with the ETag from `HeadObject`; a transfer fails if the object changed, if received bytes differ from the expected size, or if the server ignores `Range`.
-- Stalled connections (downloads): a response that sends no bytes is cut off by the SDK's stalled-stream protection (about 5 s) or our 30 s idle timeout; both surface as `Network`. The part is retried and **resumes from the bytes already written** (`Range` from the resume offset, still with `If-Match`). A part fails only after 3 consecutive attempts that received nothing. `transferredBytes` never decreases.
-- Uploads: requests that carry a body (`PutObject`, `UploadPart`) run without a read timeout, because the SDK's read timeout would include the time spent sending the body and break slow links. They rely on connect timeout, TCP errors and stalled-stream protection.
+- Stalled connections (downloads): a response that sends no bytes is cut off by the SDK's stalled-stream protection (about 5 s) or our 30 s idle timeout; both surface as `Network`. The part is retried and **resumes from the bytes already written** (`Range` from the resume offset, still with `If-Match`). An attempt counts as progress only if it delivered at least 64 KiB (or the rest of the part, if smaller); a part fails after 3 consecutive attempts without progress, or when its total budget of `3 + ceil(partLen / 1 MiB)` attempts (at most 1,000) is used up. A response checksum mismatch fails immediately and is not retried. If every byte of a part has arrived and the connection then errors, the part is complete. `transferredBytes` never decreases. Both the single-request and the ranged path flush the file to disk before the final rename.
+- Uploads: requests that carry a body (`PutObject`, `UploadPart`) do not use the SDK's read timeout, because it would include the time spent sending the body and break slow links. Each attempt instead has a timeout scaled to its size: `60 s + bodyLen × share / 32 KiB/s`, capped at 6 h, where `share` is `maxConcurrentParts × maxConcurrentTransfers` (the assumed minimum uplink is shared by everything in flight). A request whose server never answers therefore fails (after the SDK's retries) instead of hanging.
 - Uploads stream each part from disk (no whole-part buffering). `CreateMultipartUpload` and `CompleteMultipartUpload` are not interruptible; cancel takes effect between them.
 - Frontend: local file names derived from S3 keys are sanitized (path separators, reserved characters and names, `.`/`..`) and de-duplicated case-insensitively before download.
 - Security: `tauri.conf.json` sets a restrictive CSP (`default-src 'self'`, `connect-src ipc: http://ipc.localhost`); `devCsp` is null so Vite HMR works in dev.
@@ -442,6 +442,23 @@ status or phase change. First event has status `queued`; the last carries `finis
   copies). Content headers, user metadata and storage class are carried over explicitly.
 - During listing `totalItems` is a running count and becomes exact when the phase changes to `working`.
 
+**Added after the v0.3.0 code review (all enforced, each with a regression test):**
+
+- **A delete is counted only when the server confirms it.** A key counts as deleted only if the `DeleteObjects`
+  response lists it under `Deleted`. A key in neither list gets one `HeadObject` (not found → deleted); otherwise
+  it is a per-object failure ("The server did not confirm the delete."). An error entry that names no key fails
+  its whole batch. The same rule governs the source deletes of a move: an unconfirmed source is reported as
+  "the copy exists and the original remains", never as moved.
+- **A move needs an ETag for every source.** If the listing has none, the listing phase fetches it with
+  `HeadObject`; if there is still none, that object is not moved. Copies do not need one.
+- **Listings follow the continuation token**, whatever `IsTruncated` says. A truncated page without a token, or a
+  token the server already returned, is an error; a partial listing is never acted on. For `list_objects`,
+  `isTruncated` is true exactly when `nextContinuationToken` is non-null.
+- **Server-side copies** have a timeout scaled to the object size (`5 min + bytes / 2 MiB/s`, between 15 min and 6 h).
+- In development and test builds a panic inside a job or transfer ends it as `failed` and releases its slot; an
+  unfinished multipart upload or copy is aborted when its task is dropped. Release builds abort the process on
+  panic, as before.
+
 ### Updates
 
 The app can check GitHub Releases for a newer version and install it. Installation uses the Tauri
@@ -493,6 +510,7 @@ interface UpdateProgress { phase: UpdatePhase; downloadedBytes: number; totalByt
 - **Update progress on Windows** ends with `installing`: the installer takes over, closes the app and restarts
   it. `restarting` is emitted on macOS and Linux only.
 - **`check_for_update` when the repository has no releases** returns `available: false`, not an error.
+- **A stalled update download** (60 s without data) is abandoned with a `Network` error. Signature verification is unaffected.
 - **Opening links:** the app may open only `https://github.com/yonatand/S3Explorer/*` in the browser
   (capability scope). `downloadUrl` is always inside that prefix.
 - **Messages the UI relies on:** a missing secret → `InvalidInput` containing the word "secret"; installs
