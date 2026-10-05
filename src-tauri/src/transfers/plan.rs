@@ -134,4 +134,31 @@ mod tests {
             assert!(p.parts <= MAX_UPLOAD_PARTS && p.part_size >= MIN_UPLOAD_PART_SIZE, "{mib}: {p:?}");
         }
     }
+
+    /// The matrix the TypeScript mirror (`planParts` in src/lib/settings.ts) is checked against.
+    #[test]
+    fn frontend_mirror_matrix() {
+        let sizes = [40 * MIB, GIB, 3 * GIB, 60_000 * MIB];
+        // (size index, setting, part size MiB, parts)
+        let uploads: [(usize, Option<u32>, u64, u64); 16] = [
+            (0, None, 8, 5), (0, Some(1), 5, 8), (0, Some(5), 5, 8), (0, Some(64), 64, 1),
+            (1, None, 8, 128), (1, Some(1), 5, 205), (1, Some(5), 5, 205), (1, Some(64), 64, 16),
+            (2, None, 8, 384), (2, Some(1), 5, 615), (2, Some(5), 5, 615), (2, Some(64), 64, 48),
+            (3, None, 8, 7_500), (3, Some(1), 10, 6_000), (3, Some(5), 10, 6_000), (3, Some(64), 64, 938),
+        ];
+        for (i, setting, mib, parts) in uploads {
+            let p = plan_upload(sizes[i], setting);
+            assert_eq!((p.part_size, p.parts), (mib * MIB, parts), "upload {i} {setting:?}");
+        }
+        let downloads: [(usize, Option<u32>, u64, u64); 16] = [
+            (0, None, 8, 5), (0, Some(1), 1, 40), (0, Some(4), 4, 10), (0, Some(64), 64, 1),
+            (1, None, 8, 128), (1, Some(1), 1, 1_024), (1, Some(4), 4, 256), (1, Some(64), 64, 16),
+            (2, None, 16, 192), (2, Some(1), 1, 3_072), (2, Some(4), 4, 768), (2, Some(64), 64, 48),
+            (3, None, 16, 3_750), (3, Some(1), 1, 60_000), (3, Some(4), 4, 15_000), (3, Some(64), 64, 938),
+        ];
+        for (i, setting, mib, parts) in downloads {
+            let p = plan_download(sizes[i], setting);
+            assert_eq!((p.part_size, p.parts), (mib * MIB, parts), "download {i} {setting:?}");
+        }
+    }
 }
