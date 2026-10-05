@@ -15,7 +15,6 @@ project's updater key. Signature verification is never bypassed or made optional
 - **Local builds** never produce update packages (`createUpdaterArtifacts` is off by default and is
   switched on by CI), so `npm run tauri build` works without the key.
 - The update manifest is `latest.json`, attached to each GitHub Release and fetched from
-  `releases/latest/download/latest.json`. Pre-release tags (with a `-`, e.g. `v0.3.0-rc.1`) are
-  published as GitHub pre-releases, which `releases/latest` ignores, so they never reach users.
+  `releases/latest/download/latest.json`. A tag containing a `-` would be published as a GitHub pre-release, which `releases/latest` ignores. That is a safety net, not an invitation: see `versioning.md`, tags are never created to test the pipeline.
 - Update checks must never run in automated tests against the real repository in a way that installs
   anything. Never click "Install and restart" on the owner's machine from an agent.
