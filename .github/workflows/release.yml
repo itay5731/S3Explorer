@@ -2,11 +2,15 @@ name: Build executables
 
 # Tauri cannot cross-compile, so each OS builds its own binary.
 #
-# - Push a tag like v0.2.0: builds every platform, then publishes a GitHub Release whose text
+# - Push a tag like v0.3.0: builds every platform, then publishes a GitHub Release whose text
 #   is that version's section of CHANGELOG.md, with the executables and installers attached.
+#   A tag with a hyphen (v0.3.0-rc.1) is published as a pre-release.
 # - Run manually without a tag: builds only, downloadable as workflow artifacts.
 # - Run manually with an existing tag (e.g. v0.1.0): builds that tag and publishes its Release,
 #   taking the notes from CHANGELOG.md on the branch the workflow is run from.
+#
+# In-app updates: when the repository secret TAURI_SIGNING_PRIVATE_KEY is set, signed update
+# packages and a latest.json manifest are published too. See .claude/rules/updater.md.
 on:
   workflow_dispatch:
     inputs:
@@ -45,7 +49,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libdbus-1-dev pkg-config
 
       - uses: actions/setup-node@v4
         with:
@@ -64,8 +68,22 @@ jobs:
 
       - run: npm ci
 
+      # Update packages for the in-app updater are produced and signed only when the signing key
+      # secret exists. Without it the build is identical minus those files.
       - name: Build app
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "Signing key present: building signed update packages"
+            export TAURI_SIGNING_PRIVATE_KEY="$SIGNING_KEY"
+            export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+            npm run tauri build -- --target ${{ matrix.target }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+          else
+            echo "::notice::TAURI_SIGNING_PRIVATE_KEY is not set: building without signed update packages"
+            npm run tauri build -- --target ${{ matrix.target }}
+          fi
 
       - name: Upload executable and installers
         uses: actions/upload-artifact@v4
@@ -81,6 +99,8 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.rpm
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.app.tar.gz
+            src-tauri/target/${{ matrix.target }}/release/bundle/**/*.sig
 
   release:
     name: Publish release with patch notes
@@ -91,6 +111,7 @@ jobs:
       contents: write
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      REPO: ${{ github.repository }}
     steps:
       # For a tag push this is the tagged commit; for a manual run it is the branch the run was
       # started from, so older tags can be published with notes written later.
@@ -122,9 +143,12 @@ jobs:
             find "$dir" -type f | while read -r file; do
               base="$(basename "$file")"
               case "$base" in
-                s3explorer)     dest="s3explorer-${TAG}-${platform}" ;;
-                s3explorer.exe) dest="s3explorer-${TAG}-${platform}.exe" ;;
-                *)              dest="$(printf '%s' "$base" | tr ' ' '.')" ;;
+                s3explorer)        dest="s3explorer-${TAG}-${platform}" ;;
+                s3explorer.exe)    dest="s3explorer-${TAG}-${platform}.exe" ;;
+                # The macOS update package has the same file name on both architectures.
+                *.app.tar.gz)      dest="S3.Explorer_${TAG#v}_${platform}.app.tar.gz" ;;
+                *.app.tar.gz.sig)  dest="S3.Explorer_${TAG#v}_${platform}.app.tar.gz.sig" ;;
+                *)                 dest="$(printf '%s' "$base" | tr ' ' '.')" ;;
               esac
               if [ -e "release/$dest" ]; then
                 echo "::error::Two files would both be published as $dest"
@@ -135,6 +159,12 @@ jobs:
           done
           ls -la release
 
+      # latest.json is what the in-app updater reads. It is written only when every platform has
+      # a signed update package; otherwise the app still tells users about the new version and
+      # sends them to the download page.
+      - name: Write the updater manifest (latest.json)
+        run: node .github/scripts/write-latest-json.cjs release notes.md
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
@@ -142,3 +172,4 @@ jobs:
           body_path: notes.md
           files: release/*
           fail_on_unmatched_files: true
+          prerelease: ${{ contains(env.TAG, '-') }}
