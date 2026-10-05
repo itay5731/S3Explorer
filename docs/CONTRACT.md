@@ -218,3 +218,216 @@ Implementation notes (settled during implementation):
 - Queued transfers start in FIFO order. A transfer's run slot is released after its final progress event, so the
   number of transfers reported `running` never exceeds `maxConcurrentTransfers` (except right after lowering it).
 - A disk failure while saving returns `Io` and leaves the active settings unchanged.
+
+## v0.3.0 additions
+
+Everything in this section is new in v0.3.0. Where it changes an earlier section, this section wins.
+
+### App settings (extends "Settings")
+
+The settings object stays flat and keeps its three transfer fields. Two fields are added and the
+TypeScript type is renamed `AppSettings` (`TransferSettings` remains as an alias).
+
+```ts
+type ThemeMode = "system" | "light" | "dark";
+interface AppSettings {
+  partSizeMib: number | null;
+  maxConcurrentParts: number;
+  maxConcurrentTransfers: number;
+  theme: ThemeMode;                 // default "system"
+  checkUpdatesOnStartup: boolean;   // default false
+}
+```
+
+- `get_settings` / `update_settings` keep their names and semantics. `update_settings` requires all
+  five fields and rejects an unknown `theme` or a non-boolean `checkUpdatesOnStartup` with `InvalidInput`.
+- A `settings.json` written by v0.2.0 (three fields) loads with the two new fields at their defaults.
+- **Theme:** the frontend applies `theme` by setting `data-theme="light" | "dark"` on `<html>`, or
+  removing the attribute for `"system"` (then `prefers-color-scheme` decides). It applies instantly
+  on change in the Settings dialog (live preview) and reverts if the dialog is cancelled. To avoid a
+  flash at startup the frontend mirrors the last saved theme in `localStorage` and applies it before
+  first render; the backend value is the source of truth.
+
+### Saved connections
+
+Named connections the user can reuse. Metadata is stored in `connections.json` in the app config
+directory (atomic writes, lenient load, same rules as `settings.json`). **Secrets are stored only in
+the operating system keychain** (Windows Credential Manager, macOS Keychain, Linux Secret Service),
+service name `dev.s3explorer.app`, account = the connection id. Secrets are never written to
+`connections.json`, never logged, and never returned to the frontend.
+
+```ts
+interface SavedConnection {
+  id: string;                    // uuid, assigned by the backend
+  name: string;                  // unique, case-insensitive, 1..=64 chars after trimming
+  kind: "profile" | "static";
+  profile: string | null;        // kind = "profile"
+  accessKeyId: string | null;    // kind = "static"
+  region: string | null;
+  endpoint: string | null;
+  forcePathStyle: boolean;
+  hasSecret: boolean;            // kind = "static": a secret is present in the keychain
+  lastUsedAt: string | null;     // ISO-8601, updated by connect_saved
+}
+
+interface SaveConnectionInput {
+  id?: string | null;            // present = update that connection, absent = create
+  name: string;
+  config: ConnectionConfig;      // same shape as `connect`
+}
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_saved_connections` | – | `SavedConnection[]` sorted by `lastUsedAt` desc (never-used last), then name. Works while disconnected. |
+| `save_connection` | `{ input: SaveConnectionInput }` | `SavedConnection`. For `static`, `secretAccessKey` is written to the keychain. On update, an empty `secretAccessKey` means "keep the stored secret". A `sessionToken` is never saved (temporary credentials are not savable): reject with `InvalidInput` if one is supplied. Duplicate name → `InvalidInput`. |
+| `delete_saved_connection` | `{ id }` | `void`. Removes metadata and the keychain entry. Unknown id is a no-op. |
+| `connect_saved` | `{ id }` | `ConnectionInfo`. Loads the secret from the keychain and connects exactly like `connect`. `label` is the saved name. Updates `lastUsedAt`. |
+
+- New `ErrorCode` value: `"Keychain"` — the OS keychain is unavailable or refused access. `save_connection`
+  fails with it and stores nothing (no half-saved connection). `connect_saved` fails with it, or with
+  `InvalidInput` and a clear message if the secret is missing (`hasSecret: false`), so the UI can ask
+  the user to re-enter the secret.
+- Deleting a saved connection does not disconnect an active session that was started from it.
+
+### Object operations (jobs)
+
+Delete, copy, move and rename for objects and folders. Rename is a move within the same folder. S3
+has no rename or move: both are implemented as copy, then delete of the source. These can be long
+running, so they run in the background as **jobs**, reported by events like transfers.
+
+```ts
+type JobKind = "delete" | "copy" | "move";
+type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+type ConflictPolicy = "overwrite" | "skip";
+
+interface JobItem {
+  from: string;            // source key, or source prefix ending in "/" when isPrefix
+  to: string | null;       // destination key / prefix (ending in "/" when isPrefix); null for delete
+  isPrefix: boolean;
+}
+
+interface JobRequest {
+  kind: JobKind;
+  srcBucket: string;
+  destBucket: string | null;       // null for delete; may equal srcBucket
+  items: JobItem[];                // 1..=10,000 items
+  onConflict: ConflictPolicy;      // ignored for delete
+}
+
+interface JobPreview {
+  objects: number;                 // objects that would be affected (prefixes expanded)
+  bytes: number;
+  conflicts: number;               // destination keys that already exist (copy/move)
+  truncated: boolean;              // true when counting stopped at 100,000 objects; numbers are lower bounds
+}
+
+interface JobError { key: string; message: string }
+
+interface Job {
+  id: string;
+  kind: JobKind;
+  srcBucket: string;
+  destBucket: string | null;
+  label: string;                   // short human description, e.g. "Move 3 items to backups/2026/"
+  phase: "listing" | "working" | "done";
+  totalItems: number;              // objects discovered so far; final once phase != "listing"
+  doneItems: number;               // objects fully processed successfully
+  skippedItems: number;            // skipped because of onConflict = "skip"
+  failedItems: number;
+  totalBytes: number;
+  doneBytes: number;
+  status: JobStatus;
+  error: string | null;            // job-level failure (e.g. listing failed)
+  errors: JobError[];              // first 50 per-object errors
+  startedAt: string;
+  finishedAt: string | null;
+}
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `preview_job` | `{ request: JobRequest }` | `JobPreview` — validates the request and counts what it would touch, without changing anything. |
+| `start_job` | `{ request: JobRequest }` | `string` (job id). Validates, then runs in the background. |
+| `cancel_job` | `{ id }` | `void` — cooperative. Work already done stays done. |
+| `remove_job` | `{ id }` | `void` — forget a finished job. `InvalidInput` while queued/running. |
+| `list_jobs` | – | `Job[]` |
+
+Event `job:progress`, payload `Job`: at most every 100 ms per job while running, and always on
+status or phase change. First event has status `queued`; the last carries `finishedAt`.
+
+**Semantics (data safety — these are requirements, not suggestions):**
+
+- **Keys and prefixes are opaque** and passed through byte for byte (see `.claude/rules/data-safety.md`).
+  Prefix items must end with `/`; a prefix of `""` or `"/"` is rejected.
+- **Validation (`InvalidInput`, nothing is changed):** empty items; a copy/move whose destination
+  equals its source; a prefix copied or moved into itself or a descendant of itself (same bucket,
+  `to` starts with `from`); two items that would write the same destination key; `to` missing for
+  copy/move or present for delete; an object destination ending in `/`.
+- **Prefix expansion** lists every key under `from` (no delimiter, paginated) and maps
+  `from + rest` → `to + rest`. The folder marker object is included. An item whose prefix matches
+  nothing is reported as a per-item error, not silently ignored.
+- **Copy:** `CopyObject` for objects up to 5 GiB; multipart copy (`UploadPartCopy`, parts of 256 MiB up to
+  512 MiB grown to stay ≤ 10,000 parts) above that, aborted on failure or cancel. The source's
+  storage class, content type and user metadata are preserved. Objects that cannot be read (e.g.
+  archived in Glacier and not restored) fail individually with a clear message.
+- **Conflicts:** with `skip`, an existing destination key is left untouched, counted in
+  `skippedItems`, and **its source is not deleted** even in a move. With `overwrite` it is replaced.
+- **Move = copy, then delete the source of each object whose copy succeeded.** A source is deleted
+  only after its own copy is confirmed. If a copy fails, that source is never deleted. Sources are
+  deleted in batches as the job progresses, not all at the end, so a cancelled move leaves each
+  object in exactly one place.
+- **Delete:** `DeleteObjects` in batches of 1,000; per-key errors from the response are collected.
+  On a versioned bucket this adds delete markers (older versions remain).
+- **Final status:** `completed` when every object succeeded or was skipped; `failed` when the job
+  could not run or at least one object failed (then `failedItems > 0`, details in `errors`);
+  `cancelled` when cancelled. `doneItems + skippedItems + failedItems == totalItems` at the end
+  unless cancelled.
+- **Concurrency:** up to 16 object operations in flight per job; at most 2 jobs run at once, others
+  queue (FIFO). Jobs do not count against `maxConcurrentTransfers`.
+- Jobs work across buckets on the current connection, including buckets in different regions.
+
+`delete_folder` is **removed**; the UI uses `start_job` with `kind: "delete"`.
+
+### Updates
+
+The app can check GitHub Releases for a newer version and install it. Installation uses the Tauri
+updater plugin, which only installs packages signed with this project's updater key.
+
+```ts
+interface UpdateInfo {
+  currentVersion: string;          // e.g. "0.3.0"
+  available: boolean;
+  latestVersion: string | null;    // null when the check could not determine it
+  notes: string | null;            // patch notes (markdown) of the latest release
+  publishedAt: string | null;      // ISO-8601
+  canInstall: boolean;             // a signed update package exists for this platform
+  downloadUrl: string;             // release page to open when canInstall is false
+}
+
+type UpdatePhase = "downloading" | "installing" | "restarting";
+interface UpdateProgress { phase: UpdatePhase; downloadedBytes: number; totalBytes: number | null }
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `check_for_update` | – | `UpdateInfo`. Works while disconnected. Network failure → `Network` error. |
+| `install_update` | – | `void`. Downloads and installs the update found by the last check, emitting `update:progress`, then restarts the app. `InvalidInput` if no installable update is known. Refused with `InvalidInput` while any transfer or job is queued or running (the UI must say so). |
+
+- Source of truth: `https://github.com/yonatand/S3Explorer/releases/latest`. Pre-releases are ignored.
+- `check_for_update` first asks the updater plugin (endpoint
+  `https://github.com/yonatand/S3Explorer/releases/latest/download/latest.json`). If that manifest is
+  missing or has no entry for this platform, it falls back to the GitHub API
+  (`/repos/yonatand/S3Explorer/releases/latest`), compares versions, and returns `canInstall: false`
+  with `downloadUrl` set, so the user can still be told and download manually.
+- Signature verification is mandatory for installation and is never bypassed. The updater public key
+  is embedded in `tauri.conf.json`; the private key is never in the repository.
+- With `checkUpdatesOnStartup` true the frontend calls `check_for_update` once, a few seconds after
+  startup, silently; it only shows a non-blocking notice when an update is available. It never
+  installs without the user clicking.
+- Event `update:progress`, payload `UpdateProgress`.
+
+### UI text: units
+
+Sizes and speeds are computed in binary units and must be labelled that way: `KiB`, `MiB`, `GiB`,
+`MiB/s`.
