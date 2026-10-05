@@ -5,6 +5,7 @@ import {
   useState,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from "react";
 import {
@@ -12,11 +13,13 @@ import {
   AlertTriangle,
   ArrowLeft,
   ChevronRight,
+  Cloud,
   Eye,
   EyeOff,
   KeyRound,
   Loader2,
   LockKeyhole,
+  LogIn,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -33,11 +36,14 @@ import {
   type ProfileInfo,
   type SavedConnection,
 } from "../lib/types";
-import { formatExact, formatRelative } from "../lib/format";
-import { setConnected, writePref } from "../store/app";
+import { formatExact, formatRelative, nameTone } from "../lib/format";
+import { readPref, setConnected, writePref } from "../store/app";
 import { toast } from "../store/toasts";
 import { Logo } from "./Logo";
 import { SettingsButton } from "./SettingsDialog";
+import { ThemeToggle } from "./ThemeToggle";
+import { TransferBackdrop } from "./TransferBackdrop";
+import { useTileReorder } from "./useTileReorder";
 
 type Mode = "profile" | "static";
 
@@ -57,6 +63,8 @@ interface LastUsed {
 }
 
 const PREF_KEY = "s3x.lastConnection";
+/** The order the user dragged the connection tiles into: a list of saved-connection ids. */
+const ORDER_KEY = "s3x.connectionOrder";
 const KEYCHAIN_LINE = "Secret keys are stored in your operating system's keychain, not in a file.";
 
 const LAST_USED_DEFAULTS: LastUsed = {
@@ -110,12 +118,17 @@ const isMissingSecret = (e: AppError, c: SavedConnection) =>
 function RowMenu({
   conn,
   anchor,
+  point,
+  onConnect,
   onEdit,
   onDelete,
   onClose,
 }: {
   conn: SavedConnection;
   anchor: RefObject<HTMLButtonElement | null>;
+  /** Where the tile was right-clicked; null when the menu was opened from the ⋯ button. */
+  point: { x: number; y: number } | null;
+  onConnect(): void;
   onEdit(): void;
   onDelete(): void;
   onClose(refocus: boolean): void;
@@ -123,15 +136,18 @@ function RowMenu({
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
 
-  // Fixed position next to the trigger so the scrolling list never clips the menu.
+  // Fixed position so the scrolling list never clips the menu: at the pointer after a right-click,
+  // otherwise under the trigger. Either way it flips up and shifts left to stay inside the window.
   useLayoutEffect(() => {
     const a = anchor.current?.getBoundingClientRect();
     const m = ref.current?.getBoundingClientRect();
     if (!a || !m) return;
-    const below = a.bottom + 4;
-    const top = below + m.height > window.innerHeight - 6 ? Math.max(6, a.top - m.height - 4) : below;
-    setPos({ left: Math.max(6, Math.min(a.right - m.width, window.innerWidth - m.width - 6)), top });
-  }, [anchor]);
+    const left = point ? point.x : a.right - m.width;
+    const below = point ? point.y : a.bottom + 4;
+    const above = (point ? point.y : a.top - 4) - m.height;
+    const top = below + m.height > window.innerHeight - 6 ? Math.max(6, above) : below;
+    setPos({ left: Math.max(6, Math.min(left, window.innerWidth - m.width - 6)), top });
+  }, [anchor, point]);
 
   // Focus the first item once the menu is visible (hidden elements can't take focus).
   const placed = pos !== null;
@@ -181,6 +197,10 @@ function RowMenu({
       onKeyDown={onKey}
       style={{ left: pos?.left ?? 0, top: pos?.top ?? 0, visibility: pos ? "visible" : "hidden" }}
     >
+      <button type="button" role="menuitem" className="menu-item" onClick={onConnect}>
+        <LogIn size={14} />
+        <span className="menu-label">Connect</span>
+      </button>
       <button type="button" role="menuitem" className="menu-item" onClick={onEdit}>
         <Pencil size={14} />
         <span className="menu-label">Edit…</span>
@@ -197,7 +217,9 @@ function SavedRow({
   conn,
   busy,
   disabled,
+  dragging,
   menuOpen,
+  onDragStart,
   onConnect,
   onToggleMenu,
   onEdit,
@@ -206,21 +228,40 @@ function SavedRow({
   conn: SavedConnection;
   busy: boolean;
   disabled: boolean;
+  /** This tile is being dragged to a new place. */
+  dragging: boolean;
   menuOpen: boolean;
+  onDragStart(e: ReactPointerEvent): void;
   onConnect(): void;
   onToggleMenu(open: boolean): void;
   onEdit(): void;
   onDelete(): void;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
-  const Icon = conn.kind === "profile" ? UserRound : KeyRound;
+  const [menuPoint, setMenuPoint] = useState<{ x: number; y: number } | null>(null);
+  // A cloud for AWS itself, a server for a custom endpoint (MinIO, R2…).
+  const Icon = conn.endpoint ? Server : Cloud;
   const meta: { text: string; mono?: boolean }[] = [{ text: endpointHost(conn.endpoint) }];
   if (conn.region) meta.push({ text: conn.region });
   if (conn.kind === "profile") meta.push({ text: `profile ${conn.profile ?? "?"}` });
   else if (conn.accessKeyId) meta.push({ text: shortKey(conn.accessKeyId), mono: true });
   const missing = conn.kind === "static" && !conn.hasSecret;
   return (
-    <li className={`saved-row ${menuOpen ? "menu-open" : ""}`}>
+    <li
+      // The tone class gives the whole tile its colour: the badge, and the border while dragging.
+      className={`saved-row tone-${nameTone(conn.name)} ${menuOpen ? "menu-open" : ""} ${dragging ? "dragging" : ""}`}
+      data-id={conn.id}
+      onPointerDown={(e) => {
+        // The ⋯ button and its menu are not drag handles.
+        if (!(e.target as Element).closest(".saved-more")) onDragStart(e);
+      }}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        if (disabled) return;
+        setMenuPoint({ x: e.clientX, y: e.clientY });
+        onToggleMenu(true);
+      }}
+    >
       <button
         type="button"
         className="saved-main"
@@ -229,8 +270,8 @@ function SavedRow({
         aria-label={`Connect to ${conn.name}`}
         aria-describedby={`saved-meta-${conn.id}`}
       >
-        <span className={`saved-icon ${conn.kind}`}>
-          <Icon size={15} />
+        <span className="saved-icon" aria-hidden="true">
+          <Icon size={22} />
         </span>
         <span className="saved-text">
           <span className="saved-name">{conn.name}</span>
@@ -244,9 +285,9 @@ function SavedRow({
           </span>
         </span>
         <span className="saved-used" title={conn.lastUsedAt ? `Last used ${formatExact(conn.lastUsedAt)}` : undefined}>
-          {conn.lastUsedAt ? formatRelative(conn.lastUsedAt) : "never used"}
+          {conn.lastUsedAt ? `Opened ${formatRelative(conn.lastUsedAt)}` : "Not opened yet"}
         </span>
-        {busy ? <Loader2 size={15} className="spin saved-go" /> : <ChevronRight size={15} className="saved-go" />}
+        {busy && <Loader2 size={15} className="spin saved-go" />}
       </button>
       <div className="saved-more">
         <button
@@ -257,7 +298,10 @@ function SavedRow({
           aria-haspopup="menu"
           aria-expanded={menuOpen}
           disabled={disabled}
-          onClick={() => onToggleMenu(!menuOpen)}
+          onClick={() => {
+            setMenuPoint(null);
+            onToggleMenu(!menuOpen);
+          }}
         >
           <MoreHorizontal size={15} />
         </button>
@@ -265,6 +309,11 @@ function SavedRow({
           <RowMenu
             conn={conn}
             anchor={triggerRef}
+            point={menuPoint}
+            onConnect={() => {
+              onToggleMenu(false);
+              onConnect();
+            }}
             onEdit={onEdit}
             onDelete={onDelete}
             onClose={(refocus) => {
@@ -394,7 +443,8 @@ export function ConnectScreen() {
   const [view, setView] = useState<View>("loading");
   const [editing, setEditing] = useState<SavedConnection | null>(null);
   const [editNotice, setEditNotice] = useState<string | null>(null);
-  const [saveChecked, setSaveChecked] = useState(false);
+  // New connections are saved unless the box is unticked.
+  const [saveChecked, setSaveChecked] = useState(true);
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
   const [saveError, setSaveError] = useState<AppError | null>(null);
@@ -409,6 +459,7 @@ export function ConnectScreen() {
   const nameRef = useRef<HTMLInputElement>(null);
   const secretRef = useRef<HTMLInputElement>(null);
   const cardRef = useRef<HTMLFormElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
 
   const loadProfiles = async () => {
     setProfiles(null);
@@ -444,6 +495,36 @@ export function ConnectScreen() {
     void loadSaved().then((list) => setView(list.length ? "saved" : "form"));
   }, []);
 
+  // One turn of the wheel moves the tile list by a whole page (two rows); CSS snapping settles it.
+  useEffect(() => {
+    const list = listRef.current;
+    if (!list) return;
+    let lastTurn = 0;
+    const onWheel = (e: WheelEvent) => {
+      if (list.scrollHeight <= list.clientHeight) return;
+      e.preventDefault();
+      // A trackpad sends a burst of wheel events for one gesture; act on the first only.
+      if (e.timeStamp - lastTurn < 500) return;
+      lastTurn = e.timeStamp;
+      list.scrollBy({ top: Math.sign(e.deltaY) * list.clientHeight, behavior: "smooth" });
+    };
+    list.addEventListener("wheel", onWheel, { passive: false });
+    return () => list.removeEventListener("wheel", onWheel);
+  }, [view]);
+
+  // Tiles appear in the order the user dragged them into; connections not placed yet come last, in
+  // the backend's order (most recently used first).
+  const [order, setOrder] = useState(() => readPref<string[]>(ORDER_KEY, []));
+  const place = (c: SavedConnection) => (order.includes(c.id) ? order.indexOf(c.id) : order.length);
+  const tiles = [...(saved ?? [])].sort((a, b) => place(a) - place(b));
+  const reorder = useTileReorder(
+    tiles.map((c) => c.id),
+    (ids) => {
+      setOrder(ids);
+      writePref(ORDER_KEY, ids);
+    },
+  );
+
   const busy = connecting || busyId !== null;
   const hasSaved = !!saved && saved.length > 0;
   const tokenEntered = mode === "static" && !!sessionToken.trim();
@@ -451,7 +532,16 @@ export function ConnectScreen() {
   const wantsSave = !!editing || (saveChecked && !tokenEntered);
   const keepsSecret = !!editing && editing.kind === "static" && editing.hasSecret;
 
-  const trimmedName = name.trim();
+  /** Name for a new connection when the field is left empty: the profile, endpoint host or region, made unique. */
+  const suggestName = () => {
+    const base = mode === "profile" ? profile || "AWS profile" : endpoint.trim() ? endpointHost(endpoint.trim()) : `AWS ${region.trim() || "S3"}`;
+    const taken = new Set((saved ?? []).map((c) => c.name.toLowerCase()));
+    let candidate = base.slice(0, SAVED_CONNECTION_NAME_MAX);
+    for (let i = 2; taken.has(candidate.toLowerCase()); i++) candidate = `${base.slice(0, SAVED_CONNECTION_NAME_MAX - 5)} (${i})`;
+    return candidate;
+  };
+  // A new connection may leave the name empty and take the suggestion; an edited one may not.
+  const trimmedName = name.trim() || (editing ? "" : suggestName());
   const nameError = !wantsSave
     ? null
     : !trimmedName
@@ -493,7 +583,7 @@ export function ConnectScreen() {
     clearErrors();
     setEditing(null);
     setEditNotice(null);
-    setSaveChecked(false);
+    setSaveChecked(true);
     setName("");
     setNameTouched(false);
     fillFromLastUsed();
@@ -533,15 +623,6 @@ export function ConnectScreen() {
     setEditNotice(null);
     fillFromLastUsed();
     setView(hasSaved ? "saved" : "form");
-  };
-
-  /** Default name offered when the user ticks "Save this connection". */
-  const suggestName = () => {
-    const base = mode === "profile" ? profile || "AWS profile" : endpoint.trim() ? endpointHost(endpoint.trim()) : `AWS ${region.trim() || "S3"}`;
-    const taken = new Set((saved ?? []).map((c) => c.name.toLowerCase()));
-    let candidate = base.slice(0, SAVED_CONNECTION_NAME_MAX);
-    for (let i = 2; taken.has(candidate.toLowerCase()); i++) candidate = `${base.slice(0, SAVED_CONNECTION_NAME_MAX - 5)} (${i})`;
-    return candidate;
   };
 
   const buildConfig = (): ConnectionConfig =>
@@ -674,7 +755,10 @@ export function ConnectScreen() {
   if (view === "loading") {
     return (
       <div className="connect-screen">
+
+        <TransferBackdrop />
         <div className="screen-corner">
+          <ThemeToggle />
           <SettingsButton />
         </div>
         <div className="connect-card" aria-busy="true">
@@ -692,42 +776,49 @@ export function ConnectScreen() {
   if (view === "saved") {
     return (
       <div className="connect-screen">
+
+        <TransferBackdrop />
         <div className="screen-corner">
+          <ThemeToggle />
           <SettingsButton />
         </div>
-        <div className="connect-card">
-          {header}
-          <div className="connect-body">
-            <div className="field-label-row">
-              <span className="field-label" id="saved-title">
-                Saved connections
-              </span>
-              <button type="button" className="link-btn" onClick={openNew} disabled={busy}>
-                <Plus size={12} /> New connection
-              </button>
-            </div>
-            <ul className="saved-list" aria-labelledby="saved-title">
-              {saved!.map((c) => (
-                <SavedRow
-                  key={c.id}
-                  conn={c}
-                  busy={busyId === c.id}
-                  disabled={busy}
-                  menuOpen={menuFor === c.id}
-                  onConnect={() => void connectSaved(c, false)}
-                  onToggleMenu={(open) => setMenuFor(open ? c.id : null)}
-                  onEdit={() => openEdit(c)}
-                  onDelete={() => {
-                    setMenuFor(null);
-                    setDeleting(c);
-                  }}
-                />
-              ))}
-            </ul>
-            <p className="hint">
-              <LockKeyhole size={12} /> {KEYCHAIN_LINE}
-            </p>
+        <div className="connect-home">
+          <div className="brand">S3 Explorer</div>
+          <div className="home-title">
+            <h1>Welcome back</h1>
+            <p className="muted">Choose a connection to open your storage.</p>
           </div>
+          <ul ref={listRef} className="saved-list" aria-label="Saved connections" onClickCapture={reorder.onClickCapture}>
+            {tiles.map((c) => (
+              <SavedRow
+                key={c.id}
+                conn={c}
+                busy={busyId === c.id}
+                disabled={busy}
+                dragging={reorder.draggingId === c.id}
+                onDragStart={(e) => reorder.onPointerDown(e, c.id)}
+                menuOpen={menuFor === c.id}
+                onConnect={() => void connectSaved(c, false)}
+                onToggleMenu={(open) => setMenuFor(open ? c.id : null)}
+                onEdit={() => openEdit(c)}
+                onDelete={() => {
+                  setMenuFor(null);
+                  setDeleting(c);
+                }}
+              />
+            ))}
+            <li className="saved-row saved-new">
+              <button type="button" className="saved-main" onClick={openNew} disabled={busy}>
+                <span className="saved-icon" aria-hidden="true">
+                  <Plus size={20} />
+                </span>
+                <span className="saved-name">New connection</span>
+              </button>
+            </li>
+          </ul>
+          <p className="hint">
+            <LockKeyhole size={12} /> {KEYCHAIN_LINE}
+          </p>
           {errorBox}
         </div>
         {deleting && (
@@ -758,7 +849,7 @@ export function ConnectScreen() {
         }}
         onBlur={() => setNameTouched(true)}
         maxLength={SAVED_CONNECTION_NAME_MAX}
-        placeholder="e.g. Production"
+        placeholder={editing ? "e.g. Production" : suggestName()}
         spellCheck={false}
         aria-invalid={showNameError || saveError?.code === "InvalidInput"}
         aria-describedby="save-name-msg"
@@ -789,7 +880,10 @@ export function ConnectScreen() {
 
   return (
     <div className="connect-screen">
+
+      <TransferBackdrop />
       <div className="screen-corner">
+        <ThemeToggle />
         <SettingsButton />
       </div>
       <form ref={cardRef} className="connect-card" onSubmit={submit} noValidate>
@@ -797,8 +891,8 @@ export function ConnectScreen() {
 
         {(hasSaved || editing) && (
           <div className="form-nav">
-            <button type="button" className="link-btn" onClick={backToSaved} disabled={busy}>
-              <ArrowLeft size={12} /> Saved connections
+            <button type="button" className="btn" onClick={backToSaved} disabled={busy}>
+              <ArrowLeft size={14} /> Back
             </button>
             {editing && (
               <span className="form-nav-title">

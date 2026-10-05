@@ -4,6 +4,8 @@
 import {
   AUTO_PART_SIZE_MIB,
   MIN_UPLOAD_PART_MIB,
+  ACCENT_COLORS,
+  TEXT_SETTINGS_LIMITS,
   TRANSFER_SETTINGS_LIMITS,
   type AppSettings,
   type TransferKind,
@@ -78,9 +80,15 @@ export const worstCasePartMib = (partSizeMib: number | null) =>
 
 /** Full settings comparison (transfer fields plus the v0.3.0 fields). */
 export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
-  sameSettings(a, b) && a.theme === b.theme && a.checkUpdatesOnStartup === b.checkUpdatesOnStartup;
+  sameSettings(a, b) &&
+  a.theme === b.theme &&
+  a.checkUpdatesOnStartup === b.checkUpdatesOnStartup &&
+  a.notifyOnFinish === b.notifyOnFinish &&
+  a.textSize === b.textSize &&
+  a.textWeight === b.textWeight &&
+  a.accent === b.accent;
 
-/** Like `validateSettings`, also checking `theme` and `checkUpdatesOnStartup`. */
+/** Like `validateSettings`, also checking `theme`, `checkUpdatesOnStartup` and `notifyOnFinish`. */
 export function validateAppSettings(s: AppSettings): { field: keyof AppSettings; message: string } | null {
   const transfer = validateSettings(s);
   if (transfer) return transfer;
@@ -88,5 +96,13 @@ export function validateAppSettings(s: AppSettings): { field: keyof AppSettings;
     return { field: "theme", message: "Must be one of system, light, dark." };
   }
   if (typeof s.checkUpdatesOnStartup !== "boolean") return { field: "checkUpdatesOnStartup", message: "Must be true or false." };
+  if (typeof s.notifyOnFinish !== "boolean") return { field: "notifyOnFinish", message: "Must be true or false." };
+  for (const field of ["textSize", "textWeight"] as const) {
+    const { min, max } = TEXT_SETTINGS_LIMITS[field];
+    if (!Number.isInteger(s[field]) || s[field] < min || s[field] > max) {
+      return { field, message: `Must be a whole number from ${min} to ${max}.` };
+    }
+  }
+  if (!ACCENT_COLORS.includes(s.accent)) return { field: "accent", message: `Must be one of ${ACCENT_COLORS.join(", ")}.` };
   return null;
 }

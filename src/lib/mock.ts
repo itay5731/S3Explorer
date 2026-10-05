@@ -19,6 +19,7 @@ import type {
   ObjectEntry,
   ObjectMeta,
   ProfileInfo,
+  RecentListing,
   SaveConnectionInput,
   SavedConnection,
   Transfer,
@@ -990,6 +991,20 @@ export const mockBackend: Backend = {
     return page;
   },
 
+  async listRecent(bucket, prefix): Promise<RecentListing> {
+    await latency();
+    const b = requireBucket(bucket);
+    const files = sortedKeys(b).filter((key) => key.startsWith(prefix) && !key.endsWith("/"));
+    const objects = files
+      .map((key): ObjectEntry => {
+        const o = b.objects.get(key)!;
+        return { key, name: key.slice(key.lastIndexOf("/") + 1), size: o.size, lastModified: o.lastModified, etag: o.etag, storageClass: o.storageClass };
+      })
+      .sort((x, y) => (y.lastModified ?? "").localeCompare(x.lastModified ?? "") || x.key.localeCompare(y.key))
+      .slice(0, 200);
+    return { objects, scanned: files.length, truncated: false };
+  },
+
   async headObject(bucket, key): Promise<ObjectMeta> {
     await latency();
     const b = requireBucket(bucket);
@@ -1122,6 +1137,10 @@ export const mockBackend: Backend = {
       maxConcurrentTransfers: next.maxConcurrentTransfers,
       theme: next.theme,
       checkUpdatesOnStartup: next.checkUpdatesOnStartup,
+      notifyOnFinish: next.notifyOnFinish,
+      textSize: next.textSize,
+      textWeight: next.textWeight,
+      accent: next.accent,
     };
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
@@ -1292,6 +1311,19 @@ export const mockBackend: Backend = {
 
   async openExternal(url) {
     console.info("[mock] open in browser:", url);
+  },
+
+  async notify(title, body) {
+    console.info("[mock] desktop notification:", title, body ?? "");
+  },
+
+  async setWindowTitle(title) {
+    document.title = title;
+  },
+
+  async setZoom(scale) {
+    // The closest a plain browser tab offers to the webview's zoom.
+    document.documentElement.style.setProperty("zoom", String(scale));
   },
 
   async pickFiles() {

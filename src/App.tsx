@@ -13,6 +13,7 @@ import { scheduleStartupCheck } from "./store/updates";
 
 export default function App() {
   const connected = useApp((s) => s.connection !== null);
+  const connectionName = useApp((s) => s.connection?.label);
   const [booting, setBooting] = useState(true);
 
   useEffect(() => {
@@ -45,6 +46,11 @@ export default function App() {
       cancelUpdateCheck?.();
     };
   }, []);
+
+  // The window title names the open connection, so several windows can be told apart in the taskbar.
+  useEffect(() => {
+    api.setWindowTitle(connectionName ?? "S3 Explorer").catch(() => {});
+  }, [connectionName]);
 
   // Suppress the default webview context menu everywhere except text inputs.
   useEffect(() => {

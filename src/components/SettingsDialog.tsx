@@ -3,6 +3,7 @@ import {
   AlertCircle,
   AlertTriangle,
   ArrowDownUp,
+  Bell,
   Cpu,
   FileStack,
   Info,
@@ -21,13 +22,15 @@ import {
   MIN_UPLOAD_PART_MIB,
   TRANSFER_SETTINGS_LIMITS,
   type AppError,
+  type AccentColor,
   type AppSettings,
   type ThemeMode,
 } from "../lib/types";
 import { GIB, MIB, planParts, sameAppSettings, validateInteger, worstCasePartMib } from "../lib/settings";
 import { formatBytes } from "../lib/format";
-import { applyTheme } from "../lib/theme";
+import { applyAccent, applyTheme } from "../lib/theme";
 import {
+  applyTextStyle,
   closeSettings,
   loadSettings,
   openSettings,
@@ -38,6 +41,7 @@ import {
 import { toast } from "../store/toasts";
 import { useUpdates } from "../store/updates";
 import { AppearanceTab } from "./AppearanceTab";
+import { NotificationsTab } from "./NotificationsTab";
 import { UpdatesTab } from "./UpdatesTab";
 
 // ---- draft model ------------------------------------------------------------------
@@ -57,6 +61,10 @@ interface Draft {
   transfers: TransferDraft;
   theme: ThemeMode;
   checkUpdatesOnStartup: boolean;
+  notifyOnFinish: boolean;
+  textSize: number;
+  textWeight: number;
+  accent: AccentColor;
 }
 
 type TransferErrors = Record<"partSize" | "parts" | "transfers", string | null>;
@@ -70,6 +78,10 @@ const toDraft = (s: AppSettings): Draft => ({
   },
   theme: s.theme,
   checkUpdatesOnStartup: s.checkUpdatesOnStartup,
+  notifyOnFinish: s.notifyOnFinish,
+  textSize: s.textSize,
+  textWeight: s.textWeight,
+  accent: s.accent,
 });
 
 function transferErrors(d: TransferDraft): TransferErrors {
@@ -91,6 +103,10 @@ function toSettings(d: Draft): AppSettings | null {
     maxConcurrentTransfers: Number(t.transfers),
     theme: d.theme,
     checkUpdatesOnStartup: d.checkUpdatesOnStartup,
+    notifyOnFinish: d.notifyOnFinish,
+    textSize: d.textSize,
+    textWeight: d.textWeight,
+    accent: d.accent,
   };
 }
 
@@ -144,10 +160,44 @@ const TABS: SettingsTab[] = [
     label: "Appearance",
     icon: Palette,
     render: (ctx) => (
-      <AppearanceTab value={ctx.draft.theme} disabled={ctx.disabled} onChange={(theme) => ctx.update({ ...ctx.draft, theme })} />
+      <AppearanceTab
+        value={ctx.draft.theme}
+        accent={ctx.draft.accent}
+        textSize={ctx.draft.textSize}
+        textWeight={ctx.draft.textWeight}
+        disabled={ctx.disabled}
+        onChange={(theme) => ctx.update({ ...ctx.draft, theme })}
+        onAccentChange={(accent) => ctx.update({ ...ctx.draft, accent })}
+        onTextSizeChange={(textSize) => ctx.update({ ...ctx.draft, textSize })}
+        onTextWeightChange={(textWeight) => ctx.update({ ...ctx.draft, textWeight })}
+      />
     ),
-    reset: (d) => ({ ...d, theme: DEFAULT_DRAFT.theme }),
-    atDefaults: (d) => d.theme === DEFAULT_DRAFT.theme,
+    reset: (d) => ({
+      ...d,
+      theme: DEFAULT_DRAFT.theme,
+      accent: DEFAULT_DRAFT.accent,
+      textSize: DEFAULT_DRAFT.textSize,
+      textWeight: DEFAULT_DRAFT.textWeight,
+    }),
+    atDefaults: (d) =>
+      d.theme === DEFAULT_DRAFT.theme &&
+      d.accent === DEFAULT_DRAFT.accent &&
+      d.textSize === DEFAULT_DRAFT.textSize &&
+      d.textWeight === DEFAULT_DRAFT.textWeight,
+  },
+  {
+    id: "notifications",
+    label: "Notifications",
+    icon: Bell,
+    render: (ctx) => (
+      <NotificationsTab
+        notifyOnFinish={ctx.draft.notifyOnFinish}
+        disabled={ctx.disabled}
+        onNotifyOnFinishChange={(notifyOnFinish) => ctx.update({ ...ctx.draft, notifyOnFinish })}
+      />
+    ),
+    reset: (d) => ({ ...d, notifyOnFinish: DEFAULT_DRAFT.notifyOnFinish }),
+    atDefaults: (d) => d.notifyOnFinish === DEFAULT_DRAFT.notifyOnFinish,
   },
   {
     id: "updates",
@@ -503,6 +553,16 @@ function SettingsDialogInner() {
   useEffect(() => {
     if (previewTheme) applyTheme(previewTheme);
   }, [previewTheme]);
+  // Live accent preview, reverted the same way.
+  const previewAccent = draft?.accent;
+  useEffect(() => {
+    if (previewAccent) applyAccent(previewAccent);
+  }, [previewAccent]);
+  // Live text preview, reverted the same way.
+  const [previewSize, previewWeight] = [draft?.textSize, draft?.textWeight];
+  useEffect(() => {
+    if (previewSize && previewWeight) applyTextStyle(previewSize, previewWeight);
+  }, [previewSize, previewWeight]);
 
   // Initial focus on the active tab; restore focus to the opener on close.
   useEffect(() => {

@@ -83,7 +83,7 @@ const emptyListing: Listing = {
 
 const PAGE_SIZE = 1000;
 
-const readPref = <T,>(key: string, fallback: T): T => {
+export const readPref = <T,>(key: string, fallback: T): T => {
   try {
     const v = localStorage.getItem(key);
     return v === null ? fallback : (JSON.parse(v) as T);

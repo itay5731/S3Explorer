@@ -7,7 +7,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   JOB_PROGRESS_EVENT,
@@ -25,6 +27,7 @@ import {
   type ListPage,
   type ObjectMeta,
   type ProfileInfo,
+  type RecentListing,
   type SaveConnectionInput,
   type SavedConnection,
   type Transfer,
@@ -48,6 +51,7 @@ export interface Backend {
   connectionStatus(): Promise<ConnectionInfo | null>;
   listBuckets(): Promise<Bucket[]>;
   listObjects(bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number): Promise<ListPage>;
+  listRecent(bucket: string, prefix: string): Promise<RecentListing>;
   headObject(bucket: string, key: string): Promise<ObjectMeta>;
   createFolder(bucket: string, prefix: string): Promise<void>;
   // Object operations (jobs)
@@ -76,6 +80,9 @@ export interface Backend {
   onUpdateProgress(cb: (p: UpdateProgress) => void): Promise<Unlisten>;
   appVersion(): Promise<string>;
   openExternal(url: string): Promise<void>;
+  notify(title: string, body?: string): Promise<void>;
+  setWindowTitle(title: string): Promise<void>;
+  setZoom(scale: number): Promise<void>;
   // Platform helpers (dialogs, paths, shell, drag & drop)
   pickFiles(): Promise<string[]>;
   pickSavePath(defaultName: string): Promise<string | null>;
@@ -117,6 +124,7 @@ const tauriBackend: Backend = {
       continuationToken: continuationToken ?? null,
       pageSize: pageSize ?? null,
     }),
+  listRecent: (bucket, prefix) => invoke<RecentListing>("list_recent", { bucket, prefix }),
   headObject: (bucket, key) => invoke<ObjectMeta>("head_object", { bucket, key }),
   createFolder: (bucket, prefix) => invoke<void>("create_folder", { bucket, prefix }),
   previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
@@ -142,6 +150,13 @@ const tauriBackend: Backend = {
   onUpdateProgress: (cb) => listen<UpdateProgress>(UPDATE_PROGRESS_EVENT, (e) => cb(e.payload)),
   appVersion: () => getVersion(),
   openExternal: (url) => openUrl(url),
+  setWindowTitle: (title) => getCurrentWindow().setTitle(title),
+  setZoom: (scale) => getCurrentWebview().setZoom(scale),
+  async notify(title, body) {
+    // The OS remembers the answer, so the permission prompt appears at most once.
+    const granted = (await isPermissionGranted()) || (await requestPermission()) === "granted";
+    if (granted) sendNotification({ title, body });
+  },
 
   async pickFiles() {
     const res = await open({ multiple: true, directory: false, title: "Upload files" });
@@ -208,6 +223,7 @@ export const connectionStatus = () => call("connectionStatus");
 export const listBuckets = () => call("listBuckets");
 export const listObjects = (bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number) =>
   call("listObjects", bucket, prefix, continuationToken, pageSize);
+export const listRecent = (bucket: string, prefix: string) => call("listRecent", bucket, prefix);
 export const headObject = (bucket: string, key: string) => call("headObject", bucket, key);
 export const createFolder = (bucket: string, prefix: string) => call("createFolder", bucket, prefix);
 export const previewJob = (request: JobRequest) => call("previewJob", request);
@@ -240,6 +256,12 @@ export const openExternal = (url: string): Promise<void> =>
   /^https:\/\//i.test(url)
     ? call("openExternal", url)
     : Promise.reject<void>({ code: "InvalidInput", message: "Only https links can be opened." } satisfies AppError);
+/** Show an OS notification. Asks for permission on first use and does nothing if it is denied. */
+export const notify = (title: string, body?: string) => call("notify", title, body);
+/** Set the text in the OS window title bar and taskbar. */
+export const setWindowTitle = (title: string) => call("setWindowTitle", title);
+/** Scale the whole interface: 1 is normal size. */
+export const setZoom = (scale: number) => call("setZoom", scale);
 
 export const pickFiles = () => call("pickFiles");
 export const pickSavePath = (defaultName: string) => call("pickSavePath", defaultName);

@@ -7,6 +7,7 @@ import { copyName, isJobActive, KIND_VERB, plural, touchesPrefix } from "../lib/
 import { openModal, refreshInPlace, setTransfersOpen, useApp } from "./app";
 import { clearClipboard, setClipboard, useClipboard, type ClipItem } from "./clipboard";
 import { jobRequest, onJobUpdate, rememberJobRequest, useJobs } from "./jobs";
+import { notifyInBackground } from "./notify";
 import { toast } from "./toasts";
 import { getSelected } from "./view";
 
@@ -220,7 +221,12 @@ function scheduleRefresh(now: boolean) {
 export function installJobEffects(): () => void {
   const off = onJobUpdate((j, prev) => {
     const finished = !isJobActive(j) && (!prev || isJobActive(prev));
-    if (finished) reportFinished(j);
+    if (finished) {
+      reportFinished(j);
+      if (j.status !== "cancelled") {
+        notifyInBackground(`${KIND_VERB[j.kind].present} ${j.status === "failed" ? "failed" : "finished"}`, j.label);
+      }
+    }
     if (!touchesView(j)) return;
     if (finished) scheduleRefresh(true);
     else if (j.status === "running" && j.phase === "working" && (!prev || prev.doneItems !== j.doneItems)) scheduleRefresh(false);

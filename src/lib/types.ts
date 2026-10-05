@@ -98,20 +98,50 @@ export const AUTO_PART_SIZE_MIB = { standard: 8, large: 16 } as const;
 /** S3 minimum for non-final multipart upload parts. */
 export const MIN_UPLOAD_PART_MIB = 5;
 
+/** Result of `list_recent` (see "Newest files" in docs/CONTRACT.md). */
+export interface RecentListing {
+  /** At most 200, newest first. */
+  objects: ObjectEntry[];
+  /** Objects looked at. */
+  scanned: number;
+  /** The scan stopped at its limit before the end of the listing. */
+  truncated: boolean;
+}
+
 // ---- v0.3.0 (see "v0.3.0 additions" in docs/CONTRACT.md) ----
 
 export type ThemeMode = "system" | "light" | "dark";
+/** The interface's accent colour (see "Accent colour" in docs/CONTRACT.md). */
+export type AccentColor = "yellow" | "green" | "blue" | "red";
+export const ACCENT_COLORS: readonly AccentColor[] = ["yellow", "green", "blue", "red"];
 
 /** Flat settings object. Supersedes TransferSettings (kept above for reference of the transfer fields). */
 export interface AppSettings extends TransferSettings {
   theme: ThemeMode;
   checkUpdatesOnStartup: boolean;
+  /** See "Desktop notifications" in docs/CONTRACT.md. */
+  notifyOnFinish: boolean;
+  /** Interface scale in percent (see "Text size and weight" in docs/CONTRACT.md). */
+  textSize: number;
+  /** Font weight of ordinary text. */
+  textWeight: number;
+  accent: AccentColor;
 }
+
+/** Ranges and slider steps for the text settings (the backend enforces the same ranges). */
+export const TEXT_SETTINGS_LIMITS = {
+  textSize: { min: 80, max: 150, step: 5 },
+  textWeight: { min: 300, max: 600, step: 50 },
+} as const;
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   ...DEFAULT_TRANSFER_SETTINGS,
   theme: "system",
   checkUpdatesOnStartup: false,
+  notifyOnFinish: true,
+  textSize: 100,
+  textWeight: 400,
+  accent: "yellow",
 };
 
 // Saved connections

@@ -20,7 +20,7 @@ import {
 import { navigate, openModal, refresh, setDetailsOpen, setFilter, useApp } from "../store/app";
 import { clearClipboard, useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
-import { downloadObjects, pickAndUpload } from "../store/actions";
+import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
 import { getSelected, useSelectionInfo, useViewRows } from "../store/view";
 import { displayName, formatBytes, parentPrefix, prefixSegments, s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
@@ -152,7 +152,7 @@ export function Breadcrumbs() {
   const rows = useViewRows();
   const filter = useApp((s) => s.filter);
   const sel = useSelectionInfo();
-  if (!bucket) return <div className="breadcrumbs" />;
+  if (!bucket) return null;
   const segs = prefixSegments(prefix);
   const selCount = sel.folders + sel.objects;
   return (
@@ -170,6 +170,14 @@ export function Breadcrumbs() {
             </button>
           </Fragment>
         ))}
+        <button
+          className="icon-btn crumb-copy"
+          onClick={() => void copyText(s3Uri(bucket, prefix), "Path")}
+          title={`Copy path: ${s3Uri(bucket, prefix)}`}
+          aria-label="Copy path"
+        >
+          <Copy size={12} />
+        </button>
       </nav>
       <div className="crumb-info muted">
         {selCount > 0 && (
