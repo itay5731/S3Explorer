@@ -120,10 +120,18 @@ jobs:
       - name: Extract patch notes for this version from CHANGELOG.md
         run: |
           version="${TAG#v}"
-          awk -v ver="$version" '
-            /^## \[/ { if (found) exit; if (index($0, "## [" ver "]") == 1) { found = 1; next } }
-            found { print }
-          ' CHANGELOG.md > notes.md
+          extract() {
+            awk -v ver="$1" '
+              /^## \[/ { if (found) exit; if (index($0, "## [" ver "]") == 1) { found = 1; next } }
+              found { print }
+            ' CHANGELOG.md
+          }
+          extract "$version" > notes.md
+          # A pre-release (v0.3.0-rc.1) may reuse the notes of its base version, or of [Unreleased].
+          if ! grep -q '[^[:space:]]' notes.md && [ "$version" != "${version%%-*}" ]; then
+            extract "${version%%-*}" > notes.md
+            grep -q '[^[:space:]]' notes.md || extract "Unreleased" > notes.md
+          fi
           if ! grep -q '[^[:space:]]' notes.md; then
             echo "::error::CHANGELOG.md has no section for [$version]. Add patch notes before releasing."
             exit 1
