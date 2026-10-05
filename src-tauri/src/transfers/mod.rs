@@ -1,30 +1,26 @@
 //! Background transfer manager (parallel ranged downloads, multipart uploads).
 
 mod download;
+mod gate;
+pub mod plan;
 mod upload;
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use aws_sdk_s3::Client;
 use dashmap::DashMap;
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{now_iso, Transfer, TransferKind, TransferStatus};
+use crate::models::{now_iso, Transfer, TransferKind, TransferSettings, TransferStatus};
+use gate::RunGate;
 
-/// At most this many transfers run at once; the rest stay `queued`.
-pub const MAX_RUNNING_TRANSFERS: usize = 4;
-/// Concurrent parts within one transfer.
-pub const MAX_PARTS_IN_FLIGHT: usize = 8;
 pub const MIB: u64 = 1024 * 1024;
-/// Objects larger than this use ranged / multipart transfers.
-pub const MULTIPART_THRESHOLD: u64 = 8 * MIB;
 const TICK: Duration = Duration::from_millis(100);
 const RATE_WINDOW: Duration = Duration::from_secs(2);
 
@@ -53,6 +49,18 @@ pub struct TransferEntry {
     finished: CancellationToken,
     transferred: AtomicU64,
     parts_done: AtomicU32,
+    /// Parts currently in flight, and the high-water mark (observability for tests).
+    parts_in_flight: AtomicUsize,
+    peak_parts_in_flight: AtomicUsize,
+}
+
+/// Counts a part as in flight for its lifetime (see [`TransferEntry::part_started`]).
+pub(crate) struct InFlight<'a>(&'a TransferEntry);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.parts_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl TransferEntry {
@@ -80,6 +88,12 @@ impl TransferEntry {
         self.parts_done.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn part_started(&self) -> InFlight<'_> {
+        let now = self.parts_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.peak_parts_in_flight.fetch_max(now, Ordering::Relaxed);
+        InFlight(self)
+    }
+
     /// Copies counters into the record and returns a clone of it.
     fn snapshot(&self) -> Transfer {
         let mut r = self.lock();
@@ -98,9 +112,24 @@ enum Job {
     Upload { src: PathBuf },
 }
 
+/// The settings a transfer snapshots when it starts running.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartSettings {
+    pub part_size_mib: Option<u32>,
+    pub max_parts: usize,
+}
+
+impl From<&TransferSettings> for PartSettings {
+    fn from(s: &TransferSettings) -> Self {
+        Self { part_size_mib: s.part_size_mib, max_parts: (s.max_concurrent_parts as usize).max(1) }
+    }
+}
+
 pub struct TransferManager {
     entries: DashMap<String, Arc<TransferEntry>>,
-    running: Arc<Semaphore>,
+    /// Limits running transfers to `maxConcurrentTransfers`; resizable at runtime (see `gate`).
+    running: Arc<RunGate>,
+    settings: Mutex<TransferSettings>,
     sink: Arc<dyn ProgressSink>,
     seq: AtomicU64,
     /// Serializes the "is this destination already being downloaded?" check with the insert.
@@ -132,14 +161,42 @@ fn dest_key(path: &str) -> String {
 }
 
 impl TransferManager {
+    /// A manager with default settings.
     pub fn new(sink: Arc<dyn ProgressSink>) -> Arc<Self> {
+        Self::with_settings(sink, TransferSettings::default())
+    }
+
+    pub fn with_settings(sink: Arc<dyn ProgressSink>, settings: TransferSettings) -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::new(),
-            running: Arc::new(Semaphore::new(MAX_RUNNING_TRANSFERS)),
+            running: RunGate::new(settings.max_concurrent_transfers as usize),
+            settings: Mutex::new(settings),
             sink,
             seq: AtomicU64::new(0),
             start_lock: Mutex::new(()),
         })
+    }
+
+    /// The settings new transfers will snapshot.
+    pub fn settings(&self) -> TransferSettings {
+        *self.settings.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Applies new settings. Part size / parts in flight affect transfers that start running
+    /// from now on; the transfer limit applies to the queue immediately. Callers validate first.
+    pub fn apply_settings(&self, settings: &TransferSettings) {
+        *self.settings.lock().unwrap_or_else(|p| p.into_inner()) = *settings;
+        self.running.set_limit(settings.max_concurrent_transfers as usize);
+    }
+
+    /// Transfers holding a run slot right now.
+    pub fn running_count(&self) -> usize {
+        self.running.running()
+    }
+
+    /// Highest number of parts this transfer ever had in flight at once.
+    pub fn peak_parts_in_flight(&self, id: &str) -> Option<usize> {
+        self.entries.get(id).map(|e| e.peak_parts_in_flight.load(Ordering::Relaxed))
     }
 
     /// Queues a download of `bucket/key` to `dest`. Must be called within a Tokio runtime.
@@ -202,6 +259,8 @@ impl TransferManager {
             finished: CancellationToken::new(),
             transferred: AtomicU64::new(0),
             parts_done: AtomicU32::new(0),
+            parts_in_flight: AtomicUsize::new(0),
+            peak_parts_in_flight: AtomicUsize::new(0),
         });
         self.entries.insert(id.clone(), entry.clone());
         self.sink.emit(&entry.snapshot());
@@ -214,12 +273,14 @@ impl TransferManager {
         let permit = tokio::select! {
             biased;
             _ = entry.cancel.cancelled() => None,
-            p = self.running.clone().acquire_owned() => p.ok(),
+            p = self.running.acquire() => Some(p),
         };
 
-        let result = match permit {
+        let result = match &permit {
             None => Err(AppError::cancelled()),
-            Some(_permit) => {
+            Some(_) => {
+                // Snapshot now (not at queue time): settings changed while queued still apply.
+                let cfg = PartSettings::from(&self.settings());
                 entry.lock().status = TransferStatus::Running;
                 self.sink.emit(&entry.snapshot());
 
@@ -230,8 +291,8 @@ impl TransferManager {
                     (r.id.clone(), r.bucket.clone(), r.key.clone())
                 };
                 let r = match job {
-                    Job::Download { dest } => download::run(&client, &entry, &id, &bucket, &key, &dest).await,
-                    Job::Upload { src } => upload::run(&client, &entry, &bucket, &key, &src).await,
+                    Job::Download { dest } => download::run(&client, &entry, cfg, &id, &bucket, &key, &dest).await,
+                    Job::Upload { src } => upload::run(&client, &entry, cfg, &bucket, &key, &src).await,
                 };
                 stop.cancel();
                 let _ = ticker.await;
@@ -259,6 +320,9 @@ impl TransferManager {
             }
         }
         self.sink.emit(&entry.snapshot());
+        // Release the run slot only after the final event, so observers never see the next
+        // queued transfer running while this one still looks running.
+        drop(permit);
         entry.finished.cancel();
     }
 
@@ -346,11 +410,6 @@ async fn cancellable<T>(token: &CancellationToken, f: impl Future<Output = T>) -
         _ = token.cancelled() => Err(AppError::cancelled()),
         v = f => Ok(v),
     }
-}
-
-/// Number of `part_size` parts needed for `size` bytes.
-fn part_count(size: u64, part_size: u64) -> u64 {
-    size.div_ceil(part_size).max(1)
 }
 
 /// Positional write of the whole buffer (thread-safe on a shared handle).

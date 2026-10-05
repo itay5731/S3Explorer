@@ -3,4 +3,5 @@
 pub mod browse;
 pub mod connection;
 pub mod folders;
+pub mod settings;
 pub mod transfers;

@@ -8,6 +8,7 @@ pub mod error;
 pub mod models;
 pub mod ops;
 pub mod profiles;
+pub mod settings;
 pub mod state;
 pub mod transfers;
 
@@ -16,6 +17,7 @@ use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
 use crate::models::{Transfer, TRANSFER_PROGRESS_EVENT};
+use crate::settings::SettingsStore;
 use crate::state::AppState;
 use crate::transfers::ProgressSink;
 
@@ -35,7 +37,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let sink: Arc<dyn ProgressSink> = Arc::new(TauriSink(app.handle().clone()));
-            app.manage(AppState::new(sink));
+            // Never fail startup over settings: no config dir means in-memory defaults.
+            let store = match app.path().app_config_dir() {
+                Ok(dir) => SettingsStore::load(dir.join(settings::SETTINGS_FILE)),
+                Err(_) => SettingsStore::in_memory(Default::default()),
+            };
+            app.manage(AppState::new(sink, store));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -53,6 +60,8 @@ pub fn run() {
             commands::transfers::cancel_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::list_transfers,
+            commands::settings::get_settings,
+            commands::settings::update_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
