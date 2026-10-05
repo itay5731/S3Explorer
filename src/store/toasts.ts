@@ -1,0 +1,43 @@
+import { create } from "zustand";
+import type { AppError } from "../lib/types";
+
+export type ToastKind = "success" | "error" | "info";
+
+export interface Toast {
+  id: number;
+  kind: ToastKind;
+  title: string;
+  detail?: string;
+}
+
+interface ToastState {
+  toasts: Toast[];
+  push(t: Omit<Toast, "id">, ttlMs?: number): void;
+  dismiss(id: number): void;
+}
+
+let seq = 0;
+
+export const useToasts = create<ToastState>((set, get) => ({
+  toasts: [],
+  push(t, ttlMs) {
+    const id = ++seq;
+    set({ toasts: [...get().toasts.slice(-4), { ...t, id }] });
+    const ttl = ttlMs ?? (t.kind === "error" ? 8000 : 3500);
+    setTimeout(() => get().dismiss(id), ttl);
+  },
+  dismiss(id) {
+    set({ toasts: get().toasts.filter((x) => x.id !== id) });
+  },
+}));
+
+export const toast = {
+  success: (title: string, detail?: string) => useToasts.getState().push({ kind: "success", title, detail }),
+  info: (title: string, detail?: string) => useToasts.getState().push({ kind: "info", title, detail }),
+  error: (title: string, err?: AppError | string) =>
+    useToasts.getState().push({
+      kind: "error",
+      title,
+      detail: typeof err === "string" ? err : err?.message,
+    }),
+};
