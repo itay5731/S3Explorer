@@ -480,6 +480,27 @@ interface UpdateProgress { phase: UpdatePhase; downloadedBytes: number; totalByt
   installs without the user clicking.
 - Event `update:progress`, payload `UpdateProgress`.
 
+### v0.3.0 backend notes (settings, saved connections, updates)
+
+- **Settings file loading** is per field: a field with a wrong type or out-of-range value resets to its own
+  default and the others are kept. Text that is not JSON at all resets everything. (Supersedes the earlier
+  "fails to parse falls back wholesale" wording.)
+- **`hasSecret` when the keychain cannot be read** while listing is reported as `false` rather than failing the
+  whole list; connecting then returns the real `Keychain` error.
+- **No half-saved connections:** if the keychain write fails nothing is stored; if the metadata write fails the
+  keychain change is rolled back (new secret removed, or the previous secret restored).
+- **`forcePathStyle`** is stored as the value `connect` actually used.
+- **Update progress on Windows** ends with `installing`: the installer takes over, closes the app and restarts
+  it. `restarting` is emitted on macOS and Linux only.
+- **`check_for_update` when the repository has no releases** returns `available: false`, not an error.
+- **Opening links:** the app may open only `https://github.com/yonatand/S3Explorer/*` in the browser
+  (capability scope). `downloadUrl` is always inside that prefix.
+- **Messages the UI relies on:** a missing secret → `InvalidInput` containing the word "secret"; installs
+  refused while transfers or file operations run → `InvalidInput` saying so; a package that fails signature
+  verification is never installed and reports that plainly.
+- **Linux** needs a running Secret Service (gnome-keyring, KWallet) to save or use connections with a secret;
+  without one those actions return a `Keychain` error. AWS-profile connections need no keychain.
+
 ### UI text: units
 
 Sizes and speeds are computed in binary units and must be labelled that way: `KiB`, `MiB`, `GiB`,
