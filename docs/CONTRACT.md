@@ -164,3 +164,44 @@ up to 8 concurrent parts.
 - Uploads stream each part from disk (no whole-part buffering). `CreateMultipartUpload` and `CompleteMultipartUpload` are not interruptible; cancel takes effect between them.
 - Frontend: local file names derived from S3 keys are sanitized (path separators, reserved characters and names, `.`/`..`) and de-duplicated case-insensitively before download.
 - Security: `tauri.conf.json` sets a restrictive CSP (`default-src 'self'`, `connect-src ipc: http://ipc.localhost`); `devCsp` is null so Vite HMR works in dev.
+
+## Settings (added after v1)
+
+User-tunable transfer settings, owned and persisted by the backend.
+
+```ts
+interface TransferSettings {
+  partSizeMib: number | null;      // null = Auto (8 MiB; 16 MiB for objects over 1 GiB). Integer 1..=256 otherwise.
+  maxConcurrentParts: number;      // parts in flight per transfer. Integer 1..=32. Default 8.
+  maxConcurrentTransfers: number;  // transfers running at once (others queue). Integer 1..=10. Default 4.
+}
+```
+
+Defaults and limits are exported from `src/lib/types.ts` (`DEFAULT_TRANSFER_SETTINGS`,
+`TRANSFER_SETTINGS_LIMITS`) and mirrored as constants in Rust.
+
+| Command | Args | Returns |
+|---|---|---|
+| `get_settings` | – | `TransferSettings` — current values (defaults on first run). Works while disconnected. |
+| `update_settings` | `{ settings: TransferSettings }` | `TransferSettings` — the stored values. Out-of-range or non-integer values are rejected with `InvalidInput` and a message naming the field; nothing is changed. Works while disconnected. |
+
+Semantics:
+
+- **Persistence:** stored as JSON (`settings.json`) in the app config directory
+  (`app.path().app_config_dir()`), written atomically (temp file + rename). Loaded at startup; a
+  missing, unreadable or invalid file falls back to defaults without failing startup. Unknown
+  fields are ignored and missing fields take their default, so the file stays forward compatible.
+- **When changes apply:** a transfer snapshots `partSizeMib` and `maxConcurrentParts` when it
+  *starts running*; transfers already running keep theirs. `maxConcurrentTransfers` applies
+  immediately to the queue: raising it lets queued transfers start at once; lowering it never
+  interrupts running transfers, it only stops new ones from starting until the count drops below the limit.
+- **Download splitting:** an object is split when its size is greater than the part size
+  (Auto keeps today's behavior exactly: threshold 8 MiB, parts 8 MiB, 16 MiB above 1 GiB).
+  Part count is `ceil(size / partSize)`.
+- **Upload splitting:** S3 requires every non-final part to be at least 5 MiB and at most 10,000
+  parts. Uploads therefore use `max(partSize, 5 MiB)`, grown further if needed to stay within
+  10,000 parts; a file is multipart when larger than that effective part size. Auto keeps today's behavior.
+- **Memory:** a download holds up to `maxConcurrentParts × partSize` in RAM per running transfer
+  (uploads stream from disk). The UI shows this estimate and warns above 1 GiB total
+  (`maxConcurrentTransfers × maxConcurrentParts × partSize`).
+- `Transfer.partsTotal` reflects the part size the transfer actually used.
