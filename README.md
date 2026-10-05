@@ -68,7 +68,7 @@ S3 Explorer only does what your credentials allow. It needs no permissions outsi
 | See object details, download | `HeadObject`, `GetObject` | `s3:GetObject` on the objects |
 | Upload, create a folder | `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` | `s3:PutObject` and `s3:AbortMultipartUpload` on the objects |
 | Delete objects and folders | `ListObjectsV2`, `DeleteObjects` | `s3:ListBucket` on the bucket, `s3:DeleteObject` on the objects |
-| Copy | `ListObjectsV2`, `HeadObject`, `CopyObject`, `UploadPartCopy` (objects over 5 GiB) | `s3:ListBucket` and `s3:GetObject` on the source, `s3:ListBucket` and `s3:PutObject` on the destination |
+| Copy | `ListObjectsV2`, `HeadObject`, `CopyObject`, `UploadPartCopy` (objects over 5 GiB) | `s3:ListBucket` and `s3:GetObject` on the source; `s3:ListBucket`, `s3:GetObject` and `s3:PutObject` on the destination (the app checks what already exists there and confirms each copy before a move deletes anything) |
 | Move and rename | Copy, then delete the original | Everything for Copy, plus `s3:DeleteObject` on the source |
 
 Two things that surprise people:
