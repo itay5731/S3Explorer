@@ -30,6 +30,9 @@ pub const RELEASES_URL: &str = "https://github.com/yonatand/S3Explorer/releases/
 /// Only release pages under this prefix are handed to the frontend (the opener scope matches it).
 pub const ALLOWED_URL_PREFIX: &str = "https://github.com/yonatand/S3Explorer/";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// A package download that receives no data for this long is abandoned. Only an idle bound, not
+/// an overall one: a slow but moving download of a large installer is fine.
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub mod msg {
     pub const NO_UPDATE: &str = "No installable update is known. Check for updates first.";
@@ -42,6 +45,30 @@ pub mod msg {
         "GitHub is limiting update checks from this network right now. Try again in a few minutes.";
     pub const BAD_SIGNATURE: &str =
         "The downloaded update failed signature verification, so it was not installed.";
+    pub const DOWNLOAD_STALLED: &str =
+        "The update download stopped receiving data, so it was abandoned. Check your connection and try again.";
+}
+
+/// Runs `fut` to completion, or gives up (`None`) once `progress` (a counter the future bumps
+/// as it makes progress) has not changed for `idle`. Dropping `fut` cancels it.
+async fn with_idle_timeout<F: std::future::Future>(fut: F, progress: &AtomicU64, idle: Duration) -> Option<F::Output> {
+    tokio::pin!(fut);
+    let check = (idle / 6).max(Duration::from_millis(10));
+    let mut seen = progress.load(Ordering::SeqCst);
+    let mut since = Instant::now();
+    loop {
+        tokio::select! {
+            r = &mut fut => return Some(r),
+            _ = tokio::time::sleep(check) => {
+                let now = progress.load(Ordering::SeqCst);
+                if now != seen {
+                    (seen, since) = (now, Instant::now());
+                } else if since.elapsed() >= idle {
+                    return None;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -376,8 +403,10 @@ pub async fn install(
     };
     emit(snapshot());
     // `download` verifies the signature against the configured public key after the last chunk
-    // and fails (nothing is installed) when it does not match.
-    let bytes = update
+    // and fails (nothing is installed) when it does not match. The plugin sets no timeout on the
+    // package request, so a stalled download is cut off here (this wraps the whole call, so the
+    // signature check is untouched: the bytes are only returned after it passed).
+    let download = update
         .download(
             |chunk, len| {
                 downloaded.fetch_add(chunk as u64, Ordering::SeqCst);
@@ -389,8 +418,10 @@ pub async fn install(
                 }
             },
             || emit(snapshot()),
-        )
+        );
+    let bytes = with_idle_timeout(download, &downloaded, DOWNLOAD_IDLE_TIMEOUT)
         .await
+        .ok_or_else(|| AppError::new(ErrorCode::Network, msg::DOWNLOAD_STALLED))?
         .map_err(install_error)?;
     let size = bytes.len() as u64;
 
@@ -409,6 +440,34 @@ pub async fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_timeout_cuts_off_a_stalled_download_only() {
+        let idle = Duration::from_millis(300);
+        // Never makes progress: abandoned after about `idle`.
+        let stuck = AtomicU64::new(0);
+        let t0 = Instant::now();
+        let r = with_idle_timeout(std::future::pending::<()>(), &stuck, idle).await;
+        assert!(r.is_none());
+        assert!(t0.elapsed() >= idle && t0.elapsed() < idle * 3, "{:?}", t0.elapsed());
+        // Slow but steady progress for longer than `idle` in total: finishes.
+        let moving = AtomicU64::new(0);
+        let slow = async {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                moving.fetch_add(1, Ordering::SeqCst);
+            }
+            7
+        };
+        assert_eq!(with_idle_timeout(slow, &moving, idle).await, Some(7));
+        // Progress, then a stall: abandoned.
+        let stalls = AtomicU64::new(0);
+        let then_stall = async {
+            stalls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<()>().await
+        };
+        assert!(with_idle_timeout(then_stall, &stalls, idle).await.is_none());
+    }
 
     fn v(s: &str) -> Version {
         Version::parse(s).expect("version")

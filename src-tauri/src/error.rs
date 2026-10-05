@@ -48,6 +48,17 @@ impl AppError {
     pub fn is_cancelled(&self) -> bool {
         self.code == ErrorCode::Cancelled
     }
+    /// A panic caught at the top of a background task (transfer or job), so it ends as a failure
+    /// instead of staying "running". Only reachable in builds that unwind: release builds use
+    /// `panic = "abort"`, where a panic ends the process.
+    pub fn from_panic(payload: &(dyn std::any::Any + Send)) -> Self {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown cause".to_string());
+        AppError::new(ErrorCode::Unknown, format!("Internal error: the operation stopped unexpectedly ({detail})."))
+    }
 }
 
 impl From<std::io::Error> for AppError {
