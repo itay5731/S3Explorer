@@ -12,7 +12,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use s3explorer_lib::error::ErrorCode;
-use s3explorer_lib::models::{ConnectionConfig, Transfer, TransferSettings, TransferStatus};
+use s3explorer_lib::jobs::{JobManager, NoopJobSink};
+use s3explorer_lib::models::{
+    ConflictPolicy, ConnectionConfig, Job, JobItem, JobKind, JobRequest, JobStatus, Transfer, TransferSettings,
+    TransferStatus,
+};
 use s3explorer_lib::ops;
 use s3explorer_lib::state::Connection;
 use s3explorer_lib::transfers::{ProgressSink, TransferManager};
@@ -67,6 +71,26 @@ fn part_files_exist(dir: &std::path::Path) -> std::io::Result<bool> {
     Ok(std::fs::read_dir(dir)?.filter_map(Result::ok).any(|e| e.file_name().to_string_lossy().ends_with(".part")))
 }
 
+/// Deletes every object under `prefix` with a delete job (`delete_folder` is gone since v0.3.0).
+/// An empty prefix is fine here (the job then reports one "nothing found" failure).
+async fn delete_prefix(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) -> Res<Job> {
+    let jobs = JobManager::new(Arc::new(NoopJobSink));
+    let request = JobRequest {
+        kind: JobKind::Delete,
+        src_bucket: bucket.into(),
+        dest_bucket: None,
+        items: vec![JobItem { from: prefix.into(), to: None, is_prefix: true }],
+        on_conflict: ConflictPolicy::Skip,
+    };
+    let id = jobs.start(request, client.clone(), None)?;
+    let job = jobs.wait(&id).await.ok_or("missing job")?;
+    let empty = job.total_items == 1 && job.failed_items == 1;
+    if job.status != JobStatus::Completed && !empty {
+        return Err(format!("delete of {prefix} failed: {job:?}").into());
+    }
+    Ok(job)
+}
+
 fn settings(part_size_mib: Option<u32>, parts: u32, transfers: u32) -> TransferSettings {
     let s = TransferSettings { part_size_mib, max_concurrent_parts: parts, max_concurrent_transfers: transfers };
     assert!(s.validate().is_ok());
@@ -100,7 +124,7 @@ async fn settings_checks(
     println!("settings");
     let out = dir.join("settings-out");
     let _ = tokio::fs::remove_dir_all(&out).await;
-    ops::delete_folder(client, bucket, "smoke-settings/").await?;
+    delete_prefix(client, bucket, "smoke-settings/").await?;
     let rec = Arc::new(Recorder { events: Mutex::new(Vec::new()), count: AtomicUsize::new(0) });
     let tm = TransferManager::with_settings(rec.clone(), settings(Some(4), 3, 4));
     let src_key = "smoke/data/big.bin";
@@ -197,7 +221,7 @@ async fn settings_checks(
         check(sha(&tokio::fs::read(out.join(format!("raise-{i}.bin"))).await?) == want_sha, "raised-limit sha256")?;
     }
 
-    ops::delete_folder(client, bucket, "smoke-settings/").await?;
+    delete_prefix(client, bucket, "smoke-settings/").await?;
     let _ = tokio::fs::remove_dir_all(&out).await;
     Ok(())
 }
@@ -241,7 +265,7 @@ async fn main() -> Res<()> {
     let buckets = ops::list_buckets(conn.base_client()).await?;
     check(buckets.iter().any(|b| b.name == bucket), "bucket listed")?;
     // Start from a clean slate.
-    ops::delete_folder(&client, bucket, "smoke/").await?;
+    delete_prefix(&client, bucket, "smoke/").await?;
 
     println!("folders");
     ops::create_folder(&client, bucket, "smoke/data").await?;
@@ -375,9 +399,12 @@ async fn main() -> Res<()> {
         check(puts.iter().all(|r| r.is_ok()), "seeded 2100 extra objects")?;
     }
     let t2 = Instant::now();
-    let del = ops::delete_folder(&client, bucket, "smoke/").await?;
-    println!("  deleted {} errors {:?} in {:.2}s", del.deleted, del.errors, t2.elapsed().as_secs_f64());
-    check(del.deleted == 2103 && del.errors.is_empty(), "deleted marker + 2 files + 2100 (3 batches)")?;
+    let del = delete_prefix(&client, bucket, "smoke/").await?;
+    println!("  deleted {} errors {:?} in {:.2}s", del.done_items, del.errors, t2.elapsed().as_secs_f64());
+    check(
+        del.status == JobStatus::Completed && del.done_items == 2103 && del.errors.is_empty(),
+        "deleted marker + 2 files + 2100 (3 batches)",
+    )?;
     let after = ops::list_all_keys(&client, bucket, "smoke/").await?;
     check(after.is_empty(), "prefix empty after delete")?;
 

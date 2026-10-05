@@ -1,7 +1,7 @@
 //! Background transfer manager (parallel ranged downloads, multipart uploads).
 
 mod download;
-mod gate;
+pub(crate) mod gate;
 pub mod plan;
 mod upload;
 

@@ -1,18 +1,12 @@
 //! Plain S3 operations (no Tauri dependency) used by the commands and the smoke test.
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
-use futures::stream::{self, StreamExt};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    clean_etag, fmt_dt, last_segment, Bucket, DeleteError, DeleteResult, FolderEntry, ListPage, ObjectEntry,
-    ObjectMeta,
+    clean_etag, fmt_dt, last_segment, Bucket, FolderEntry, ListPage, ObjectEntry, ObjectMeta,
 };
-
-const DELETE_BATCH: usize = 1000;
-const DELETE_CONCURRENCY: usize = 8;
 
 pub async fn list_buckets(client: &Client) -> AppResult<Vec<Bucket>> {
     let mut out = Vec::new();
@@ -104,8 +98,7 @@ pub async fn head_object(client: &Client, bucket: &str, key: &str) -> AppResult<
 }
 
 /// Folder prefixes are used exactly as given (S3 keys may legitimately contain "//" or a
-/// leading "/"); only a missing trailing '/' is appended. Normalizing here could widen a
-/// recursive delete to a parent folder, so nothing else is rewritten.
+/// leading "/"); only a missing trailing '/' is appended. Nothing else is rewritten.
 fn folder_prefix(prefix: &str) -> AppResult<String> {
     if prefix.is_empty() || prefix == "/" {
         return Err(AppError::invalid("Folder prefix is required"));
@@ -135,62 +128,6 @@ pub async fn list_all_keys(client: &Client, bucket: &str, prefix: &str) -> AppRe
         keys.extend(page.contents().iter().filter_map(|o| o.key().map(str::to_string)));
     }
     Ok(keys)
-}
-
-async fn delete_batch(client: Client, bucket: String, keys: Vec<String>) -> (u64, Vec<DeleteError>) {
-    let ids: Result<Vec<ObjectIdentifier>, _> =
-        keys.iter().map(|k| ObjectIdentifier::builder().key(k).build()).collect();
-    let delete = ids.and_then(|ids| Delete::builder().set_objects(Some(ids)).quiet(true).build());
-    let delete = match delete {
-        Ok(d) => d,
-        Err(e) => {
-            let msg = e.to_string();
-            return (0, keys.iter().map(|k| DeleteError { key: k.clone(), message: msg.clone() }).collect());
-        }
-    };
-    match client.delete_objects().bucket(bucket).delete(delete).send().await {
-        Ok(resp) => {
-            let errors: Vec<DeleteError> = resp
-                .errors()
-                .iter()
-                .map(|e| DeleteError {
-                    key: e.key().unwrap_or_default().to_string(),
-                    message: match (e.code(), e.message()) {
-                        (Some(c), Some(m)) => format!("{c}: {m}"),
-                        (Some(c), None) => c.to_string(),
-                        (None, Some(m)) => m.to_string(),
-                        (None, None) => "Unknown error".to_string(),
-                    },
-                })
-                .collect();
-            (keys.len().saturating_sub(errors.len()) as u64, errors)
-        }
-        Err(e) => {
-            let msg = AppError::from(e).message;
-            (0, keys.iter().map(|k| DeleteError { key: k.clone(), message: msg.clone() }).collect())
-        }
-    }
-}
-
-/// Deletes every object under `prefix` (including the folder marker itself).
-pub async fn delete_folder(client: &Client, bucket: &str, prefix: &str) -> AppResult<DeleteResult> {
-    let prefix = folder_prefix(prefix)?;
-    // The listing includes the marker object `prefix` itself when it exists.
-    let keys = list_all_keys(client, bucket, &prefix).await?;
-
-    let batches: Vec<Vec<String>> = keys.chunks(DELETE_BATCH).map(<[String]>::to_vec).collect();
-    let results: Vec<(u64, Vec<DeleteError>)> = stream::iter(batches)
-        .map(|chunk| delete_batch(client.clone(), bucket.to_string(), chunk))
-        .buffer_unordered(DELETE_CONCURRENCY)
-        .collect()
-        .await;
-
-    let mut out = DeleteResult::default();
-    for (deleted, errors) in results {
-        out.deleted += deleted;
-        out.errors.extend(errors);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
