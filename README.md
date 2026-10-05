@@ -39,7 +39,7 @@ Up to 8 parts of a file are in flight at once, and up to 4 transfers run at the 
 
 ## Get it
 
-**Download a build.** Tagged versions are built for Windows, macOS (Apple Silicon and Intel) and Linux by GitHub Actions. Open the [Actions tab](../../actions), pick the latest "Build executables" run, and download the artifact for your system. Each artifact contains the bare executable plus installers.
+**Download a build.** Every version is built for Windows, macOS (Apple Silicon and Intel) and Linux by GitHub Actions. Grab the file for your system from the [Releases page](../../releases): either the bare executable or an installer. Each release comes with patch notes.
 
 **Or build it yourself.** You need [Node.js](https://nodejs.org) 22+, [Rust](https://rustup.rs) (the exact toolchain is pinned in `src-tauri/rust-toolchain.toml` and installs itself), and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS.
 
@@ -106,4 +106,4 @@ The rules and playbooks the agents follow are checked in under [.claude/](.claud
 
 ## Versioning
 
-Releases are tagged `vMAJOR.MINOR.PATCH`. Pushing a tag builds the executables for all three platforms.
+Releases are tagged `vMAJOR.MINOR.PATCH`. Pushing a tag builds the executables for all three platforms and publishes a release with the patch notes from [CHANGELOG.md](CHANGELOG.md).
