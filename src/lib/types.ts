@@ -48,8 +48,6 @@ export interface ObjectMeta extends ObjectEntry {
   versionId: string | null;
 }
 
-export interface DeleteResult { deleted: number; errors: { key: string; message: string }[] }
-
 export type TransferKind = "download" | "upload";
 export type TransferStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 

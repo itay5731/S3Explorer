@@ -87,11 +87,8 @@ interface ObjectMeta extends ObjectEntry {
 | Command | Args | Returns |
 |---|---|---|
 | `create_folder` | `{ bucket, prefix }` | `void` — `prefix` must end with `/`; backend appends it if missing. Implemented as a zero-byte `PutObject`. |
-| `delete_folder` | `{ bucket, prefix }` | `DeleteResult` — lists *all* keys under `prefix` (paginated, no delimiter) and deletes them with `DeleteObjects` in batches of 1000, batches running concurrently (≤ 8). Also deletes the marker object. |
 
-```ts
-interface DeleteResult { deleted: number; errors: { key: string; message: string }[] }
-```
+`delete_folder` was removed in v0.3.0; folders are deleted with `start_job` (see "Object operations (jobs)").
 
 ### Transfers (downloads & uploads)
 
@@ -388,6 +385,27 @@ status or phase change. First event has status `queued`; the last carries `finis
 - Jobs work across buckets on the current connection, including buckets in different regions.
 
 `delete_folder` is **removed**; the UI uses `start_job` with `kind: "delete"`.
+
+**Details settled during implementation:**
+
+- **Two phases, strictly in order.** The whole listing phase (prefix expansion and, for copy/move, conflict
+  detection) finishes before the first object is changed. If expansion shows that two sources map to the same
+  destination key, the job fails with a job-level `error` and nothing is changed.
+- **Request-time validation** additionally rejects identical `to` values and a destination nested inside another
+  item's destination prefix.
+- **Duplicate or overlapping sources** (the same key reached through two items) are de-duplicated; each object is
+  processed once.
+- **A prefix that matches nothing** counts as one item in `totalItems` and `failedItems`, with an error saying
+  nothing was found under it.
+- **A missing object key:** for delete it counts as done (deleting is idempotent in S3); for copy/move it is a
+  per-object failure.
+- `phase` is `"done"` in every final status, including `failed` and `cancelled`.
+- `label` is written by the backend for display as-is: `Delete N items`, `Copy N items to <dest prefix or bucket>`,
+  `Move N items to <dest>`, and for a single-item move within one folder `Rename <old name> to <new name>`.
+- `cancel_job` returns `InvalidInput` for an unknown id and is a no-op for a finished job (same as transfers).
+- `install_update` is refused while any job is queued or running, as for transfers.
+- The frontend sends `onConflict: "skip"` unless the user explicitly chose Overwrite, so an object that appears
+  at the destination after the preview is never overwritten silently.
 
 ### Updates
 
