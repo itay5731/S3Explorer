@@ -367,8 +367,8 @@ status or phase change. First event has status `queued`; the last carries `finis
 - **Prefix expansion** lists every key under `from` (no delimiter, paginated) and maps
   `from + rest` → `to + rest`. The folder marker object is included. An item whose prefix matches
   nothing is reported as a per-item error, not silently ignored.
-- **Copy:** `CopyObject` for objects up to 5 GiB; multipart copy (`UploadPartCopy`, parts of 256 MiB up to
-  512 MiB grown to stay ≤ 10,000 parts) above that, aborted on failure or cancel. The source's
+- **Copy:** `CopyObject` for objects up to 5 GiB; multipart copy (`UploadPartCopy`, parts of 256 MiB, doubled
+  as needed up to S3's 5 GiB part maximum to stay ≤ 10,000 parts) above that, aborted on failure or cancel. The source's
   storage class, content type and user metadata are preserved. Objects that cannot be read (e.g.
   archived in Glacier and not restored) fail individually with a clear message.
 - **Conflicts:** with `skip`, an existing destination key is left untouched, counted in
@@ -409,6 +409,38 @@ status or phase change. First event has status `queued`; the last carries `finis
 - `install_update` is refused while any job is queued or running, as for transfers.
 - The frontend sends `onConflict: "skip"` unless the user explicitly chose Overwrite, so an object that appears
   at the destination after the preview is never overwritten silently.
+
+**Safety rules added by the backend implementation (all enforced, all tested):**
+
+- **A job can never write into its own sources.** In the same bucket, any destination range that overlaps any
+  source range of the same or another item is rejected with `InvalidInput` (e.g. `a/b/` → `a/`, the rotation
+  `x/` → `y/` with `y/` → `z/`, swaps, or pasting into a folder that is itself being moved). Without this an
+  overwriting move could replace a source and then delete its own destination. Two further guards back it up:
+  after expansion the job fails before any change if a destination key equals a source key, and at run time a
+  move refuses to delete any key that the same job writes.
+- **A source is deleted only after its copy is proven.** The copy response must carry an ETag and a `HeadObject`
+  of the destination must show the expected size. The delete of the source is conditional on the ETag that was
+  copied, so a source that was overwritten in the meantime is kept (reported as a per-object failure saying the
+  copy exists and the original remains).
+- **Copies are conditional on the source seen during listing** (`x-amz-copy-source-if-match`): an object that
+  changed after listing fails instead of copying something unexpected.
+- **`skip` is enforced on the server where possible** with `If-None-Match: *`, so a destination created after the
+  listing is still not overwritten. A server that answers NotImplemented falls back to the listing-phase check.
+  A server that rejects ETag-conditional deletes gets one retry without the condition for the affected keys.
+- **Overlapping sources in copy/move** (an object reachable through two items): the first item in request order
+  wins and the object is copied once.
+- **Listing-phase errors fail the whole job before any change** (for example a `HeadObject` error other than
+  not-found, or a truncated listing without a continuation token).
+- **Cancel:** copies already in flight finish and their sources are deleted, so no object is left in both places
+  by a cancelled move; a multipart copy stops between parts and is aborted.
+- Concurrency inside a job: 16 object copies, 4 parts per multipart copy, 4 `DeleteObjects` batches. Source
+  deletes are flushed every 500 ms or 1,000 keys, so `doneItems` of a move can trail the copies briefly.
+- `destBucket` on a delete request is rejected. `remove_job` with an unknown id is a no-op.
+- Labels: a single item is named (`Delete report.pdf`, `Rename old.txt to new.txt`, `Move a to bucket/q/`);
+  several items read `Copy 1,234 items to bucket/prefix/`.
+- Not preserved by a copy: ACLs, the checksum algorithm, SSE-C. Tags are carried over (best effort for multipart
+  copies). Content headers, user metadata and storage class are carried over explicitly.
+- During listing `totalItems` is a running count and becomes exact when the phase changes to `working`.
 
 ### Updates
 
