@@ -1,7 +1,7 @@
-import { CheckCircle2, Info, X, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "lucide-react";
 import { useToasts } from "../store/toasts";
 
-const ICON = { success: CheckCircle2, error: XCircle, info: Info };
+const ICON = { success: CheckCircle2, error: XCircle, info: Info, warning: AlertTriangle };
 
 export function Toasts() {
   const toasts = useToasts((s) => s.toasts);

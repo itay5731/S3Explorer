@@ -5,7 +5,6 @@ import {
   loadMore,
   navigate,
   openContextMenu,
-  openModal,
   refresh,
   setDetailsOpen,
   setSelection,
@@ -17,6 +16,8 @@ import { getViewRows, useViewRows, type Row } from "../store/view";
 import { formatBytes, formatExact, formatRelative, formatStorageClass, parentPrefix, displayName } from "../lib/format";
 import { FileIcon } from "./FileIcon";
 import { pickAndUpload } from "../store/actions";
+import { useClipboard } from "../store/clipboard";
+import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
 
 const ROW_H = 28;
 
@@ -33,18 +34,20 @@ const RowView = memo(function RowView({
   start,
   selected,
   focused,
+  cut,
 }: {
   row: Row;
   index: number;
   start: number;
   selected: boolean;
   focused: boolean;
+  cut: boolean;
 }) {
   const obj = row.kind === "object" ? row.object : null;
   const sc = obj?.storageClass ?? null;
   return (
     <div
-      className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""}`}
+      className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""} ${cut ? "cut" : ""}`}
       data-index={index}
       role="row"
       aria-selected={selected}
@@ -53,6 +56,7 @@ const RowView = memo(function RowView({
       <div className="cell col-name" title={row.kind === "folder" ? row.folder.prefix : row.object.key}>
         <FileIcon name={row.name} folder={row.kind === "folder"} />
         <span className="name-text">{displayName(row.name)}</span>
+        {cut && <span className="cut-tag" title="Cut: will be moved when you paste">cut</span>}
       </div>
       <div className="cell col-size">{obj ? formatBytes(obj.size) : <span className="dim">—</span>}</div>
       <div className="cell col-modified" title={obj ? formatExact(obj.lastModified) : undefined}>
@@ -87,6 +91,8 @@ export function ObjectTable() {
   const truncated = useApp((s) => s.listing.truncated);
   const error = useApp((s) => s.listing.error);
   const hasRows = rows.length > 0;
+  // Rows on the clipboard in "cut" mode get a subtle indicator (only for this bucket).
+  const cutIds = useClipboard((s) => (s.clip && s.clip.mode === "cut" && s.clip.bucket === bucket ? s.clip.ids : null));
 
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -224,11 +230,14 @@ export function ObjectTable() {
       case "Escape":
         setSelection(new Set(), null, null);
         break;
-      case "Delete": {
-        const { folders, objects } = summarizeSelection();
-        if (folders.length === 1 && objects === 0) openModal({ kind: "deleteFolder", prefix: folders[0] });
+      case "Delete":
+        if (e.ctrlKey || e.metaKey || e.altKey || !useApp.getState().selection.size) return;
+        requestDelete();
         break;
-      }
+      case "F2":
+        if (useApp.getState().selection.size !== 1) return;
+        requestRename();
+        break;
       case "a":
       case "A":
         if (e.ctrlKey || e.metaKey) {
@@ -237,6 +246,23 @@ export function ObjectTable() {
           break;
         }
         return;
+      case "c":
+      case "C":
+      case "x":
+      case "X":
+      case "v":
+      case "V": {
+        if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+        // Text selected outside the table (e.g. in the details panel): let the browser copy it.
+        const inTable = !!scrollRef.current?.contains(e.target as Node);
+        const text = window.getSelection();
+        if (!inTable && text && !text.isCollapsed && text.toString()) return;
+        const k = e.key.toLowerCase();
+        if (k === "v") requestPaste();
+        else if (!useApp.getState().selection.size) return;
+        else copySelection(k === "x" ? "cut" : "copy");
+        break;
+      }
       default:
         return;
     }
@@ -255,8 +281,11 @@ export function ObjectTable() {
       const inTable = scrollRef.current?.contains(target);
       if (!inTable && target !== document.body) {
         // Let focused buttons/menus handle their own activation keys and arrows.
-        if (target.closest(".sidebar, .transfers, .context-menu, .popover, .modal")) {
-          if (e.key !== "Backspace") return;
+        if (target.closest(".context-menu, .popover, .modal")) return;
+        if (target.closest(".sidebar, .transfers")) {
+          // Backspace (up) and paste (e.g. right after picking another bucket) still work here.
+          const paste = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v";
+          if (e.key !== "Backspace" && !paste) return;
         } else if (e.key === "Enter" || e.key === " ") return;
       }
       handleKeyRef.current(e);
@@ -340,6 +369,7 @@ export function ObjectTable() {
                     start={vi.start}
                     selected={selection.has(row.id)}
                     focused={focus === row.id}
+                    cut={!!cutIds && cutIds.has(row.id)}
                   />
                 );
               })}
@@ -362,11 +392,4 @@ export function ObjectTable() {
       </div>
     </div>
   );
-}
-
-function summarizeSelection() {
-  const { selection, listing } = useApp.getState();
-  const folders = listing.folders.filter((f) => selection.has(f.prefix)).map((f) => f.prefix);
-  const objects = listing.objects.filter((o) => selection.has(o.key)).length;
-  return { folders, objects };
 }

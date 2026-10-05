@@ -1,9 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { Copy, Download, FolderOpen, FolderPlus, Info, Link, RefreshCw, Trash2, Upload } from "lucide-react";
+import { ClipboardPaste, Copy, CopyPlus, Download, FolderOpen, FolderPlus, Info, Link, PencilLine, RefreshCw, Scissors, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, setDetailsOpen, setSelection, useApp } from "../store/app";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
 import { getSelected } from "../store/view";
+import { useClipboard } from "../store/clipboard";
+import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
 import { s3Uri } from "../lib/format";
+import { plural } from "../lib/ops";
 
 interface Item {
   label: string;
@@ -11,11 +14,13 @@ interface Item {
   action: () => void;
   danger?: boolean;
   hint?: string;
+  disabled?: boolean;
 }
 
 export function ContextMenu() {
   const menu = useApp((s) => s.contextMenu);
   const bucket = useApp((s) => s.bucket);
+  const clip = useClipboard((s) => s.clip);
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
 
@@ -28,7 +33,7 @@ export function ContextMenu() {
     const x = Math.min(menu.x, window.innerWidth - r.width - 6);
     const y = menu.y + r.height > window.innerHeight - 6 ? Math.max(6, menu.y - r.height) : menu.y;
     setPos({ x: Math.max(6, x), y });
-    ref.current.querySelector<HTMLButtonElement>("button")?.focus();
+    ref.current.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
   }, [menu]);
 
   useEffect(() => {
@@ -43,7 +48,7 @@ export function ContextMenu() {
         close();
       } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
-        const btns = [...(ref.current?.querySelectorAll<HTMLButtonElement>("button") ?? [])];
+        const btns = [...(ref.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
         const i = btns.indexOf(document.activeElement as HTMLButtonElement);
         const next = e.key === "ArrowDown" ? (i + 1) % btns.length : (i - 1 + btns.length) % btns.length;
         btns[next]?.focus();
@@ -69,11 +74,32 @@ export function ContextMenu() {
   const groups: Item[][] = [];
   const count = folders.length + objects.length;
 
+  const pasteItem: Item = {
+    label: clip ? `Paste ${plural(clip.items.length, "item")} here` : "Paste",
+    icon: <ClipboardPaste size={14} />,
+    action: () => requestPaste(),
+    hint: "Ctrl+V",
+    disabled: !clip,
+  };
+  const editItems = (n: number): Item[] => [
+    { label: n > 1 ? `Copy ${n} items` : "Copy", icon: <CopyPlus size={14} />, action: () => copySelection("copy"), hint: "Ctrl+C" },
+    { label: n > 1 ? `Cut ${n} items` : "Cut", icon: <Scissors size={14} />, action: () => copySelection("cut"), hint: "Ctrl+X" },
+    ...(n === 1 ? [{ label: "Rename…", icon: <PencilLine size={14} />, action: () => requestRename(), hint: "F2" }] : []),
+  ];
+  const deleteItem = (n: number, folder: boolean): Item => ({
+    label: n > 1 ? `Delete ${n} items…` : folder ? "Delete folder…" : "Delete…",
+    icon: <Trash2 size={14} />,
+    danger: true,
+    action: () => requestDelete(),
+    hint: "Del",
+  });
+
   if (count === 0) {
     groups.push([
       { label: "Upload files…", icon: <Upload size={14} />, action: () => void pickAndUpload() },
       { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openModal({ kind: "newFolder" }) },
     ]);
+    groups.push([pasteItem]);
     groups.push([{ label: "Refresh", icon: <RefreshCw size={14} />, action: () => refresh() }]);
   } else if (count === 1 && folders.length === 1) {
     const f = folders[0];
@@ -82,9 +108,8 @@ export function ContextMenu() {
       { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(f.prefix, "Key") },
       { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, f.prefix), "S3 URI") },
     ]);
-    groups.push([
-      { label: "Delete folder…", icon: <Trash2 size={14} />, danger: true, action: () => openModal({ kind: "deleteFolder", prefix: f.prefix }) },
-    ]);
+    groups.push(editItems(1));
+    groups.push([deleteItem(1, true)]);
   } else if (count === 1) {
     const o = objects[0];
     groups.push([{ label: "Download…", icon: <Download size={14} />, action: () => void downloadObjects([o]) }]);
@@ -92,6 +117,7 @@ export function ContextMenu() {
       { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(o.key, "Key") },
       { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, o.key), "S3 URI") },
     ]);
+    groups.push(editItems(1));
     groups.push([
       {
         label: "Properties",
@@ -102,6 +128,7 @@ export function ContextMenu() {
         },
       },
     ]);
+    groups.push([deleteItem(1, false)]);
   } else {
     const keys = [...folders.map((f) => f.prefix), ...objects.map((o) => o.key)];
     if (objects.length) {
@@ -121,6 +148,8 @@ export function ContextMenu() {
         action: () => void copyText(keys.map((k) => s3Uri(bucket, k)).join("\n"), "S3 URIs"),
       },
     ]);
+    groups.push(editItems(count));
+    groups.push([deleteItem(count, false)]);
   }
 
   return (
@@ -138,6 +167,7 @@ export function ContextMenu() {
               key={item.label}
               role="menuitem"
               className={`menu-item ${item.danger ? "danger" : ""}`}
+              disabled={item.disabled}
               onClick={() => {
                 openContextMenu(null);
                 item.action();

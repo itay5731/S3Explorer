@@ -2,8 +2,9 @@
 
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AppError, Bucket, ConnectionInfo, FolderEntry, ObjectEntry } from "../lib/types";
+import type { AppError, Bucket, ConnectionInfo, FolderEntry, JobRequest, ObjectEntry } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
+import { clearClipboard } from "./clipboard";
 
 export type SortKey = "name" | "size" | "modified" | "class";
 export interface SortState {
@@ -21,7 +22,24 @@ export interface Listing {
   error: AppError | null;
 }
 
-export type Modal = { kind: "newFolder" } | { kind: "deleteFolder"; prefix: string } | null;
+/** The single item being renamed (exact server key/prefix plus its last segment). */
+export interface RenameTarget {
+  bucket: string;
+  key: string;
+  isPrefix: boolean;
+  name: string;
+  /** The folder it lives in: `key` minus its name (and trailing "/" for folders). */
+  parent: string;
+}
+
+export type Modal =
+  | { kind: "newFolder" }
+  /** Confirm a delete job; `request` is exactly what will be sent. */
+  | { kind: "delete"; request: JobRequest }
+  | { kind: "rename"; target: RenameTarget }
+  /** Confirm a paste (copy or move job). `renamed` = names got a "(copy)" suffix. */
+  | { kind: "paste"; request: JobRequest; mode: "copy" | "cut"; srcPrefix: string; destPrefix: string; renamed: boolean }
+  | null;
 
 export interface ContextMenuState {
   x: number;
@@ -123,6 +141,7 @@ async function fetchPage(bucket: string, prefix: string, token: string | null, s
 // ---- connection ------------------------------------------------------------------
 
 export function setConnected(info: ConnectionInfo) {
+  clearClipboard();
   set({
     connection: info,
     buckets: [],
@@ -144,7 +163,8 @@ export async function disconnect() {
     /* disconnect is best effort */
   }
   listSeq++;
-  set({ connection: null, buckets: [], bucket: null, prefix: "", listing: emptyListing, selection: new Set() });
+  clearClipboard();
+  set({ connection: null, buckets: [], bucket: null, prefix: "", listing: emptyListing, selection: new Set(), modal: null, contextMenu: null });
 }
 
 export async function loadBuckets() {
@@ -230,6 +250,65 @@ async function loadFirstPage(keepSelection = false) {
     if (seq !== listSeq) return;
     set({ listing: { ...emptyListing, error: e as AppError } });
   }
+}
+
+let inPlace: Promise<void> | null = null;
+let inPlaceAgain = false;
+
+/**
+ * Re-list the current folder after something changed it (a job), without the loading state:
+ * reloads as many entries as were loaded before so the scroll position survives, keeps the
+ * selection for entries that still exist and drops the rest. Concurrent calls coalesce.
+ */
+export function refreshInPlace(): Promise<void> {
+  if (inPlace) {
+    inPlaceAgain = true;
+    return inPlace;
+  }
+  inPlace = (async () => {
+    do {
+      inPlaceAgain = false;
+      await reloadKeepingPosition();
+    } while (inPlaceAgain);
+  })().finally(() => {
+    inPlace = null;
+  });
+  return inPlace;
+}
+
+async function reloadKeepingPosition() {
+  const { bucket, prefix, listing } = get();
+  if (!bucket || listing.loading) return;
+  const want = Math.max(1, listing.folders.length + listing.objects.length);
+  const seq = ++listSeq;
+  const folders: FolderEntry[] = [];
+  const objects: ObjectEntry[] = [];
+  let token: string | null = null;
+  let truncated = false;
+  try {
+    do {
+      const page = await fetchPage(bucket, prefix, token, seq);
+      if (seq !== listSeq) return;
+      folders.push(...page.folders);
+      objects.push(...page.objects);
+      token = page.nextContinuationToken;
+      truncated = page.isTruncated;
+    } while (truncated && token && folders.length + objects.length < want);
+  } catch {
+    // Keep showing what we had; the next refresh (or the user) can retry.
+    return;
+  }
+  if (seq !== listSeq) return;
+  set((s) => {
+    const ids = new Set<string>([...folders.map((f) => f.prefix), ...objects.map((o) => o.key)]);
+    const selection = new Set([...s.selection].filter((id) => ids.has(id)));
+    return {
+      listing: { folders, objects, token, truncated, loading: false, loadingMore: false, error: null },
+      selection: selection.size === s.selection.size ? s.selection : selection,
+      anchor: s.anchor && ids.has(s.anchor) ? s.anchor : null,
+      focus: s.focus && ids.has(s.focus) ? s.focus : null,
+    };
+  });
 }
 
 export async function loadMore() {

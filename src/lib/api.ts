@@ -10,6 +10,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  JOB_PROGRESS_EVENT,
   TRANSFER_PROGRESS_EVENT,
   UPDATE_PROGRESS_EVENT,
   type AppError,
@@ -17,8 +18,10 @@ import {
   type Bucket,
   type ConnectionConfig,
   type ConnectionInfo,
-  type DeleteResult,
   type ErrorCode,
+  type Job,
+  type JobPreview,
+  type JobRequest,
   type ListPage,
   type ObjectMeta,
   type ProfileInfo,
@@ -47,7 +50,13 @@ export interface Backend {
   listObjects(bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number): Promise<ListPage>;
   headObject(bucket: string, key: string): Promise<ObjectMeta>;
   createFolder(bucket: string, prefix: string): Promise<void>;
-  deleteFolder(bucket: string, prefix: string): Promise<DeleteResult>;
+  // Object operations (jobs)
+  previewJob(request: JobRequest): Promise<JobPreview>;
+  startJob(request: JobRequest): Promise<string>;
+  cancelJob(id: string): Promise<void>;
+  removeJob(id: string): Promise<void>;
+  listJobs(): Promise<Job[]>;
+  onJobProgress(cb: (j: Job) => void): Promise<Unlisten>;
   startDownload(bucket: string, key: string, destPath: string): Promise<string>;
   startUpload(bucket: string, key: string, srcPath: string): Promise<string>;
   cancelTransfer(id: string): Promise<void>;
@@ -110,7 +119,12 @@ const tauriBackend: Backend = {
     }),
   headObject: (bucket, key) => invoke<ObjectMeta>("head_object", { bucket, key }),
   createFolder: (bucket, prefix) => invoke<void>("create_folder", { bucket, prefix }),
-  deleteFolder: (bucket, prefix) => invoke<DeleteResult>("delete_folder", { bucket, prefix }),
+  previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
+  startJob: (request) => invoke<string>("start_job", { request }),
+  cancelJob: (id) => invoke<void>("cancel_job", { id }),
+  removeJob: (id) => invoke<void>("remove_job", { id }),
+  listJobs: () => invoke<Job[]>("list_jobs"),
+  onJobProgress: (cb) => listen<Job>(JOB_PROGRESS_EVENT, (e) => cb(e.payload)),
   startDownload: (bucket, key, destPath) => invoke<string>("start_download", { bucket, key, destPath }),
   startUpload: (bucket, key, srcPath) => invoke<string>("start_upload", { bucket, key, srcPath }),
   cancelTransfer: (id) => invoke<void>("cancel_transfer", { id }),
@@ -196,7 +210,12 @@ export const listObjects = (bucket: string, prefix: string, continuationToken?: 
   call("listObjects", bucket, prefix, continuationToken, pageSize);
 export const headObject = (bucket: string, key: string) => call("headObject", bucket, key);
 export const createFolder = (bucket: string, prefix: string) => call("createFolder", bucket, prefix);
-export const deleteFolder = (bucket: string, prefix: string) => call("deleteFolder", bucket, prefix);
+export const previewJob = (request: JobRequest) => call("previewJob", request);
+export const startJob = (request: JobRequest) => call("startJob", request);
+export const cancelJob = (id: string) => call("cancelJob", id);
+export const removeJob = (id: string) => call("removeJob", id);
+export const listJobs = () => call("listJobs");
+export const onJobProgress = (cb: (j: Job) => void) => call("onJobProgress", cb);
 export const startDownload = (bucket: string, key: string, destPath: string) =>
   call("startDownload", bucket, key, destPath);
 export const startUpload = (bucket: string, key: string, srcPath: string) => call("startUpload", bucket, key, srcPath);
