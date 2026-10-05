@@ -37,7 +37,13 @@ Release procedure (orchestrator only, after the `verify` gate passes):
 
 To publish a Release for a tag that predates its notes, run the workflow manually with the `tag` input.
 
-Never move or delete a pushed tag; fix forward with a new PATCH version.
+Never move or delete a pushed **version** tag (`vX.Y.Z`); fix forward with a new PATCH version.
+
+**Release candidates are temporary.** Use a tag like `vX.Y.Z-rc.1` only to test a change to the release pipeline
+itself (it is published as a pre-release, which `releases/latest` and the in-app updater ignore). As soon as it
+has answered its question, delete it: `git push origin :refs/tags/vX.Y.Z-rc.1` and `git tag -d vX.Y.Z-rc.1`.
+GitHub then keeps the release as a hidden draft that only the owner can delete (Releases page), so tell the
+user it is there. Do not leave a release candidate published next to the real release.
 
 History: `v0.1.0` = first working app (list, browse, upload, download, folders). It was tagged before the
 release job existed, so its Release has to be published by a manual workflow run with `tag: v0.1.0`.
