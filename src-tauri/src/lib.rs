@@ -14,6 +14,8 @@ pub mod profiles;
 pub mod saved;
 pub mod settings;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod transfers;
 pub mod updates;
 

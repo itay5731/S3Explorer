@@ -4262,6 +4262,7 @@ dependencies = [
  "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
+ "aws-smithy-checksums",
  "aws-smithy-types",
  "base64 0.22.1",
  "bytes",

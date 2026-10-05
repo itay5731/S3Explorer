@@ -12,6 +12,7 @@ pub mod plan;
 pub mod validate;
 
 use std::collections::HashSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -19,6 +20,7 @@ use std::time::Duration;
 use aws_sdk_s3::Client;
 use dashmap::DashMap;
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
@@ -213,7 +215,14 @@ impl JobManager {
                 self.sink.emit(&entry.snapshot());
                 let stop = CancellationToken::new();
                 let ticker = tokio::spawn(ticker(self.sink.clone(), entry.clone(), stop.clone()));
-                let r = self.execute(&entry, &req, &src, dest.as_ref()).await;
+                // A panic must not leave the job "running" forever (has_active() would block the
+                // updater): it becomes a job-level failure and `finish` still runs. A multipart
+                // copy in flight is aborted by its drop guard. Release builds use
+                // `panic = "abort"`, so there a panic still ends the whole process.
+                let r = AssertUnwindSafe(self.execute(&entry, &req, &src, dest.as_ref()))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|p| Err(AppError::from_panic(&*p)));
                 stop.cancel();
                 let _ = ticker.await;
                 r
@@ -235,7 +244,8 @@ impl JobManager {
 
         // ---- listing phase: nothing is changed here ----
         let on_page = |n: u64| entry.lock().total_items += n;
-        let (exp, _) = engine::expand(&ctx, transfer, None, &on_page).await?;
+        let (mut exp, _) = engine::expand(&ctx, transfer, None, &on_page).await?;
+        engine::require_move_etags(&ctx, &mut exp).await?;
         {
             let mut j = entry.lock();
             j.total_items = (exp.work.len() + exp.missing.len()) as u64;
@@ -369,6 +379,292 @@ async fn ticker(sink: Arc<dyn JobSink>, entry: Arc<JobEntry>, stop: Cancellation
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::JobItem;
+    use crate::testutil::{h, FakeS3, Reply, Req};
+
+    // ---- end-to-end against a scripted fake S3 (fabricated DeleteObjects / listing answers) ----
+
+    fn delete_result(deleted: &[&str], errors: &[(Option<&str>, &str)]) -> String {
+        let mut x = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#);
+        for k in deleted {
+            x.push_str(&format!("<Deleted><Key>{k}</Key></Deleted>"));
+        }
+        for (k, code) in errors {
+            x.push_str("<Error>");
+            if let Some(k) = k {
+                x.push_str(&format!("<Key>{k}</Key>"));
+            }
+            x.push_str(&format!("<Code>{code}</Code><Message>fabricated</Message></Error>"));
+        }
+        x.push_str("</DeleteResult>");
+        x
+    }
+
+    fn is_delete(r: &Req) -> bool {
+        r.method == "POST" && r.has_query("delete")
+    }
+
+    fn obj(from: &str, to: Option<&str>) -> JobItem {
+        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false }
+    }
+
+    fn request(kind: JobKind, items: Vec<JobItem>) -> JobRequest {
+        JobRequest {
+            kind,
+            src_bucket: "b".into(),
+            dest_bucket: if kind == JobKind::Delete { None } else { Some("b".into()) },
+            items,
+            on_conflict: ConflictPolicy::Overwrite,
+        }
+    }
+
+    async fn run(req: JobRequest, client: &Client) -> (Job, Arc<JobManager>) {
+        let m = JobManager::new(Arc::new(NoopJobSink));
+        let dest = (req.kind != JobKind::Delete).then(|| client.clone());
+        let id = m.start(req, client.clone(), dest).expect("start");
+        let j = tokio::time::timeout(Duration::from_secs(60), m.wait(&id)).await.expect("job finished").expect("known");
+        (j, m)
+    }
+
+    /// Delete job of keys k1..k3 whose DeleteObjects answer is `answer`; `exists` says which keys a
+    /// follow-up HeadObject still finds.
+    async fn delete_job(answer: String, exists: &'static [&'static str]) -> (Job, FakeS3) {
+        let s3 = FakeS3::start(move |r| {
+            if is_delete(r) {
+                Reply::xml(200, &answer)
+            } else if r.method == "HEAD" {
+                let key = r.path.trim_start_matches("/b/");
+                if exists.contains(&key) {
+                    Reply::with_headers(200, vec![h("Content-Length", "3"), h("ETag", "\"x\"")])
+                } else {
+                    Reply::status(404)
+                }
+            } else {
+                Reply::status(500)
+            }
+        })
+        .await;
+        let req = request(JobKind::Delete, vec![obj("k1", None), obj("k2", None), obj("k3", None)]);
+        let (j, _) = run(req, &s3.client()).await;
+        (j, s3)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delete_job_trusts_only_confirmed_keys() {
+        // All confirmed.
+        let (j, s3) = delete_job(delete_result(&["k1", "k2", "k3"], &[]), &[]).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 3, 0));
+        assert_eq!(s3.count(|r| r.method == "HEAD"), 0, "no lookups when everything is confirmed");
+        let sent = s3.requests().into_iter().find(is_delete).expect("delete sent");
+        assert!(String::from_utf8_lossy(&sent.body).contains("<Quiet>false</Quiet>"), "Quiet is off");
+        // k2 missing from both lists and still there: a per-object failure, job failed.
+        let (j, _) = delete_job(delete_result(&["k1", "k3"], &[]), &["k2"]).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 2, 1));
+        assert_eq!(j.errors[0].key, "k2");
+        assert_eq!(j.errors[0].message, engine::DELETE_NOT_CONFIRMED);
+        // k2 missing from both lists but gone (HeadObject 404): deleted.
+        let (j, s3) = delete_job(delete_result(&["k1", "k3"], &[]), &[]).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 3, 0));
+        assert_eq!(s3.count(|r| r.method == "HEAD" && r.path == "/b/k2"), 1);
+        // An error without a key: nothing in the batch counts as done.
+        let (j, _) = delete_job(delete_result(&["k1", "k2", "k3"], &[(None, "InternalError")]), &[]).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 0, 3));
+        assert!(j.errors[0].message.contains("without naming the object"), "{}", j.errors[0].message);
+        // An error with a key fails that key only.
+        let (j, _) = delete_job(delete_result(&["k1", "k3"], &[(Some("k2"), "AccessDenied")]), &[]).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 2, 1));
+        assert_eq!(j.errors[0].message, "AccessDenied: fabricated");
+        // Duplicate entries in the answer change nothing.
+        let (j, _) = delete_job(delete_result(&["k1", "k1", "k2", "k3", "k3"], &[]), &[]).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 3, 0));
+    }
+
+    /// A move of `s/a` -> `d/a` (same bucket) whose source deletes are answered by `deletes` in
+    /// turn (the last one repeats); `src_exists` is what a HeadObject of the source says after
+    /// the copy.
+    async fn move_job(deletes: Vec<String>, src_exists_after: bool) -> (Job, FakeS3) {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        let s3 = FakeS3::start(move |r| {
+            let etag = h("ETag", "\"e1\"");
+            match (r.method.as_str(), r.path.as_str()) {
+                ("HEAD", "/b/s/a") => {
+                    let deleting = n.load(Ordering::SeqCst) > 0;
+                    if deleting && !src_exists_after {
+                        Reply::status(404)
+                    } else {
+                        Reply::with_headers(200, vec![h("Content-Length", "5"), etag])
+                    }
+                }
+                ("HEAD", "/b/d/a") => Reply::with_headers(200, vec![h("Content-Length", "5"), etag]),
+                ("PUT", "/b/d/a") if r.header("x-amz-copy-source").is_some() => Reply::xml(
+                    200,
+                    r#"<CopyObjectResult><ETag>"e1"</ETag><LastModified>2026-01-01T00:00:00.000Z</LastModified></CopyObjectResult>"#,
+                ),
+                ("POST", "/b" | "/b/") if r.has_query("delete") => {
+                    let i = n.fetch_add(1, Ordering::SeqCst).min(deletes.len() - 1);
+                    Reply::xml(200, &deletes[i])
+                }
+                _ => Reply::status(500),
+            }
+        })
+        .await;
+        let (j, _) = run(request(JobKind::Move, vec![obj("s/a", Some("d/a"))]), &s3.client()).await;
+        (j, s3)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_counts_a_source_as_moved_only_when_its_delete_is_confirmed() {
+        let (j, s3) = move_job(vec![delete_result(&["s/a"], &[])], true).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 1, 0));
+        let del = s3.requests().into_iter().find(is_delete).expect("delete sent");
+        assert!(String::from_utf8_lossy(&del.body).contains("<ETag>"), "conditional on the copied ETag");
+        // Not mentioned and still there: the copy exists, the original remains, never "moved".
+        let (j, _) = move_job(vec![delete_result(&[], &[])], true).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 0, 1));
+        let m = &j.errors[0].message;
+        assert!(m.contains("did not confirm the delete") && m.contains("The copy exists and the original remains"), "{m}");
+        // An unattributable error: same.
+        let (j, _) = move_job(vec![delete_result(&["s/a"], &[(None, "InternalError")])], true).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 0, 1));
+        assert!(j.errors[0].message.contains("The copy exists and the original remains"));
+        // Not mentioned but gone: moved.
+        let (j, _) = move_job(vec![delete_result(&[], &[])], false).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_retry_without_etag_follows_the_same_rule() {
+        let rejected = delete_result(&[], &[(Some("s/a"), "NotImplemented")]);
+        // Retried without the condition, then confirmed.
+        let (j, s3) = move_job(vec![rejected.clone(), delete_result(&["s/a"], &[])], true).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 1, 0));
+        let dels: Vec<Req> = s3.requests().into_iter().filter(is_delete).collect();
+        assert_eq!(dels.len(), 2);
+        assert!(String::from_utf8_lossy(&dels[0].body).contains("<ETag>"));
+        assert!(!String::from_utf8_lossy(&dels[1].body).contains("<ETag>"), "retry is unconditional");
+        // Retried, but the retry is not confirmed and the source is still there: failure.
+        let (j, s3) = move_job(vec![rejected, delete_result(&[], &[])], true).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 0, 1));
+        assert!(j.errors[0].message.contains("The copy exists and the original remains"));
+        assert_eq!(s3.count(is_delete), 2, "retried once only");
+    }
+
+    fn list_xml(keys: &[(&str, Option<&str>)], is_truncated: Option<bool>, next: Option<&str>) -> String {
+        let mut x = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>b</Name>"#);
+        if let Some(t) = is_truncated {
+            x.push_str(&format!("<IsTruncated>{t}</IsTruncated>"));
+        }
+        if let Some(n) = next {
+            x.push_str(&format!("<NextContinuationToken>{n}</NextContinuationToken>"));
+        }
+        for (k, etag) in keys {
+            x.push_str(&format!("<Contents><Key>{k}</Key><Size>5</Size>"));
+            if let Some(e) = etag {
+                x.push_str(&format!("<ETag>{e}</ETag>"));
+            }
+            x.push_str("</Contents>");
+        }
+        x.push_str("</ListBucketResult>");
+        x
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn listing_follows_a_token_even_without_is_truncated() {
+        let s3 = FakeS3::start(|r| {
+            if r.method == "GET" && r.has_query("list-type") {
+                if r.query.contains("continuation-token=T1") {
+                    Reply::xml(200, &list_xml(&[("p/2", Some("\"2\""))], None, None))
+                } else {
+                    Reply::xml(200, &list_xml(&[("p/1", Some("\"1\""))], None, Some("T1")))
+                }
+            } else if is_delete(r) {
+                let keys = r.xml_keys();
+                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                Reply::xml(200, &delete_result(&keys, &[]))
+            } else {
+                Reply::status(500)
+            }
+        })
+        .await;
+        let req = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true }]);
+        let (j, _) = run(req, &s3.client()).await;
+        assert_eq!((j.status, j.total_items, j.done_items), (JobStatus::Completed, 2, 2));
+        let del = s3.requests().into_iter().find(is_delete).expect("delete");
+        assert_eq!(del.xml_keys(), vec!["p/1", "p/2"], "the second page was listed");
+
+        // A server that hands out the same token forever: the job fails before any change.
+        let s3 = FakeS3::start(|r| {
+            if r.method == "GET" && r.has_query("list-type") {
+                Reply::xml(200, &list_xml(&[("p/1", Some("\"1\""))], Some(true), Some("SAME")))
+            } else {
+                Reply::status(500)
+            }
+        })
+        .await;
+        let req = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true }]);
+        let (j, _) = run(req, &s3.client()).await;
+        assert_eq!(j.status, JobStatus::Failed);
+        assert!(j.error.as_deref().unwrap_or_default().contains("same continuation token"), "{:?}", j.error);
+        assert_eq!(s3.count(is_delete), 0);
+        assert_eq!(s3.count(|r| r.has_query("list-type")), 2);
+    }
+
+    /// A prefix move whose listing has no ETags; `head_etag` is what HeadObject then says.
+    async fn move_without_listing_etag(head_etag: Option<&'static str>) -> (Job, FakeS3) {
+        let s3 = FakeS3::start(move |r| match (r.method.as_str(), r.path.as_str()) {
+            ("GET", "/b" | "/b/") if r.has_query("list-type") => Reply::xml(200, &list_xml(&[("s/x", None)], Some(false), None)),
+            ("HEAD", "/b/s/x") | ("HEAD", "/b/d/x") => {
+                let mut hs = vec![h("Content-Length", "5")];
+                if let Some(e) = head_etag {
+                    hs.push(h("ETag", e));
+                }
+                Reply::with_headers(200, hs)
+            }
+            ("PUT", "/b/d/x") => Reply::xml(
+                200,
+                r#"<CopyObjectResult><ETag>"e"</ETag><LastModified>2026-01-01T00:00:00.000Z</LastModified></CopyObjectResult>"#,
+            ),
+            ("POST", "/b" | "/b/") if r.has_query("delete") => Reply::xml(200, &delete_result(&["s/x"], &[])),
+            _ => Reply::status(500),
+        })
+        .await;
+        let req = request(JobKind::Move, vec![JobItem { from: "s/".into(), to: Some("d/".into()), is_prefix: true }]);
+        let (j, _) = run(req, &s3.client()).await;
+        (j, s3)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_needs_an_etag_before_anything_changes() {
+        // No ETag anywhere: not moved, nothing written or deleted.
+        let (j, s3) = move_without_listing_etag(None).await;
+        assert_eq!((j.status, j.total_items, j.done_items, j.failed_items), (JobStatus::Failed, 1, 0, 1));
+        assert_eq!(j.errors[0].message, engine::NO_ETAG_FOR_MOVE);
+        assert_eq!(s3.count(|r| r.method == "PUT"), 0, "no copy");
+        assert_eq!(s3.count(is_delete), 0, "no delete");
+        // The listing had none, HeadObject has one: the move goes ahead, pinned to it.
+        let (j, s3) = move_without_listing_etag(Some("\"h1\"")).await;
+        assert_eq!((j.status, j.done_items), (JobStatus::Completed, 1));
+        let put = s3.requests().into_iter().find(|r| r.method == "PUT").expect("copy");
+        assert_eq!(put.header("x-amz-copy-source-if-match"), Some("\"h1\""));
+        let del = s3.requests().into_iter().find(is_delete).expect("delete");
+        assert!(String::from_utf8_lossy(&del.body).contains("<ETag>&quot;h1&quot;</ETag>") || String::from_utf8_lossy(&del.body).contains("<ETag>\"h1\"</ETag>"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_job_still_finishes() {
+        let hook: AfterListingHook = Arc::new(|_| Box::pin(async { panic!("injected fault") }));
+        let m = JobManager::with_tuning(Arc::new(NoopJobSink), JobTuning { after_listing: Some(hook), ..JobTuning::default() });
+        let conf = aws_sdk_s3::Config::builder().behavior_version(aws_sdk_s3::config::BehaviorVersion::latest()).build();
+        let client = Client::from_conf(conf);
+        // A single-key delete needs no request before the hook (delete keys are not looked up).
+        let id = m.start(request(JobKind::Delete, vec![obj("k", None)]), client, None).expect("start");
+        let j = tokio::time::timeout(Duration::from_secs(10), m.wait(&id)).await.expect("not stuck").expect("known");
+        assert_eq!((j.status, j.phase), (JobStatus::Failed, JobPhase::Done));
+        assert!(j.finished_at.is_some());
+        assert!(j.error.as_deref().unwrap_or_default().contains("injected fault"), "{:?}", j.error);
+        assert!(!m.has_active());
+        assert_eq!(m.running_count(), 0, "run slot released");
+    }
 
     fn job() -> Job {
         Job {

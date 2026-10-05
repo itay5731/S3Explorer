@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use super::plan::{encode_copy_source, plan_copy_parts, Expansion, ItemListing, Listed, Planned};
 use super::{JobEntry, JobTuning};
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::models::{ConflictPolicy, JobKind, JobRequest};
+use crate::models::{ConflictPolicy, JobError, JobKind, JobRequest};
+use crate::ops::{listing_error, next_list_page, NextPage};
+use crate::transfers::AbortOnDrop;
 
 /// Object operations in flight per job (copies, or delete batches for a delete job count 1 each).
 pub const OBJECT_CONCURRENCY: usize = 16;
@@ -32,9 +34,21 @@ pub const DELETE_BATCH: usize = 1000;
 const DELETE_CONCURRENCY: usize = 4;
 /// A move deletes the sources of confirmed copies at least this often (or every 1,000 keys).
 const SOURCE_DELETE_INTERVAL: Duration = Duration::from_millis(500);
-/// Copies can legitimately take minutes before S3 answers (up to 5 GiB per request, possibly
-/// across regions); the connection's 30 s read timeout would cut them off.
-const COPY_READ_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Server-side copies answer only when done (up to 5 GiB per `CopyObject` / `UploadPartCopy`,
+/// possibly across regions, with up to 16 copies sharing the server), so the connection's 30 s
+/// read timeout would cut them off. Their bound scales with the bytes copied instead: this much
+/// time plus the bytes at [`COPY_MIN_RATE`], clamped to [`COPY_TIMEOUT_MIN`, `COPY_TIMEOUT_MAX`].
+const COPY_TIMEOUT_BASE: Duration = Duration::from_secs(5 * 60);
+/// Assumed slowest healthy server-side copy rate per request (2 MiB/s: a 5 GiB copy may take ~43 min).
+const COPY_MIN_RATE: u64 = 2 * 1024 * 1024;
+/// Never less than the fixed 15 minutes used before.
+const COPY_TIMEOUT_MIN: Duration = Duration::from_secs(15 * 60);
+const COPY_TIMEOUT_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// The response wait and attempt bound for a server-side copy of `bytes` bytes.
+pub(crate) fn copy_timeout_for(bytes: u64) -> Duration {
+    (COPY_TIMEOUT_BASE + Duration::from_secs(bytes / COPY_MIN_RATE)).clamp(COPY_TIMEOUT_MIN, COPY_TIMEOUT_MAX)
+}
 
 pub(crate) struct Ctx<'a> {
     pub req: &'a JobRequest,
@@ -64,9 +78,13 @@ async fn cancellable<T>(token: &CancellationToken, f: impl std::future::Future<O
     }
 }
 
-fn copy_timeout() -> aws_sdk_s3::config::Builder {
+/// Config override for a copy of `bytes` bytes: no request body, so the read timeout (time to
+/// the response) and the per-attempt timeout get the same size-scaled bound; SDK retries still
+/// apply (an attempt timeout is a retryable error). The connect timeout is inherited.
+fn copy_timeout(bytes: u64) -> aws_sdk_s3::config::Builder {
+    let t = copy_timeout_for(bytes);
     aws_sdk_s3::config::Builder::default()
-        .timeout_config(TimeoutConfig::builder().read_timeout(COPY_READ_TIMEOUT).build())
+        .timeout_config(TimeoutConfig::builder().read_timeout(t).operation_attempt_timeout(t).build())
 }
 
 /// HTTP status and S3 error code of a failed request.
@@ -80,8 +98,9 @@ fn err_info<E: ProvideErrorMetadata>(e: &SdkError<E, HttpResponse>) -> (Option<u
 
 /// Lists every key under `prefix` (no delimiter, all pages). With a `budget` (shared by
 /// concurrent listings) it stops once the budget is used up; the flag is true when it stopped
-/// before the end. A truncated page without a usable continuation token is an error: silently
-/// stopping would under-count destinations that already exist.
+/// before the end. Paging follows [`next_list_page`]: a continuation token is followed even when
+/// `IsTruncated` is missing, and a truncated page without a token, or a token the server already
+/// sent, is an error (silently stopping would under-count sources and existing destinations).
 pub(crate) async fn list_prefix(
     client: &Client,
     bucket: &str,
@@ -92,6 +111,7 @@ pub(crate) async fn list_prefix(
 ) -> AppResult<(Vec<Listed>, bool)> {
     let mut out = Vec::new();
     let mut token: Option<String> = None;
+    let mut seen: HashSet<String> = HashSet::new();
     loop {
         if budget.is_some_and(|b| b.load(Ordering::Relaxed) <= 0) {
             return Ok((out, true));
@@ -115,17 +135,13 @@ pub(crate) async fn list_prefix(
         if let Some(b) = budget {
             b.fetch_sub(added as i64, Ordering::Relaxed);
         }
-        if !resp.is_truncated().unwrap_or(false) {
-            return Ok((out, false));
-        }
-        match resp.next_continuation_token() {
-            Some(t) if !t.is_empty() && Some(t) != token.as_deref() => token = Some(t.to_string()),
-            _ => {
-                return Err(AppError::new(
-                    ErrorCode::Unknown,
-                    format!("Listing {prefix:?} in {bucket} was truncated without a usable continuation token"),
-                ))
+        match next_list_page(resp.is_truncated(), resp.next_continuation_token(), |t| seen.contains(t)) {
+            NextPage::Done => return Ok((out, false)),
+            NextPage::Continue(t) => {
+                seen.insert(t.clone());
+                token = Some(t);
             }
+            NextPage::Error(why) => return Err(listing_error(bucket, prefix, why)),
         }
     }
 }
@@ -220,6 +236,73 @@ pub(crate) async fn expand(
     Ok((exp, truncated))
 }
 
+/// Per-object error for a move whose source has no ETag (none in the listing nor from `HeadObject`).
+pub(crate) const NO_ETAG_FOR_MOVE: &str = "The server did not provide an ETag for this object, so the move could not be made safe (the copy and the delete of the original could not be tied to this exact version). The object was not moved.";
+
+/// For a move, every source must have an ETag: it pins the copy (`x-amz-copy-source-if-match`)
+/// and the delete of the original. Returns the objects that may proceed and per-object errors
+/// for the others. A copy never deletes anything, so it proceeds without an ETag.
+pub(crate) fn split_unmovable(kind: JobKind, work: Vec<Planned>) -> (Vec<Planned>, Vec<JobError>) {
+    if kind != JobKind::Move {
+        return (work, Vec::new());
+    }
+    let (ok, bad): (Vec<Planned>, Vec<Planned>) = work.into_iter().partition(|p| p.etag.as_deref().is_some_and(|e| !e.is_empty()));
+    (ok, bad.into_iter().map(|p| JobError { key: p.src, message: NO_ETAG_FOR_MOVE.into() }).collect())
+}
+
+/// Listing phase of a move: sources the listing gave no ETag are looked up with `HeadObject`
+/// (size, ETag and storage class are taken from it); a source that is gone by then is a
+/// per-object failure; one still without an ETag is not moved (see [`split_unmovable`]).
+/// A `HeadObject` error fails the job before any change, like any listing error.
+pub(crate) async fn require_move_etags(ctx: &Ctx<'_>, exp: &mut Expansion) -> AppResult<()> {
+    if ctx.req.kind != JobKind::Move {
+        return Ok(());
+    }
+    let need: Vec<usize> =
+        (0..exp.work.len()).filter(|&i| exp.work[i].etag.as_deref().is_none_or(str::is_empty)).collect();
+    if !need.is_empty() {
+        let work = &exp.work;
+        let need = &need;
+        let found: Vec<(usize, Option<Listed>)> = stream::iter(0..need.len())
+            .map(move |n| async move {
+                let i = need[n];
+                Ok::<_, AppError>((i, head(ctx.src, &ctx.req.src_bucket, &work[i].src, ctx.cancel).await?))
+            })
+            .buffered(LIST_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let mut gone = HashSet::new();
+        for (i, h) in found {
+            match h {
+                Some(h) => {
+                    let p = &mut exp.work[i];
+                    p.size = h.size;
+                    p.etag = h.etag;
+                    p.storage_class = h.storage_class.or(p.storage_class.take());
+                }
+                None => {
+                    gone.insert(i);
+                }
+            }
+        }
+        if !gone.is_empty() {
+            let mut i = 0;
+            exp.work.retain(|p| {
+                let keep = !gone.contains(&i);
+                if !keep {
+                    exp.missing.push(JobError { key: p.src.clone(), message: SOURCE_GONE.into() });
+                }
+                i += 1;
+                keep
+            });
+        }
+    }
+    let (ok, errors) = split_unmovable(ctx.req.kind, std::mem::take(&mut exp.work));
+    exp.work = ok;
+    exp.missing.extend(errors);
+    Ok(())
+}
+
 /// Destination keys of `exp` that already exist: each prefix item's destination prefix is
 /// listed once and intersected; single-object items are checked with `HeadObject`.
 pub(crate) async fn existing_dests(ctx: &Ctx<'_>, exp: &Expansion, cap: Option<u64>) -> AppResult<(HashSet<String>, bool)> {
@@ -276,35 +359,145 @@ pub(crate) async fn existing_dests(ctx: &Ctx<'_>, exp: &Expansion, cap: Option<u
 
 // ---- working phase: delete --------------------------------------------------------------------
 
-/// One `DeleteObjects` request (Quiet off). `Ok` holds the per-key errors from the 200
-/// response; keys not listed there were deleted (a missing key counts as deleted, as in S3).
-/// With ETags, each key is deleted only if it still has that ETag.
-async fn delete_objects(
-    client: &Client,
-    bucket: &str,
-    keys: &[(&str, Option<&str>)],
-) -> Result<HashMap<String, String>, SdkError<aws_sdk_s3::operation::delete_objects::DeleteObjectsError, HttpResponse>>
-{
+/// The message for a key a `DeleteObjects` response neither confirmed nor reported an error for
+/// (and that a `HeadObject` afterwards still found, or could not check).
+pub(crate) const DELETE_NOT_CONFIRMED: &str = "The server did not confirm the delete.";
+
+/// What one `DeleteObjects` response says about one requested key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyOutcome {
+    /// Listed under `<Deleted>`.
+    Deleted,
+    /// Listed under `<Error>` (`"Code: Message"`).
+    Failed(String),
+    /// In neither list: not proven deleted.
+    Unconfirmed,
+}
+
+/// Why a `DeleteObjects` batch as a whole has no per-key result.
+#[derive(Debug)]
+enum BatchError {
+    /// The request failed (nothing in it is known to be deleted).
+    Request(Box<SdkError<aws_sdk_s3::operation::delete_objects::DeleteObjectsError, HttpResponse>>),
+    /// The response cannot be attributed to keys (an `<Error>` without a key).
+    Unattributed(String),
+}
+
+impl BatchError {
+    fn message(self) -> String {
+        match self {
+            BatchError::Request(e) => AppError::from(*e).message,
+            BatchError::Unattributed(m) => m,
+        }
+    }
+}
+
+fn error_text(code: Option<&str>, message: Option<&str>) -> String {
+    match (code, message) {
+        (Some(c), Some(m)) => format!("{c}: {m}"),
+        (Some(c), None) => c.to_string(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => "Unknown error".to_string(),
+    }
+}
+
+/// Classifies a `DeleteObjects` response for the `requested` keys (one outcome per requested
+/// key, in order). A key counts as deleted only if the response lists it under `<Deleted>`; an
+/// `<Error>` for a key wins over a `<Deleted>` entry for it. An `<Error>` without a key cannot be
+/// attributed, so the whole batch fails (no key in it is counted as deleted).
+pub(crate) fn classify_delete(
+    requested: &[&str],
+    deleted: &[Option<&str>],
+    errors: &[(Option<&str>, String)],
+) -> Result<Vec<KeyOutcome>, String> {
+    if let Some((_, m)) = errors.iter().find(|(k, _)| k.is_none_or(str::is_empty)) {
+        return Err(format!(
+            "The server reported an error without naming the object ({m}), so no object in this batch of {} can be confirmed as deleted.",
+            requested.len()
+        ));
+    }
+    let mut failed: HashMap<&str, &str> = HashMap::new();
+    for (k, m) in errors {
+        if let Some(k) = k {
+            failed.entry(k).or_insert(m.as_str());
+        }
+    }
+    let ok: HashSet<&str> = deleted.iter().flatten().copied().collect();
+    Ok(requested
+        .iter()
+        .map(|k| match failed.get(k) {
+            Some(m) => KeyOutcome::Failed(m.to_string()),
+            None if ok.contains(k) => KeyOutcome::Deleted,
+            None => KeyOutcome::Unconfirmed,
+        })
+        .collect())
+}
+
+/// One `DeleteObjects` request (Quiet off), one outcome per key (never `Unconfirmed`: a key the
+/// response does not mention is looked up with `HeadObject`; gone = deleted, otherwise it fails
+/// with [`DELETE_NOT_CONFIRMED`]). With ETags, each key is deleted only if it still has that ETag.
+async fn delete_objects(client: &Client, bucket: &str, keys: &[(&str, Option<&str>)]) -> Result<Vec<KeyOutcome>, BatchError> {
     let ids = keys
         .iter()
         .map(|(k, etag)| ObjectIdentifier::builder().key(*k).set_e_tag(etag.map(str::to_string)).build())
         .collect::<Result<Vec<_>, _>>()
-        .map_err(SdkError::construction_failure)?;
-    let delete = Delete::builder().set_objects(Some(ids)).quiet(false).build().map_err(SdkError::construction_failure)?;
-    let resp = client.delete_objects().bucket(bucket).delete(delete).send().await?;
-    Ok(resp
-        .errors()
-        .iter()
-        .map(|e| {
-            let msg = match (e.code(), e.message()) {
-                (Some(c), Some(m)) => format!("{c}: {m}"),
-                (Some(c), None) => c.to_string(),
-                (None, Some(m)) => m.to_string(),
-                (None, None) => "Unknown error".to_string(),
-            };
-            (e.key().unwrap_or_default().to_string(), msg)
+        .map_err(|e| BatchError::Request(Box::new(SdkError::construction_failure(e))))?;
+    let delete = Delete::builder()
+        .set_objects(Some(ids))
+        .quiet(false)
+        .build()
+        .map_err(|e| BatchError::Request(Box::new(SdkError::construction_failure(e))))?;
+    let resp = client
+        .delete_objects()
+        .bucket(bucket)
+        .delete(delete)
+        .send()
+        .await
+        .map_err(|e| BatchError::Request(Box::new(e)))?;
+    let requested: Vec<&str> = keys.iter().map(|(k, _)| *k).collect();
+    let deleted: Vec<Option<&str>> = resp.deleted().iter().map(|d| d.key()).collect();
+    let errors: Vec<(Option<&str>, String)> =
+        resp.errors().iter().map(|e| (e.key(), error_text(e.code(), e.message()))).collect();
+    let outcomes = classify_delete(&requested, &deleted, &errors).map_err(BatchError::Unattributed)?;
+    // Rare (a server that leaves keys out of the response): confirm each one by looking it up.
+    // Index-based (see `expand`): closures taking references trip a compiler limitation.
+    let confirm = CancellationToken::new();
+    let (confirm, outcomes, requested) = (&confirm, &outcomes, &requested);
+    let confirmed: Vec<KeyOutcome> = stream::iter(0..outcomes.len())
+        .map(move |i| async move {
+            match &outcomes[i] {
+                KeyOutcome::Unconfirmed => match head(client, bucket, requested[i], confirm).await {
+                    Ok(None) => KeyOutcome::Deleted,
+                    Ok(Some(_)) => KeyOutcome::Failed(DELETE_NOT_CONFIRMED.into()),
+                    Err(e) => KeyOutcome::Failed(format!("{DELETE_NOT_CONFIRMED} Checking it failed: {}", e.message)),
+                },
+                o => o.clone(),
+            }
         })
-        .collect())
+        .buffered(LIST_CONCURRENCY)
+        .collect()
+        .await;
+    Ok(confirmed)
+}
+
+/// Records the result of one delete-job batch: only confirmed keys count as done.
+pub(crate) fn record_delete_batch(entry: &JobEntry, chunk: &[Planned], r: Result<Vec<KeyOutcome>, String>) {
+    match r {
+        Ok(outcomes) => {
+            for (p, o) in chunk.iter().zip(outcomes) {
+                match o {
+                    KeyOutcome::Deleted => entry.done(p.size),
+                    KeyOutcome::Failed(m) => entry.fail(&p.src, m),
+                    KeyOutcome::Unconfirmed => entry.fail(&p.src, DELETE_NOT_CONFIRMED.into()),
+                }
+            }
+        }
+        Err(m) => {
+            for p in chunk {
+                entry.fail(&p.src, m.clone());
+            }
+        }
+    }
 }
 
 pub(crate) async fn run_delete(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planned]) {
@@ -313,26 +506,12 @@ pub(crate) async fn run_delete(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planned]
         .map(move |c| async move {
             let chunk = &work[c * DELETE_BATCH..((c + 1) * DELETE_BATCH).min(work.len())];
             let keys: Vec<(&str, Option<&str>)> = chunk.iter().map(|p| (p.src.as_str(), None)).collect();
-            (chunk, delete_objects(ctx.src, &ctx.req.src_bucket, &keys).await.map_err(|e| AppError::from(e).message))
+            (chunk, delete_objects(ctx.src, &ctx.req.src_bucket, &keys).await.map_err(BatchError::message))
         })
         .buffer_unordered(DELETE_CONCURRENCY);
     tokio::pin!(results);
     while let Some((chunk, r)) = results.next().await {
-        match r {
-            Ok(errors) => {
-                for p in chunk {
-                    match errors.get(&p.src) {
-                        Some(m) => entry.fail(&p.src, m.clone()),
-                        None => entry.done(p.size),
-                    }
-                }
-            }
-            Err(m) => {
-                for p in chunk {
-                    entry.fail(&p.src, m.clone());
-                }
-            }
-        }
+        record_delete_batch(entry, chunk, r);
     }
 }
 
@@ -415,7 +594,7 @@ async fn copy_simple(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str) ->
         }
         // Not cancellable: a copy in flight is allowed to finish, so a cancelled move never
         // leaves a written destination whose source is then kept unknowingly.
-        return match r.customize().config_override(copy_timeout()).send().await {
+        return match r.customize().config_override(copy_timeout(p.size)).send().await {
             Ok(out) if out.copy_object_result().and_then(|c| c.e_tag()).is_some() => Outcome::Copied,
             Ok(_) => Outcome::Failed("The server did not confirm the copy (no ETag in the response).".into()),
             Err(e) => {
@@ -569,9 +748,8 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
         },
         Err(e) => return Outcome::Failed(AppError::from(e).message),
     };
-    let abort = || async {
-        let _ = dest.abort_multipart_upload().bucket(dest_bucket).key(dest_key).upload_id(&upload_id).send().await;
-    };
+    // Aborts the upload on every failure path, and also if this future is dropped or panics.
+    let mut guard = AbortOnDrop::new(dest, dest_bucket, dest_key, &upload_id);
     let source = encode_copy_source(src_bucket, &p.src);
     let (source, etag, upload_id, ranges) = (&source, &etag, &upload_id, &ranges);
     let parts: Result<Vec<CompletedPart>, Outcome> = stream::iter(0..ranges.len())
@@ -589,7 +767,7 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
                     .copy_source_range(format!("bytes={a}-{b}"))
                     .copy_source_if_match(etag)
                     .customize()
-                    .config_override(copy_timeout())
+                    .config_override(copy_timeout(b - a + 1))
                     .send();
                 match cancellable(ctx.cancel, fut).await {
                     Err(_) => Err(Outcome::Cancelled),
@@ -614,7 +792,7 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
     let parts = match parts {
         Ok(parts) => parts,
         Err(o) => {
-            abort().await;
+            guard.abort().await;
             return o;
         }
     };
@@ -631,10 +809,13 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
             complete = complete.if_none_match("*");
         }
         // Not cancellable (see CreateMultipartUpload).
-        return match complete.customize().config_override(copy_timeout()).send().await {
-            Ok(out) if out.e_tag().is_some() => Outcome::Copied,
+        return match complete.customize().config_override(copy_timeout(p.size)).send().await {
+            Ok(out) if out.e_tag().is_some() => {
+                guard.disarm();
+                Outcome::Copied
+            }
             Ok(_) => {
-                abort().await;
+                guard.abort().await;
                 Outcome::Failed("The server did not confirm the multipart copy (no ETag).".into())
             }
             Err(e) => {
@@ -643,7 +824,7 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
                     caps.if_none_match.store(false, Ordering::Relaxed);
                     continue;
                 }
-                abort().await;
+                guard.abort().await;
                 if status == Some(412) || code.as_deref() == Some("PreconditionFailed") {
                     precondition_outcome(ctx, p, use_inm).await
                 } else {
@@ -681,10 +862,32 @@ async fn copy_one(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, existing: &HashSet<St
     }
 }
 
+/// What a move does with one source after a `DeleteObjects` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceStep {
+    Deleted,
+    /// The server rejected the ETag condition: send this key again without it.
+    RetryWithoutEtag,
+    Failed(String),
+}
+
+pub(crate) fn source_step(with_etag: bool, o: KeyOutcome) -> SourceStep {
+    match o {
+        KeyOutcome::Deleted => SourceStep::Deleted,
+        KeyOutcome::Failed(m) if with_etag && m.starts_with("NotImplemented") => SourceStep::RetryWithoutEtag,
+        KeyOutcome::Failed(m) if m.starts_with("PreconditionFailed") => {
+            SourceStep::Failed(format!("{m} (the original changed after it was copied)"))
+        }
+        KeyOutcome::Failed(m) => SourceStep::Failed(m),
+        KeyOutcome::Unconfirmed => SourceStep::Failed(DELETE_NOT_CONFIRMED.into()),
+    }
+}
+
 /// Deletes move sources whose copies are confirmed. Each key is deleted only if it still has
 /// the ETag that was copied (when the server supports conditional deletes). If the server
 /// rejects the ETag condition itself (the whole request, or per key with NotImplemented), the
 /// affected keys are retried once without it; keys that were already deleted are never re-sent.
+/// A source counts as moved only when the server confirms its delete (see [`delete_objects`]).
 async fn delete_sources<'p>(ctx: &Ctx<'_>, caps: &Caps, batch: Vec<&'p Planned>) -> Vec<(&'p Planned, Result<(), String>)> {
     if let Some(hook) = &ctx.tuning.before_source_delete {
         hook(String::new()).await;
@@ -698,16 +901,13 @@ async fn delete_sources<'p>(ctx: &Ctx<'_>, caps: &Caps, batch: Vec<&'p Planned>)
             .map(|p| (p.src.as_str(), if with_etag { p.etag.as_deref() } else { None }))
             .collect();
         match delete_objects(ctx.src, &ctx.req.src_bucket, &keys).await {
-            Ok(errors) => {
+            Ok(outcomes) => {
                 let mut retry = Vec::new();
-                for p in todo {
-                    match errors.get(&p.src) {
-                        None => out.push((p, Ok(()))),
-                        Some(m) if with_etag && m.starts_with("NotImplemented") => retry.push(p),
-                        Some(m) if m.starts_with("PreconditionFailed") => {
-                            out.push((p, Err(format!("{m} (the original changed after it was copied)"))))
-                        }
-                        Some(m) => out.push((p, Err(m.clone()))),
+                for (p, o) in todo.into_iter().zip(outcomes) {
+                    match source_step(with_etag, o) {
+                        SourceStep::Deleted => out.push((p, Ok(()))),
+                        SourceStep::RetryWithoutEtag => retry.push(p),
+                        SourceStep::Failed(m) => out.push((p, Err(m))),
                     }
                 }
                 if retry.is_empty() {
@@ -716,7 +916,7 @@ async fn delete_sources<'p>(ctx: &Ctx<'_>, caps: &Caps, batch: Vec<&'p Planned>)
                 caps.delete_etag.store(false, Ordering::Relaxed);
                 todo = retry;
             }
-            Err(e) => {
+            Err(BatchError::Request(e)) => {
                 let (status, code) = err_info(&e);
                 let unsupported = matches!(status, Some(400) | Some(501))
                     && matches!(
@@ -728,7 +928,11 @@ async fn delete_sources<'p>(ctx: &Ctx<'_>, caps: &Caps, batch: Vec<&'p Planned>)
                     caps.delete_etag.store(false, Ordering::Relaxed);
                     continue;
                 }
-                let m = AppError::from(e).message;
+                let m = AppError::from(*e).message;
+                out.extend(todo.into_iter().map(|p| (p, Err(m.clone()))));
+                return out;
+            }
+            Err(BatchError::Unattributed(m)) => {
                 out.extend(todo.into_iter().map(|p| (p, Err(m.clone()))));
                 return out;
             }
@@ -736,15 +940,16 @@ async fn delete_sources<'p>(ctx: &Ctx<'_>, caps: &Caps, batch: Vec<&'p Planned>)
     }
 }
 
-fn record_source_delete(entry: &JobEntry, results: Vec<(&Planned, Result<(), String>)>) {
+pub(crate) fn record_source_delete(entry: &JobEntry, results: Vec<(&Planned, Result<(), String>)>) {
     for (p, r) in results {
         match r {
             Ok(()) => entry.done(p.size),
             Err(m) => entry.fail(
                 &p.src,
                 format!(
-                    "Copied to {:?}, but the original could not be deleted: {m}. The copy exists and the original remains.",
-                    p.dest.as_deref().unwrap_or_default()
+                    "Copied to {:?}, but the original could not be deleted: {}. The copy exists and the original remains.",
+                    p.dest.as_deref().unwrap_or_default(),
+                    m.trim_end_matches('.')
                 ),
             ),
         }
@@ -814,6 +1019,163 @@ pub(crate) async fn run_transfer(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{now_iso, Job, JobPhase, JobStatus};
+    use std::sync::Mutex;
+
+    fn entry(total: u64) -> JobEntry {
+        let job = Job {
+            id: "j".into(),
+            kind: JobKind::Delete,
+            src_bucket: "b".into(),
+            dest_bucket: None,
+            label: String::new(),
+            phase: JobPhase::Working,
+            total_items: total,
+            done_items: 0,
+            skipped_items: 0,
+            failed_items: 0,
+            total_bytes: 0,
+            done_bytes: 0,
+            status: JobStatus::Running,
+            error: None,
+            errors: Vec::new(),
+            started_at: now_iso(),
+            finished_at: None,
+        };
+        JobEntry { seq: 0, record: Mutex::new(job), cancel: CancellationToken::new(), finished: CancellationToken::new() }
+    }
+
+    fn planned(src: &str, dest: Option<&str>, etag: Option<&str>) -> Planned {
+        Planned {
+            src: src.into(),
+            dest: dest.map(Into::into),
+            size: 10,
+            etag: etag.map(Into::into),
+            storage_class: None,
+            item: 0,
+        }
+    }
+
+    use KeyOutcome::{Deleted, Failed, Unconfirmed};
+
+    #[test]
+    fn delete_response_classification() {
+        let req = ["a", "b", "c"];
+        // All confirmed.
+        assert_eq!(classify_delete(&req, &[Some("a"), Some("b"), Some("c")], &[]), Ok(vec![Deleted, Deleted, Deleted]));
+        // One in neither list: not counted as deleted (it used to be).
+        assert_eq!(classify_delete(&req, &[Some("a"), Some("c")], &[]), Ok(vec![Deleted, Unconfirmed, Deleted]));
+        // An empty response confirms nothing (e.g. a server that answered as if Quiet were on).
+        assert_eq!(classify_delete(&req, &[], &[]), Ok(vec![Unconfirmed, Unconfirmed, Unconfirmed]));
+        // An error with a key fails that key only.
+        assert_eq!(
+            classify_delete(&req, &[Some("a"), Some("c")], &[(Some("b"), "AccessDenied: no".into())]),
+            Ok(vec![Deleted, Failed("AccessDenied: no".into()), Deleted])
+        );
+        // An error without a key (missing or empty) fails the whole batch.
+        for k in [None, Some("")] {
+            let e = classify_delete(&req, &[Some("a"), Some("b"), Some("c")], &[(k, "InternalError: boom".into())])
+                .expect_err("unattributable");
+            assert!(e.contains("InternalError: boom") && e.contains("batch of 3"), "{e}");
+        }
+        // Duplicates: repeated entries are harmless; the first error message for a key wins; an
+        // error beats a contradictory Deleted entry; a key requested twice gets the same answer.
+        assert_eq!(
+            classify_delete(
+                &["a", "b", "a"],
+                &[Some("a"), Some("a"), Some("b"), None, Some("zzz")],
+                &[(Some("b"), "E1: first".into()), (Some("b"), "E2: second".into())]
+            ),
+            Ok(vec![Deleted, Failed("E1: first".into()), Deleted])
+        );
+        // Keys are compared byte for byte.
+        assert_eq!(classify_delete(&["a/", "A"], &[Some("a"), Some("a/ ")], &[]), Ok(vec![Unconfirmed, Unconfirmed]));
+    }
+
+    #[test]
+    fn delete_job_counts_only_confirmed_keys() {
+        let chunk = [planned("a", None, None), planned("b", None, None), planned("c", None, None)];
+        let e = entry(3);
+        record_delete_batch(&e, &chunk, Ok(vec![Deleted, Unconfirmed, Failed("AccessDenied: no".into())]));
+        let j = e.snapshot();
+        assert_eq!((j.done_items, j.failed_items, j.done_bytes), (1, 2, 10));
+        assert_eq!(j.errors[0].key, "b");
+        assert_eq!(j.errors[0].message, DELETE_NOT_CONFIRMED);
+        assert_eq!(j.errors[1].message, "AccessDenied: no");
+        // A whole-batch failure counts nothing as done.
+        let e = entry(3);
+        record_delete_batch(&e, &chunk, Err("unattributable".into()));
+        let j = e.snapshot();
+        assert_eq!((j.done_items, j.failed_items), (0, 3));
+        assert!(j.errors.iter().all(|x| x.message == "unattributable"));
+        let mut done = e.snapshot();
+        crate::jobs::finish(&mut done, Ok(()), false);
+        assert_eq!(done.status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn move_source_steps() {
+        assert_eq!(source_step(true, Deleted), SourceStep::Deleted);
+        assert_eq!(source_step(true, Unconfirmed), SourceStep::Failed(DELETE_NOT_CONFIRMED.into()));
+        assert_eq!(source_step(false, Unconfirmed), SourceStep::Failed(DELETE_NOT_CONFIRMED.into()));
+        // The ETag condition was rejected: retried once without it (only while it was sent).
+        assert_eq!(source_step(true, Failed("NotImplemented: x".into())), SourceStep::RetryWithoutEtag);
+        assert_eq!(source_step(false, Failed("NotImplemented: x".into())), SourceStep::Failed("NotImplemented: x".into()));
+        match source_step(true, Failed("PreconditionFailed: x".into())) {
+            SourceStep::Failed(m) => assert!(m.contains("changed after it was copied"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_accounting_never_counts_an_unconfirmed_source() {
+        let a = planned("s/a", Some("d/a"), Some("e"));
+        let b = planned("s/b", Some("d/b"), Some("e"));
+        let e = entry(2);
+        let steps = [source_step(true, Deleted), source_step(true, Unconfirmed)];
+        let results: Vec<(&Planned, Result<(), String>)> = [&a, &b]
+            .into_iter()
+            .zip(steps)
+            .map(|(p, s)| match s {
+                SourceStep::Deleted => (p, Ok(())),
+                SourceStep::Failed(m) => (p, Err(m)),
+                SourceStep::RetryWithoutEtag => unreachable!(),
+            })
+            .collect();
+        record_source_delete(&e, results);
+        let j = e.snapshot();
+        assert_eq!((j.done_items, j.failed_items), (1, 1));
+        let m = &j.errors[0].message;
+        assert_eq!(j.errors[0].key, "s/b");
+        assert!(m.contains("did not confirm the delete"), "{m}");
+        assert!(m.contains("The copy exists and the original remains."), "{m}");
+        assert!(m.contains("d/b"), "{m}");
+        assert!(!m.contains(".."), "no doubled period: {m}");
+    }
+
+    #[test]
+    fn moves_need_an_etag_copies_do_not() {
+        let work = vec![planned("a", Some("x/a"), Some("1")), planned("b", Some("x/b"), None), planned("c", Some("x/c"), Some(""))];
+        let (ok, errs) = split_unmovable(JobKind::Copy, work.clone());
+        assert_eq!(ok.len(), 3);
+        assert!(errs.is_empty());
+        let (ok, errs) = split_unmovable(JobKind::Move, work);
+        assert_eq!(ok.iter().map(|p| p.src.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        assert_eq!(errs.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
+        assert!(errs.iter().all(|e| e.message == NO_ETAG_FOR_MOVE));
+    }
+
+    #[test]
+    fn copy_timeout_scales_with_size() {
+        let mib = 1024 * 1024;
+        assert_eq!(copy_timeout_for(0), COPY_TIMEOUT_MIN);
+        assert_eq!(copy_timeout_for(256 * mib), COPY_TIMEOUT_MIN, "small copies keep the old 15 min");
+        // A 5 GiB CopyObject (or UploadPartCopy part) at 2 MiB/s takes 2,560 s > 15 min.
+        let five_gib = 5 * 1024 * mib;
+        assert_eq!(copy_timeout_for(five_gib), Duration::from_secs(300 + 2560));
+        assert!(copy_timeout_for(five_gib) > Duration::from_secs(five_gib / COPY_MIN_RATE));
+        assert_eq!(copy_timeout_for(u64::MAX), COPY_TIMEOUT_MAX);
+    }
 
     #[test]
     fn tagging_is_query_encoded() {

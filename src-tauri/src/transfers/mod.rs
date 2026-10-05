@@ -12,8 +12,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use std::panic::AssertUnwindSafe;
+
 use aws_sdk_s3::Client;
 use dashmap::DashMap;
+use futures::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
@@ -56,6 +59,8 @@ pub struct TransferEntry {
     /// but that had to be fetched again (observability for tests and benchmarks).
     part_retries: AtomicU32,
     discarded_bytes: AtomicU64,
+    /// Times a download's temp file was flushed to disk (`sync_all`) before the rename.
+    file_syncs: AtomicU32,
 }
 
 /// Internal counters of one transfer, for tests and benchmarks (not part of the bridge contract).
@@ -64,6 +69,20 @@ pub struct TransferStats {
     pub peak_parts_in_flight: usize,
     pub part_retries: u32,
     pub discarded_bytes: u64,
+    pub file_syncs: u32,
+}
+
+/// Panics or fails in a test, at a named point of a transfer (see [`TransferTuning::fault`]).
+pub type FaultHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Internal knobs, for tests only (never exposed to the UI).
+#[doc(hidden)]
+#[derive(Clone, Default)]
+pub struct TransferTuning {
+    /// Replaces the size-scaled per-attempt timeout of body-carrying upload requests.
+    pub upload_attempt_timeout: Option<Duration>,
+    /// Called with `"download"` / `"upload"` when a transfer starts running.
+    pub fault: Option<FaultHook>,
 }
 
 /// Counts a part as in flight for its lifetime (see [`TransferEntry::part_started`]).
@@ -129,11 +148,22 @@ enum Job {
 pub(crate) struct PartSettings {
     pub part_size_mib: Option<u32>,
     pub max_parts: usize,
+    /// How many body-carrying requests may share the link at most (parts in flight per transfer
+    /// x transfers running at once); scales the upload attempt timeout.
+    pub link_share: u64,
+    /// Test override for the upload attempt timeout.
+    pub upload_attempt_timeout: Option<Duration>,
 }
 
 impl From<&TransferSettings> for PartSettings {
     fn from(s: &TransferSettings) -> Self {
-        Self { part_size_mib: s.part_size_mib, max_parts: (s.max_concurrent_parts as usize).max(1) }
+        let max_parts = (s.max_concurrent_parts as usize).max(1);
+        Self {
+            part_size_mib: s.part_size_mib,
+            max_parts,
+            link_share: max_parts as u64 * u64::from(s.max_concurrent_transfers.max(1)),
+            upload_attempt_timeout: None,
+        }
     }
 }
 
@@ -146,6 +176,7 @@ pub struct TransferManager {
     seq: AtomicU64,
     /// Serializes the "is this destination already being downloaded?" check with the insert.
     start_lock: Mutex<()>,
+    tuning: TransferTuning,
 }
 
 /// Download destinations must be absolute and free of `..` so a crafted key can never
@@ -179,6 +210,11 @@ impl TransferManager {
     }
 
     pub fn with_settings(sink: Arc<dyn ProgressSink>, settings: TransferSettings) -> Arc<Self> {
+        Self::with_tuning(sink, settings, TransferTuning::default())
+    }
+
+    #[doc(hidden)]
+    pub fn with_tuning(sink: Arc<dyn ProgressSink>, settings: TransferSettings, tuning: TransferTuning) -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::new(),
             running: RunGate::new(settings.max_concurrent_transfers as usize),
@@ -186,6 +222,7 @@ impl TransferManager {
             sink,
             seq: AtomicU64::new(0),
             start_lock: Mutex::new(()),
+            tuning,
         })
     }
 
@@ -217,6 +254,7 @@ impl TransferManager {
             peak_parts_in_flight: e.peak_parts_in_flight.load(Ordering::Relaxed),
             part_retries: e.part_retries.load(Ordering::Relaxed),
             discarded_bytes: e.discarded_bytes.load(Ordering::Relaxed),
+            file_syncs: e.file_syncs.load(Ordering::Relaxed),
         })
     }
 
@@ -284,6 +322,7 @@ impl TransferManager {
             peak_parts_in_flight: AtomicUsize::new(0),
             part_retries: AtomicU32::new(0),
             discarded_bytes: AtomicU64::new(0),
+            file_syncs: AtomicU32::new(0),
         });
         self.entries.insert(id.clone(), entry.clone());
         self.sink.emit(&entry.snapshot());
@@ -303,7 +342,8 @@ impl TransferManager {
             None => Err(AppError::cancelled()),
             Some(_) => {
                 // Snapshot now (not at queue time): settings changed while queued still apply.
-                let cfg = PartSettings::from(&self.settings());
+                let mut cfg = PartSettings::from(&self.settings());
+                cfg.upload_attempt_timeout = self.tuning.upload_attempt_timeout;
                 entry.lock().status = TransferStatus::Running;
                 self.sink.emit(&entry.snapshot());
 
@@ -313,10 +353,27 @@ impl TransferManager {
                     let r = entry.lock();
                     (r.id.clone(), r.bucket.clone(), r.key.clone())
                 };
-                let r = match job {
-                    Job::Download { dest } => download::run(&client, &entry, cfg, &id, &bucket, &key, &dest).await,
-                    Job::Upload { src } => upload::run(&client, &entry, cfg, &bucket, &key, &src).await,
+                let fault = self.tuning.fault.clone();
+                let body = async {
+                    match job {
+                        Job::Download { dest } => {
+                            if let Some(f) = &fault {
+                                f("download");
+                            }
+                            download::run(&client, &entry, cfg, &id, &bucket, &key, &dest).await
+                        }
+                        Job::Upload { src } => {
+                            if let Some(f) = &fault {
+                                f("upload");
+                            }
+                            upload::run(&client, &entry, cfg, &bucket, &key, &src).await
+                        }
+                    }
                 };
+                // A panic must not leave the transfer "running" forever (and the updater blocked):
+                // it becomes a failure and the final event below is still sent. Release builds
+                // use `panic = "abort"`, so there a panic still ends the whole process.
+                let r = AssertUnwindSafe(body).catch_unwind().await.unwrap_or_else(|p| Err(AppError::from_panic(&*p)));
                 stop.cancel();
                 let _ = ticker.await;
                 r
@@ -431,6 +488,67 @@ async fn ticker(sink: Arc<dyn ProgressSink>, entry: Arc<TransferEntry>, stop: Ca
     }
 }
 
+/// Aborts a multipart upload when dropped while armed: if the task driving it panics or its
+/// future is dropped, the upload (and the parts stored for it) would otherwise be left behind.
+/// `Drop` cannot await, so the abort is spawned (best effort, needs a Tokio runtime). Normal
+/// paths call [`abort`](Self::abort) or [`disarm`](Self::disarm) instead.
+pub(crate) struct AbortOnDrop {
+    client: Client,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    armed: bool,
+}
+
+impl AbortOnDrop {
+    pub(crate) fn new(client: &Client, bucket: &str, key: &str, upload_id: &str) -> Self {
+        Self {
+            client: client.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            armed: true,
+        }
+    }
+
+    /// Aborts now (best effort; deliberately not cancellable) and disarms.
+    pub(crate) async fn abort(&mut self) {
+        self.armed = false;
+        let _ = self
+            .client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .upload_id(&self.upload_id)
+            .send()
+            .await;
+    }
+
+    /// The upload was completed (or aborted) normally.
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            let req = self
+                .client
+                .abort_multipart_upload()
+                .bucket(std::mem::take(&mut self.bucket))
+                .key(std::mem::take(&mut self.key))
+                .upload_id(std::mem::take(&mut self.upload_id));
+            rt.spawn(async move {
+                let _ = req.send().await;
+            });
+        }
+    }
+}
+
 /// Runs `f` unless `token` is cancelled first.
 async fn cancellable<T>(token: &CancellationToken, f: impl Future<Output = T>) -> AppResult<T> {
     tokio::select! {
@@ -511,6 +629,256 @@ fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{h, FakeS3, Reply, Req, ScratchDir};
+
+    // ---- end-to-end against a scripted fake S3 ----
+
+    async fn finished(tm: &TransferManager, id: &str, limit: Duration) -> Transfer {
+        tokio::time::timeout(limit, tm.wait(id)).await.expect("transfer finished in time").expect("known")
+    }
+
+    fn manager(settings: TransferSettings, tuning: TransferTuning) -> Arc<TransferManager> {
+        TransferManager::with_tuning(Arc::new(NoopSink), settings, tuning)
+    }
+
+    /// Serves an object of `size` bytes (byte i = i % 251). `serve` gets the requested range
+    /// `(start, end)` and returns how many bytes to send before dropping the connection (`None` =
+    /// all, normally). `chunked`: send the body chunked and drop it before the last chunk.
+    async fn object_server(size: u64, serve: impl Fn(u64, u64) -> Option<u64> + Send + Sync + 'static, chunked: bool) -> FakeS3 {
+        FakeS3::start(move |r: &Req| {
+            let etag = h("ETag", "\"v1\"");
+            match r.method.as_str() {
+                "HEAD" => Reply::with_headers(200, vec![h("Content-Length", &size.to_string()), etag]),
+                "GET" => {
+                    let (status, start, end) = match r.header("range").and_then(|v| v.strip_prefix("bytes=")) {
+                        Some(spec) => {
+                            let (a, b) = spec.split_once('-').expect("range");
+                            let (a, b): (u64, u64) = (a.parse().expect("start"), b.parse().expect("end"));
+                            if a > b || b >= size {
+                                return Reply::status(416);
+                            }
+                            (206, a, b)
+                        }
+                        None => (200, 0, size - 1),
+                    };
+                    let body: Vec<u8> = (start..=end).map(|i| (i % 251) as u8).collect();
+                    let mut hs = vec![etag];
+                    if status == 206 {
+                        hs.push(h("Content-Range", &format!("bytes {start}-{end}/{size}")));
+                    }
+                    if chunked {
+                        hs.push(h("Transfer-Encoding", "chunked"));
+                        let mut b = format!("{:x}\r\n", body.len()).into_bytes();
+                        b.extend_from_slice(&body);
+                        b.extend_from_slice(b"\r\n"); // ... but never the final "0\r\n\r\n"
+                        return Reply::Partial { status, headers: hs, body: b };
+                    }
+                    hs.push(h("Content-Length", &body.len().to_string()));
+                    match serve(start, end) {
+                        Some(n) => Reply::Partial { status, headers: hs, body: body[..(n as usize).min(body.len())].to_vec() },
+                        None => Reply::Full { status, headers: hs, body },
+                    }
+                }
+                _ => Reply::status(500),
+            }
+        })
+        .await
+    }
+
+    fn expected(size: u64) -> Vec<u8> {
+        (0..size).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn gets(s3: &FakeS3) -> usize {
+        s3.count(|r| r.method == "GET")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_sends_one_byte_per_connection_fails_the_download() {
+        let dir = ScratchDir::new("dl-1byte");
+        let size = 2 * MIB; // one whole-object GET with the Auto part size
+        let s3 = object_server(size, |_, _| Some(1), false).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let dest = dir.0.join("obj.bin");
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        // Before the fix every 1-byte attempt reset the failure count: ~2 million attempts.
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Failed, "{:?}", t.error);
+        assert_eq!(gets(&s3), 3, "3 attempts without meaningful progress");
+        assert!(dir.files().is_empty(), "no .part left behind: {:?}", dir.files());
+        assert!(t.transferred_bytes <= 3, "progress is monotonic and honest");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_part_has_a_total_attempt_budget() {
+        let dir = ScratchDir::new("dl-budget");
+        let size = 2 * MIB;
+        // 64 KiB per connection counts as progress, but 2 MiB would need 32 attempts.
+        let s3 = object_server(size, |_, _| Some(64 * 1024), false).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let id = tm.start_download(s3.client(), "b", "k", dir.0.join("obj.bin")).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Failed, "{:?}", t.error);
+        assert_eq!(gets(&s3), 3 + 2, "3 + ceil(2 MiB / 1 MiB) attempts");
+        assert!(dir.files().is_empty(), "{:?}", dir.files());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flaky_but_working_link_still_finishes() {
+        let dir = ScratchDir::new("dl-flaky");
+        let size = 2 * MIB;
+        // Each connection drops after 1 MiB: progress every time, done in 2 + 1 attempts.
+        let s3 = object_server(size, |a, b| if b - a + 1 > MIB { Some(MIB) } else { None }, false).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let dest = dir.0.join("obj.bin");
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_eq!(std::fs::read(&dest).expect("file"), expected(size));
+        assert_eq!(gets(&s3), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn both_download_paths_sync_before_the_rename() {
+        let dir = ScratchDir::new("dl-sync");
+        // Single GET.
+        let s3 = object_server(1000, |_, _| None, false).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let dest = dir.0.join("small.bin");
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_eq!(std::fs::read(&dest).expect("file"), expected(1000));
+        assert_eq!(tm.stats(&id).expect("stats").file_syncs, 1, "single-GET path syncs");
+        // Ranged (1 MiB parts).
+        let size = 3 * MIB + 5;
+        let s3 = object_server(size, |_, _| None, false).await;
+        let settings = TransferSettings { part_size_mib: Some(1), ..TransferSettings::default() };
+        let tm = manager(settings, TransferTuning::default());
+        let dest = dir.0.join("big.bin");
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_eq!(t.parts_total, 4);
+        assert_eq!(std::fs::read(&dest).expect("file"), expected(size));
+        assert_eq!(tm.stats(&id).expect("stats").file_syncs, 1, "ranged path syncs once");
+        assert_eq!(dir.files().len(), 2, "no temp files: {:?}", dir.files());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_error_after_the_last_byte_completes_the_part() {
+        let dir = ScratchDir::new("dl-tail");
+        // Every byte arrives, then the connection drops before the end of the chunked body.
+        let s3 = object_server(1000, |_, _| None, true).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let dest = dir.0.join("obj.bin");
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        // Before the fix: a retry with "bytes=1000-999", answered 416 (InvalidRange).
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_eq!(std::fs::read(&dest).expect("file"), expected(1000));
+        assert_eq!(gets(&s3), 1, "no retry");
+        assert!(s3.requests().iter().all(|r| r.header("range").is_none()));
+        // Same for a ranged part.
+        let size = 2 * MIB + 10;
+        let s3 = object_server(size, |_, _| None, true).await;
+        let tm = manager(TransferSettings { part_size_mib: Some(1), ..TransferSettings::default() }, TransferTuning::default());
+        let dest = dir.0.join("big.bin");
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_eq!(std::fs::read(&dest).expect("file"), expected(size));
+        assert_eq!(gets(&s3), 3);
+    }
+
+    /// Upload server: answers everything, except that requests carrying a body (`PUT` with
+    /// content) are read completely and never answered.
+    async fn black_hole_for_bodies() -> FakeS3 {
+        FakeS3::start(|r: &Req| match r.method.as_str() {
+            "PUT" if !r.body.is_empty() => Reply::Hang,
+            "POST" if r.has_query("uploads") => Reply::xml(
+                200,
+                r#"<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>U1</UploadId></InitiateMultipartUploadResult>"#,
+            ),
+            "DELETE" if r.has_query("uploadId") => Reply::status(204),
+            _ => Reply::status(500),
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_whose_server_never_answers_fails_within_the_bound() {
+        let dir = ScratchDir::new("up-hang");
+        let small = dir.0.join("small.bin");
+        std::fs::write(&small, vec![7u8; 4096]).expect("write");
+        let s3 = black_hole_for_bodies().await;
+        let bound = Duration::from_secs(2);
+        let tm = manager(TransferSettings::default(), TransferTuning { upload_attempt_timeout: Some(bound), fault: None });
+        let t0 = Instant::now();
+        let id = tm.start_upload(s3.client(), "b", "k", small);
+        // Before the fix there was no bound at all once the body was sent.
+        let t = finished(&tm, &id, Duration::from_secs(40)).await;
+        let took = t0.elapsed();
+        assert_eq!(t.status, TransferStatus::Failed, "{:?}", t.error);
+        assert!(t.error.as_deref().unwrap_or_default().contains("timed out"), "{:?}", t.error);
+        let puts = s3.count(|r| r.method == "PUT");
+        assert_eq!(puts, 3, "the SDK retried the timed-out attempt");
+        assert!(took >= bound * 3 && took < Duration::from_secs(20), "{took:?}");
+        assert!(s3.requests().iter().filter(|r| r.method == "PUT").all(|r| r.body.len() == 4096), "whole body each time");
+
+        // Multipart: the part never gets an answer; the transfer fails and the upload is aborted.
+        let big = dir.0.join("big.bin");
+        std::fs::write(&big, vec![9u8; 6 * MIB as usize]).expect("write");
+        let s3 = black_hole_for_bodies().await;
+        let settings = TransferSettings { part_size_mib: Some(5), ..TransferSettings::default() };
+        let tm = manager(settings, TransferTuning { upload_attempt_timeout: Some(bound), fault: None });
+        let id = tm.start_upload(s3.client(), "b", "k", big);
+        let t = finished(&tm, &id, Duration::from_secs(40)).await;
+        assert_eq!(t.status, TransferStatus::Failed, "{:?}", t.error);
+        assert_eq!(s3.count(|r| r.method == "DELETE" && r.query.contains("uploadId=U1")), 1, "aborted");
+        assert!(!tm.has_active());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicking_transfer_still_finishes() {
+        let dir = ScratchDir::new("panic");
+        let src = dir.0.join("f.bin");
+        std::fs::write(&src, b"x").expect("write");
+        let fault: FaultHook = Arc::new(|what: &str| {
+            if what == "upload" {
+                panic!("injected fault in {what}");
+            }
+        });
+        let s3 = black_hole_for_bodies().await;
+        let tm = manager(TransferSettings::default(), TransferTuning { upload_attempt_timeout: None, fault: Some(fault) });
+        let id = tm.start_upload(s3.client(), "b", "k", src);
+        let t = finished(&tm, &id, Duration::from_secs(10)).await;
+        assert_eq!(t.status, TransferStatus::Failed);
+        assert!(t.finished_at.is_some());
+        assert!(t.error.as_deref().unwrap_or_default().contains("injected fault in upload"), "{:?}", t.error);
+        assert!(!tm.has_active());
+        assert_eq!(tm.running_count(), 0, "run slot released");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_multipart_upload_is_aborted() {
+        let s3 = black_hole_for_bodies().await;
+        let c = s3.client();
+        // Dropped while armed (what a panic or a dropped future does): the abort is sent.
+        drop(AbortOnDrop::new(&c, "b", "k", "U1"));
+        // Disarmed (completed normally): nothing is sent.
+        let mut done = AbortOnDrop::new(&c, "b", "k", "U2");
+        done.disarm();
+        drop(done);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while s3.count(|r| r.method == "DELETE") == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deletes: Vec<String> = s3.requests().into_iter().filter(|r| r.method == "DELETE").map(|r| r.query).collect();
+        assert_eq!(deletes.len(), 1, "{deletes:?}");
+        assert!(deletes[0].contains("uploadId=U1"));
+    }
 
     #[test]
     fn download_dest_validation() {

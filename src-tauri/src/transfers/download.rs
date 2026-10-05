@@ -21,8 +21,14 @@ use tokio_util::sync::CancellationToken;
 use super::{cancellable, plan, set_sparse, write_all_at, PartSettings, TransferEntry, MIB};
 use crate::error::{AppError, AppResult, ErrorCode};
 
-/// Consecutive failed attempts (without receiving any new byte) after which a part gives up.
+/// Consecutive failed attempts without meaningful progress after which a part gives up.
 const PART_ATTEMPTS: u32 = 3;
+/// A failed attempt counts as progress only if it delivered at least this much (or the whole
+/// rest of the part, if that is smaller): a peer that sends a few bytes per connection and then
+/// resets must not be retried practically forever.
+const MIN_PROGRESS: u64 = 64 * 1024;
+/// Every part also has a total attempt budget: `3 + ceil(part length / 1 MiB)`, at most this.
+const MAX_PART_ATTEMPTS: u64 = 1_000;
 /// A response body that delivers no bytes for this long is treated as a (retryable) network error.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Parts up to this size are written with a single write once complete. Measured on NTFS with
@@ -46,14 +52,72 @@ fn create_tmp(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+/// True if `e` or any error it wraps is a response checksum mismatch (the data is corrupt).
+fn is_checksum_mismatch(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.downcast_ref::<aws_smithy_checksums::body::validate::Error>().is_some() {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Next body chunk, bounded by [`BODY_IDLE_TIMEOUT`] so a stalled connection cannot hang forever.
+/// Transport errors are `Network` (retryable); a checksum mismatch is not (`Unknown`): retrying
+/// or keeping what was received would accept corrupt data.
 async fn next_chunk(body: &mut aws_sdk_s3::primitives::ByteStream) -> AppResult<Option<bytes::Bytes>> {
     match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.try_next()).await {
-        Ok(r) => Ok(r?),
+        Ok(Ok(c)) => Ok(c),
+        Ok(Err(e)) if is_checksum_mismatch(&e) => Err(AppError::new(
+            ErrorCode::Unknown,
+            format!("The downloaded data failed checksum validation: {}", aws_sdk_s3::error::DisplayErrorContext(&e)),
+        )),
+        Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(AppError::new(
             ErrorCode::Network,
             format!("No data received for {} s", BODY_IDLE_TIMEOUT.as_secs()),
         )),
+    }
+}
+
+/// What a part does after a failed attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryDecision {
+    /// Retry (resuming after the bytes received so far) after this pause.
+    Retry(Duration),
+    GiveUp,
+}
+
+/// Retry budget of one part: at most [`PART_ATTEMPTS`] consecutive failed attempts without
+/// meaningful progress (see [`MIN_PROGRESS`]), and at most `3 + ceil(len / 1 MiB)` attempts in
+/// total (capped at [`MAX_PART_ATTEMPTS`]), so every part terminates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryPolicy {
+    max_attempts: u64,
+    attempts: u64,
+    failures: u32,
+}
+
+impl RetryPolicy {
+    fn new(part_len: u64) -> Self {
+        Self { max_attempts: (3 + part_len.div_ceil(MIB)).min(MAX_PART_ATTEMPTS), attempts: 0, failures: 0 }
+    }
+
+    /// After a failed (retryable) attempt that started with `remaining` bytes of the part still
+    /// missing and received `got` of them.
+    fn after_failure(&mut self, remaining: u64, got: u64) -> RetryDecision {
+        self.attempts += 1;
+        if got > 0 && got >= MIN_PROGRESS.min(remaining) {
+            self.failures = 0;
+        }
+        self.failures += 1;
+        if self.failures >= PART_ATTEMPTS || self.attempts >= self.max_attempts {
+            RetryDecision::GiveUp
+        } else {
+            RetryDecision::Retry(Duration::from_millis(500 * u64::from(self.failures)))
+        }
     }
 }
 
@@ -68,8 +132,13 @@ struct Span {
 }
 
 impl Span {
-    /// The `Range` header for an attempt that starts after `done` bytes, if one is needed.
+    /// The `Range` header for an attempt that starts after `done` bytes, if one is needed. Never
+    /// an empty or inverted range: callers never start an attempt once every byte is received
+    /// (`done >= len`), and for that case this returns `None` rather than `start > end`.
     fn range_header(&self, done: u64) -> Option<String> {
+        if done >= self.len {
+            return None;
+        }
         (!self.whole || done > 0).then(|| format!("bytes={}-{}", self.start + done, self.start + self.len - 1))
     }
 
@@ -216,17 +285,36 @@ pub(super) async fn run(
     }
     let tmp = part_path(dest, id);
     let tmp_owned = tmp.clone();
-    let file = tokio::task::spawn_blocking(move || create_tmp(&tmp_owned)).await??;
+    let file = Arc::new(tokio::task::spawn_blocking(move || create_tmp(&tmp_owned)).await??);
+    // Removes the temp file if this future is dropped or panics before it is renamed.
+    let mut tmp_guard = RemoveOnDrop(Some(tmp.clone()));
 
     let p = plan::plan_download(size, cfg.part_size_mib);
     entry.set_totals(size, p.parts_total());
     let result = if !p.multipart {
         let _in_flight = entry.part_started();
         let span = Span { start: 0, len: size, whole: true };
-        fetch_part(client, entry, bucket, key, etag.as_deref(), Arc::new(file), span, &token).await
+        fetch_part(client, entry, bucket, key, etag.as_deref(), file.clone(), span, &token).await
     } else {
-        ranged(client, entry, bucket, key, etag, size, p.part_size, p.parts, cfg.max_parts, file, &token).await
+        ranged(client, entry, bucket, key, etag, size, p.part_size, p.parts, cfg.max_parts, file.clone(), &token).await
     };
+    // Both paths: every byte reaches the disk before the file gets its final name, so a crash
+    // right after "completed" never leaves a short or zero-filled file under that name.
+    let result = match result {
+        Ok(()) => {
+            let f = file.clone();
+            match tokio::task::spawn_blocking(move || f.sync_all()).await {
+                Ok(Ok(())) => {
+                    entry.file_syncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(e.into()),
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    drop(file);
 
     match result {
         Ok(()) => {
@@ -234,10 +322,13 @@ pub(super) async fn run(
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(e.into());
             }
+            tmp_guard.0 = None;
             Ok(())
         }
         Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            if tokio::fs::remove_file(&tmp).await.is_ok() {
+                tmp_guard.0 = None;
+            }
             Err(e)
         }
     }
@@ -254,20 +345,19 @@ async fn ranged(
     part_size: u64,
     parts: u64,
     max_parts: usize,
-    file: std::fs::File,
+    file: Arc<std::fs::File>,
     token: &CancellationToken,
 ) -> AppResult<()> {
-    let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+    let f = file.clone();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         // Large parts stream far ahead of each other; see `set_sparse` (best effort). Small
         // parts fill the file nearly in order, where sparse allocation only costs time.
         if part_size > WHOLE_PART_MAX {
-            let _ = set_sparse(&file);
+            let _ = set_sparse(&f);
         }
-        file.set_len(size)?;
-        Ok(file)
+        f.set_len(size)
     })
     .await??;
-    let file = Arc::new(file);
     let sem = Arc::new(Semaphore::new(max_parts.max(1)));
     let mut set: JoinSet<AppResult<()>> = JoinSet::new();
     let mut first_err: Option<AppError> = None;
@@ -315,15 +405,14 @@ async fn ranged(
     if token.is_cancelled() {
         return Err(AppError::cancelled());
     }
-    let f = file.clone();
-    tokio::task::spawn_blocking(move || f.sync_all()).await??;
     Ok(())
 }
 
-/// Downloads `span` into `file` at its offsets. Retries transient (Network) failures; a retry
-/// resumes after the last byte received, and only consecutive attempts that received nothing
-/// count toward [`PART_ATTEMPTS`] (an attempt that made progress resets the count, so a flaky
-/// but working link finishes; every such attempt moves the part forward, so this terminates).
+/// Downloads `span` into `file` at its offsets. Retries transient (Network) failures within the
+/// part's [`RetryPolicy`]; a retry resumes after the last byte received (so `transferredBytes`
+/// never goes backwards). An error that arrives after every byte of the span was received (a
+/// connection reset or idle timeout after the final byte) completes the part instead of asking
+/// for an empty range; a checksum mismatch is never such an error (it is not `Network`).
 /// Returns once every byte of the span has been handed to the OS.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_part(
@@ -337,28 +426,47 @@ async fn fetch_part(
     token: &CancellationToken,
 ) -> AppResult<()> {
     let mut w = PartWriter::new(file, span.start, span.write_batch());
-    let mut failures = 0;
+    let mut policy = RetryPolicy::new(span.len);
+    let end = span.start + span.len;
     loop {
         let before = w.next;
         let e = match attempt(client, entry, bucket, key, etag, span, &mut w, token).await {
             Ok(()) => return w.flush().await,
             Err(e) => e,
         };
-        if w.next > before {
-            failures = 0;
+        if e.code == ErrorCode::Network && w.next == end {
+            // Everything was received (range- and length-checked, pinned by If-Match); only the
+            // end of the stream failed. Nothing is left to fetch.
+            return w.flush().await;
         }
-        failures += 1;
-        if failures >= PART_ATTEMPTS || e.code != ErrorCode::Network {
+        let decision = if e.code == ErrorCode::Network {
+            policy.after_failure(end - before, w.next - before)
+        } else {
+            RetryDecision::GiveUp
+        };
+        let RetryDecision::Retry(pause) = decision else {
             // Cancelled or fatal: the temp file is about to be deleted, so only let the write
             // in flight finish (never leave one running against it) instead of flushing.
             let _ = w.wait().await;
             return Err(e);
-        }
+        };
         // Everything received is valid (pinned by If-Match and range-checked), so it is
         // written out and the retry starts after it.
         w.flush().await?;
         entry.note_retry(0);
-        cancellable(token, tokio::time::sleep(Duration::from_millis(500 * u64::from(failures)))).await?;
+        cancellable(token, tokio::time::sleep(pause)).await?;
+    }
+}
+
+/// Deletes a download's temp file when dropped while it still holds a path (panic or a dropped
+/// future); the normal paths remove or rename it themselves.
+struct RemoveOnDrop(Option<PathBuf>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -377,6 +485,9 @@ async fn attempt(
 ) -> AppResult<()> {
     let done = w.next - span.start;
     let end = span.start + span.len;
+    if span.len > 0 && done >= span.len {
+        return Ok(()); // nothing left (never request an empty range)
+    }
     let resp = cancellable(
         token,
         client
@@ -415,6 +526,100 @@ async fn attempt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_policy_counts_only_meaningful_progress() {
+        const K: u64 = 1024;
+        let retry = |n: u64| RetryDecision::Retry(Duration::from_millis(500 * n));
+        // No progress: gives up on the 3rd consecutive failure.
+        let mut p = RetryPolicy::new(8 * MIB);
+        assert_eq!(p.after_failure(8 * MIB, 0), retry(1));
+        assert_eq!(p.after_failure(8 * MIB, 0), retry(2));
+        assert_eq!(p.after_failure(8 * MIB, 0), RetryDecision::GiveUp);
+        // A few bytes per attempt is not progress (it used to reset the count every time).
+        let mut p = RetryPolicy::new(8 * MIB);
+        assert_eq!(p.after_failure(8 * MIB, 1), retry(1));
+        assert_eq!(p.after_failure(8 * MIB - 1, 64 * K - 1), retry(2));
+        assert_eq!(p.after_failure(8 * MIB - 64 * K, 1), RetryDecision::GiveUp);
+        // >= 64 KiB is progress: the consecutive count restarts.
+        let mut p = RetryPolicy::new(8 * MIB);
+        assert_eq!(p.after_failure(8 * MIB, 0), retry(1));
+        assert_eq!(p.after_failure(8 * MIB, 0), retry(2));
+        assert_eq!(p.after_failure(8 * MIB, 64 * K), retry(1));
+        // Less than 64 KiB left: delivering all of the remainder is progress, less is not.
+        let mut p = RetryPolicy::new(100);
+        assert_eq!(p.after_failure(100, 0), retry(1));
+        assert_eq!(p.after_failure(100, 99), retry(2));
+        let mut p = RetryPolicy::new(100);
+        assert_eq!(p.after_failure(100, 0), retry(1));
+        assert_eq!(p.after_failure(100, 0), retry(2));
+        assert_eq!(p.after_failure(10, 10), retry(1));
+    }
+
+    #[test]
+    fn retry_policy_has_a_total_budget() {
+        // 3 + ceil(len / 1 MiB) attempts, even if every one makes progress.
+        assert_eq!(RetryPolicy::new(0).max_attempts, 3);
+        assert_eq!(RetryPolicy::new(1).max_attempts, 4);
+        assert_eq!(RetryPolicy::new(MIB).max_attempts, 4);
+        assert_eq!(RetryPolicy::new(MIB + 1).max_attempts, 5);
+        assert_eq!(RetryPolicy::new(16 * MIB).max_attempts, 19);
+        assert_eq!(RetryPolicy::new(5 * 1024 * MIB).max_attempts, MAX_PART_ATTEMPTS, "capped");
+        let mut p = RetryPolicy::new(2 * MIB); // 5 attempts
+        let mut left = 2 * MIB;
+        let mut decisions = Vec::new();
+        for _ in 0..5 {
+            decisions.push(p.after_failure(left, 64 * 1024));
+            left -= 64 * 1024;
+        }
+        assert!(decisions[..4].iter().all(|d| matches!(d, RetryDecision::Retry(_))), "{decisions:?}");
+        assert_eq!(decisions[4], RetryDecision::GiveUp);
+    }
+
+    #[test]
+    fn range_header_never_inverted() {
+        let part = Span { start: 100, len: 50, whole: false };
+        assert_eq!(part.range_header(49).as_deref(), Some("bytes=149-149"));
+        // Everything received: no range at all (it used to be "bytes=150-149").
+        assert_eq!(part.range_header(50), None);
+        assert_eq!(part.range_header(51), None);
+        let whole = Span { start: 0, len: 1000, whole: true };
+        assert_eq!(whole.range_header(1000), None);
+        for len in [1u64, 2, 50, 1000] {
+            for done in 0..=len + 1 {
+                if let Some(r) = (Span { start: 7, len, whole: false }).range_header(done) {
+                    let (a, b) = r.strip_prefix("bytes=").and_then(|x| x.split_once('-')).expect("range");
+                    assert!(a.parse::<u64>().expect("a") <= b.parse::<u64>().expect("b"), "{r}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checksum_mismatch_is_not_retryable() {
+        use aws_sdk_s3::primitives::ByteStream;
+        use aws_smithy_checksums::body::validate::ChecksumBody;
+        use aws_smithy_checksums::ChecksumAlgorithm;
+        use aws_smithy_types::body::SdkBody;
+
+        let algo: ChecksumAlgorithm = "crc32".parse().expect("crc32");
+        let bad = ChecksumBody::new(SdkBody::from("some data"), algo.into_impl(), bytes::Bytes::from_static(&[0, 0, 0, 0]));
+        let mut body = ByteStream::new(SdkBody::from_body_1_x(bad));
+        let mut got = Vec::new();
+        let err = loop {
+            match next_chunk(&mut body).await {
+                Ok(Some(c)) => got.extend_from_slice(&c),
+                Ok(None) => panic!("mismatch not reported"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(got, b"some data", "the error comes after the last byte");
+        assert_eq!(err.code, ErrorCode::Unknown, "{err:?}");
+        assert!(err.message.contains("checksum"), "{}", err.message);
+        // A plain transport error stays retryable.
+        let io: Box<dyn std::error::Error + Send + Sync> = Box::new(std::io::Error::other("reset"));
+        assert!(!is_checksum_mismatch(&*io));
+    }
 
     #[test]
     fn part_path_is_unique_per_transfer() {
