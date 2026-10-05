@@ -2,7 +2,7 @@
 
 import { useMemo } from "react";
 import type { FolderEntry, ObjectEntry } from "../lib/types";
-import { useApp, type SortState } from "./app";
+import { matchesFilter, useApp, type SortState } from "./app";
 
 export type Row =
   | { kind: "folder"; id: string; name: string; folder: FolderEntry }
@@ -22,8 +22,7 @@ export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filt
   if (cache && cache.folders === folders && cache.objects === objects && cache.filter === filter && cache.sort === sort) {
     return cache.rows;
   }
-  const f = filter.trim().toLowerCase();
-  const match = (name: string) => !f || name.toLowerCase().includes(f);
+  const match = (name: string) => matchesFilter(name, filter);
   const fr: Row[] = [];
   for (const folder of folders) if (match(folder.name)) fr.push({ kind: "folder", id: folder.prefix, name: folder.name, folder });
   const or: Row[] = [];
@@ -74,41 +73,43 @@ export function getViewRows(): Row[] {
   return computeRows(s.listing.folders, s.listing.objects, s.filter, s.sort);
 }
 
-/** Selected entries from the full listing (not just the filtered view). */
+/**
+ * Selected entries, in listing order, limited to rows the current filter shows: an action never
+ * includes an item the user can't see (setFilter also prunes hidden ones from the selection).
+ */
 export function getSelected(): { folders: FolderEntry[]; objects: ObjectEntry[] } {
   const { selection, listing } = useApp.getState();
   if (!selection.size) return { folders: [], objects: [] };
+  const visible = new Set(getViewRows().map((r) => r.id));
   return {
-    folders: listing.folders.filter((f) => selection.has(f.prefix)),
-    objects: listing.objects.filter((o) => selection.has(o.key)),
+    folders: listing.folders.filter((f) => selection.has(f.prefix) && visible.has(f.prefix)),
+    objects: listing.objects.filter((o) => selection.has(o.key) && visible.has(o.key)),
   };
 }
 
-/** Hook: counts of selected folders/objects (cheap, re-renders only when selection/listing change). */
+/** Hook: counts of selected visible folders/objects (same rule as getSelected). */
 export function useSelectionInfo() {
   const selection = useApp((s) => s.selection);
-  const listing = useApp((s) => s.listing);
-  return useMemo(() => summarize(selection, listing.folders, listing.objects), [selection, listing.folders, listing.objects]);
+  const rows = useViewRows();
+  return useMemo(() => summarize(selection, rows), [selection, rows]);
 }
 
-function summarize(selection: Set<string>, allFolders: FolderEntry[], allObjects: ObjectEntry[]) {
+function summarize(selection: Set<string>, rows: Row[]) {
   let folders = 0;
   let objects = 0;
   let bytes = 0;
   let singleFolder: FolderEntry | null = null;
   let singleObject: ObjectEntry | null = null;
   if (selection.size) {
-    for (const f of allFolders) {
-      if (selection.has(f.prefix)) {
+    for (const r of rows) {
+      if (!selection.has(r.id)) continue;
+      if (r.kind === "folder") {
         folders++;
-        singleFolder = f;
-      }
-    }
-    for (const o of allObjects) {
-      if (selection.has(o.key)) {
+        singleFolder = r.folder;
+      } else {
         objects++;
-        bytes += o.size;
-        singleObject = o;
+        bytes += r.object.size;
+        singleObject = r.object;
       }
     }
   }

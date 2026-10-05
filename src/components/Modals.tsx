@@ -153,28 +153,36 @@ function NewFolderModal() {
 
 type PreviewState = { status: "loading" } | { status: "ok"; preview: JobPreview } | { status: "error"; error: AppError };
 
-/** Run `preview_job` for `request` (null = nothing to preview). `delayMs` debounces typing. */
+const PREVIEW_LOADING: PreviewState = { status: "loading" };
+
+/**
+ * Run `preview_job` for `request` (null = nothing to preview). `delayMs` debounces typing.
+ * The result is tagged with the exact request object (and retry attempt) it was computed for;
+ * until the result for the current `request` arrives this returns "loading", never the result
+ * of a previous request (state set by an effect lags the render that changed `request`).
+ */
 function usePreview(request: JobRequest | null, delayMs = 0): [PreviewState | null, () => void] {
-  const [state, setState] = useState<PreviewState | null>(null);
+  const [tagged, setTagged] = useState<{ request: JobRequest; attempt: number; state: PreviewState } | null>(null);
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!request) {
-      setState(null);
+      setTagged(null);
       return;
     }
     let cancelled = false;
-    setState({ status: "loading" });
+    setTagged({ request, attempt, state: PREVIEW_LOADING });
     const t = setTimeout(() => {
       api
         .previewJob(request)
-        .then((preview) => !cancelled && setState({ status: "ok", preview }))
-        .catch((error: AppError) => !cancelled && setState({ status: "error", error }));
+        .then((preview) => !cancelled && setTagged({ request, attempt, state: { status: "ok", preview } }))
+        .catch((error: AppError) => !cancelled && setTagged({ request, attempt, state: { status: "error", error } }));
     }, delayMs);
     return () => {
       cancelled = true;
       clearTimeout(t);
     };
   }, [request, attempt, delayMs]);
+  const state = !request ? null : tagged && tagged.request === request && tagged.attempt === attempt ? tagged.state : PREVIEW_LOADING;
   return [state, () => setAttempt((n) => n + 1)];
 }
 

@@ -371,8 +371,31 @@ export function setSort(key: SortKey) {
   writePref("s3x.sort", sort);
 }
 
+/** The quick filter's row predicate (shared with the derived view in ./view.ts). */
+export function matchesFilter(name: string, filter: string): boolean {
+  const f = filter.trim().toLowerCase();
+  return !f || name.toLowerCase().includes(f);
+}
+
+/**
+ * Change the quick filter. Selected rows the new filter hides are dropped from the selection
+ * (and the anchor/focus if hidden), so an action never includes an item the user can't see.
+ * Clearing the filter later does not bring them back.
+ */
 export function setFilter(filter: string) {
-  set({ filter });
+  set((s) => {
+    if (!s.selection.size && !s.anchor && !s.focus) return { filter };
+    const visible = new Set<string>();
+    for (const f of s.listing.folders) if (matchesFilter(f.name, filter)) visible.add(f.prefix);
+    for (const o of s.listing.objects) if (matchesFilter(o.name, filter)) visible.add(o.key);
+    const selection = new Set([...s.selection].filter((id) => visible.has(id)));
+    return {
+      filter,
+      selection: selection.size === s.selection.size ? s.selection : selection,
+      anchor: s.anchor && visible.has(s.anchor) ? s.anchor : null,
+      focus: s.focus && visible.has(s.focus) ? s.focus : null,
+    };
+  });
 }
 
 export function setDetailsOpen(open: boolean) {
