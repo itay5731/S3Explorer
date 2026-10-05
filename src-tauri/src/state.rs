@@ -1,4 +1,4 @@
-//! Application state: the active S3 connection and the transfer manager.
+//! Application state: the active S3 connection, the transfer manager and the job manager.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use tokio::sync::RwLock;
 
 use crate::error::{is_access_denied, raw_status_and_region, AppError, AppResult};
+use crate::jobs::{JobManager, JobSink};
 use crate::models::{ConnectionConfig, ConnectionInfo, TransferSettings};
 use crate::settings::SettingsStore;
 use crate::transfers::{ProgressSink, TransferManager};
@@ -183,14 +184,15 @@ impl Connection {
 pub struct AppState {
     connection: RwLock<Option<Arc<Connection>>>,
     pub transfers: Arc<TransferManager>,
+    pub jobs: Arc<JobManager>,
     pub settings: SettingsStore,
 }
 
 impl AppState {
     /// The transfer manager starts with the store's (loaded) settings.
-    pub fn new(sink: Arc<dyn ProgressSink>, settings: SettingsStore) -> Self {
+    pub fn new(sink: Arc<dyn ProgressSink>, job_sink: Arc<dyn JobSink>, settings: SettingsStore) -> Self {
         let transfers = TransferManager::with_settings(sink, settings.get());
-        Self { connection: RwLock::new(None), transfers, settings }
+        Self { connection: RwLock::new(None), transfers, jobs: JobManager::new(job_sink), settings }
     }
 
     pub fn get_settings(&self) -> TransferSettings {

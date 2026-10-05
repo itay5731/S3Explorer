@@ -94,20 +94,6 @@ pub struct ObjectMeta {
     pub version_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteError {
-    pub key: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteResult {
-    pub deleted: u64,
-    pub errors: Vec<DeleteError>,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum TransferKind {
@@ -282,6 +268,116 @@ impl TransferSettings {
     }
 }
 
+// ---- Object operations (jobs) --------------------------------------------------------------
+
+pub const JOB_PROGRESS_EVENT: &str = "job:progress";
+/// Most items one job request may contain (mirror `JOB_MAX_ITEMS` in `types.ts`).
+pub const JOB_MAX_ITEMS: usize = 10_000;
+/// `preview_job` stops counting at this many objects (`truncated: true`).
+pub const JOB_PREVIEW_CAP: u64 = 100_000;
+/// `Job.errors` keeps the first this-many per-object errors.
+pub const JOB_MAX_ERRORS: usize = 50;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum JobKind {
+    Delete,
+    Copy,
+    Move,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    pub fn is_active(self) -> bool {
+        matches!(self, JobStatus::Queued | JobStatus::Running)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ConflictPolicy {
+    Overwrite,
+    /// The default when the field is missing: never overwrite silently.
+    #[default]
+    Skip,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum JobPhase {
+    Listing,
+    Working,
+    Done,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobItem {
+    pub from: String,
+    #[serde(default)]
+    pub to: Option<String>,
+    pub is_prefix: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRequest {
+    pub kind: JobKind,
+    pub src_bucket: String,
+    #[serde(default)]
+    pub dest_bucket: Option<String>,
+    pub items: Vec<JobItem>,
+    #[serde(default)]
+    pub on_conflict: ConflictPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPreview {
+    pub objects: u64,
+    pub bytes: u64,
+    pub conflicts: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JobError {
+    pub key: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Job {
+    pub id: String,
+    pub kind: JobKind,
+    pub src_bucket: String,
+    pub dest_bucket: Option<String>,
+    pub label: String,
+    pub phase: JobPhase,
+    pub total_items: u64,
+    pub done_items: u64,
+    pub skipped_items: u64,
+    pub failed_items: u64,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub status: JobStatus,
+    pub error: Option<String>,
+    pub errors: Vec<JobError>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
 /// Current time as ISO-8601 UTC with millisecond precision.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -345,6 +441,65 @@ mod tests {
         assert!(v.get("bytesPerSec").is_some());
         let e = serde_json::to_value(crate::error::AppError::not_connected()).expect("ser");
         assert_eq!(e["code"], "NotConnected");
+    }
+
+    #[test]
+    fn job_json() {
+        let r: JobRequest = serde_json::from_str(
+            r#"{"kind":"move","srcBucket":"a","destBucket":"b","items":[{"from":"x/","to":"y/","isPrefix":true}],"onConflict":"overwrite"}"#,
+        )
+        .expect("parse request");
+        assert_eq!(r.kind, JobKind::Move);
+        assert_eq!(r.dest_bucket.as_deref(), Some("b"));
+        assert_eq!(r.on_conflict, ConflictPolicy::Overwrite);
+        assert!(r.items[0].is_prefix);
+        let d: JobRequest = serde_json::from_str(
+            r#"{"kind":"delete","srcBucket":"a","destBucket":null,"items":[{"from":"k","to":null,"isPrefix":false}]}"#,
+        )
+        .expect("parse delete");
+        assert_eq!(d.on_conflict, ConflictPolicy::Skip, "missing onConflict defaults to skip");
+        assert!(d.dest_bucket.is_none() && d.items[0].to.is_none());
+        let j = Job {
+            id: "i".into(),
+            kind: JobKind::Copy,
+            src_bucket: "a".into(),
+            dest_bucket: None,
+            label: "l".into(),
+            phase: JobPhase::Listing,
+            total_items: 0,
+            done_items: 0,
+            skipped_items: 0,
+            failed_items: 0,
+            total_bytes: 0,
+            done_bytes: 0,
+            status: JobStatus::Queued,
+            error: None,
+            errors: vec![JobError { key: "k".into(), message: "m".into() }],
+            started_at: now_iso(),
+            finished_at: None,
+        };
+        let v = serde_json::to_value(&j).expect("ser");
+        for f in [
+            "id", "kind", "srcBucket", "destBucket", "label", "phase", "totalItems", "doneItems", "skippedItems",
+            "failedItems", "totalBytes", "doneBytes", "status", "error", "errors", "startedAt", "finishedAt",
+        ] {
+            assert!(v.get(f).is_some(), "missing {f}");
+        }
+        assert_eq!(v.as_object().map(|o| o.len()), Some(17));
+        assert_eq!(v["kind"], "copy");
+        assert_eq!(v["phase"], "listing");
+        assert_eq!(v["status"], "queued");
+        assert_eq!(v["destBucket"], serde_json::Value::Null);
+        let p = serde_json::to_value(JobPreview { objects: 1, bytes: 2, conflicts: 3, truncated: true }).expect("ser");
+        assert_eq!(p, serde_json::json!({"objects":1,"bytes":2,"conflicts":3,"truncated":true}));
+        for (k, s) in [(JobPhase::Working, "working"), (JobPhase::Done, "done")] {
+            assert_eq!(serde_json::to_value(k).expect("ser"), s);
+        }
+        for (k, s) in [(JobStatus::Completed, "completed"), (JobStatus::Failed, "failed"), (JobStatus::Cancelled, "cancelled"), (JobStatus::Running, "running")] {
+            assert_eq!(serde_json::to_value(k).expect("ser"), s);
+        }
+        assert_eq!(serde_json::to_value(JobKind::Delete).expect("ser"), "delete");
+        assert_eq!(serde_json::to_value(ConflictPolicy::Skip).expect("ser"), "skip");
     }
 
     #[test]
