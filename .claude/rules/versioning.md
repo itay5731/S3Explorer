@@ -24,7 +24,10 @@ Release procedure (orchestrator only, after the `verify` gate passes):
    the "does not do" list, the download-splitting table and concurrency numbers, the status table
    under "Should you trust it?" (version named there, what has and has not been tested), build and
    run commands, toolchain requirements, executable size, and screenshots that no longer match the
-   UI. If nothing needs changing, say so explicitly in the release summary to the user.
+   UI.
+   Also re-derive the "IAM permissions" section from the code: list every S3 call the backend makes
+   (`grep -rhoE ".(list_|head_|get_|put_|create_|upload_|complete_|abort_|delete_|copy_)[a-z_]*()" src-tauri/src | sort -u`)
+   and make sure the table, both example policies and the notes cover exactly those calls. If nothing needs changing, say so explicitly in the release summary to the user.
 3. Bump the three version files. Steps 1 to 3 go in one commit: `Release vX.Y.Z`.
 4. Create an annotated tag on that commit: `git tag -a vX.Y.Z -m "vX.Y.Z: <one-line summary>"`.
 5. Push the commit and the tag. The tag triggers `.github/workflows/release.yml`, which builds the

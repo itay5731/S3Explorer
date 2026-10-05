@@ -57,6 +57,99 @@ npm run tauri build
 
 The executable lands in `src-tauri/target/release/`, with installers under `src-tauri/target/release/bundle/`.
 
+## IAM permissions
+
+S3 Explorer only does what your credentials allow. It needs no permissions outside S3, never creates or changes IAM resources, and makes no calls to other AWS services. Grant only the rows you want to use:
+
+| To do this | The app calls | You need |
+|---|---|---|
+| See the list of buckets | `ListBuckets` | `s3:ListAllMyBuckets` on `*` |
+| Open a bucket and browse folders | `HeadBucket` (to find the bucket's region), `ListObjectsV2` | `s3:ListBucket` on the bucket |
+| See object details, download | `HeadObject`, `GetObject` | `s3:GetObject` on the objects |
+| Upload, create a folder | `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` | `s3:PutObject` and `s3:AbortMultipartUpload` on the objects |
+| Delete objects and folders | `ListObjectsV2`, `DeleteObjects` | `s3:ListBucket` on the bucket, `s3:DeleteObject` on the objects |
+| Copy | `ListObjectsV2`, `HeadObject`, `CopyObject`, `UploadPartCopy` (objects over 5 GiB) | `s3:ListBucket` and `s3:GetObject` on the source, `s3:ListBucket` and `s3:PutObject` on the destination |
+| Move and rename | Copy, then delete the original | Everything for Copy, plus `s3:DeleteObject` on the source |
+
+Two things that surprise people:
+
+- **Without `s3:ListAllMyBuckets` the app still works.** It can't show the bucket list, so it asks you to type the bucket name instead.
+- **Bucket-level and object-level permissions use different resources.** `s3:ListBucket` goes on `arn:aws:s3:::my-bucket`, while the object actions go on `arn:aws:s3:::my-bucket/*`. Mixing them up is the most common reason for "Access Denied".
+
+### Full access to one bucket
+
+Replace `my-bucket` with your bucket name. Add more buckets by adding their ARNs to both `Resource` lists.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SeeBucketList",
+      "Effect": "Allow",
+      "Action": "s3:ListAllMyBuckets",
+      "Resource": "*"
+    },
+    {
+      "Sid": "BrowseBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket"
+    },
+    {
+      "Sid": "ReadWriteDeleteObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload",
+        "s3:GetObjectTagging",
+        "s3:PutObjectTagging"
+      ],
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    }
+  ]
+}
+```
+
+### Read-only
+
+Browse and download, nothing else. Upload, new folder, delete, rename, copy and move will fail with "Access Denied", which is the point.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListAllMyBuckets",
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-bucket"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-bucket/*"
+    }
+  ]
+}
+```
+
+### Depending on your setup
+
+- **Tagged objects.** Copying keeps an object's tags, which needs `s3:GetObjectTagging` on the source and `s3:PutObjectTagging` on the destination. They are in the full policy above; you can drop them if you never copy or move tagged objects.
+- **KMS-encrypted buckets (SSE-KMS).** Downloads need `kms:Decrypt` and uploads and copies need `kms:GenerateDataKey` on the bucket's KMS key. S3 calls KMS on your behalf; the app itself does not.
+- **Versioned buckets.** Deleting adds a delete marker and older versions stay. The app never deletes specific versions, so it does not need `s3:DeleteObjectVersion`.
+- **Archived objects (Glacier, Deep Archive).** They can be listed but not downloaded or copied until restored. The app does not restore objects.
+- **Other S3-compatible storage** (MinIO, Cloudflare R2, SeaweedFS and others) has its own permission model. The table of calls above tells you what the app will ask the server to do.
+
+The app remembers no more than it must: saved connections keep the secret key in your operating system's keychain, and an AWS profile is read from `~/.aws` each time you connect.
+
 ## Should you trust it?
 
 Honest status, as of `v0.2.0`:
