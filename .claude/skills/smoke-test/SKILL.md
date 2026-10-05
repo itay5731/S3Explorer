@@ -40,6 +40,22 @@ SHA-256, exercises cancel and a missing-key failure, then deletes the folder wit
 and confirms it is empty. Record the reported MiB/s for upload and download. Reference on this
 machine: 40 MiB upload ~300 MiB/s, download ~450 MiB/s; 512 MiB upload ~480 MiB/s, download ~650 MiB/s.
 
+## Other harnesses in src-tauri/examples
+- `cargo run --example jobs`: delete, copy, move and rename. 110+ checks, each comparing a full snapshot of the
+  bucket (every key, size, hash) before and after. Run it after any change under `src-tauri/src/jobs/`.
+  `JOBS_TRUNCATION=1` adds a 100,000-object run.
+- `cargo run --release --example bench -- gen|put|get ...`: throughput, peak memory, retries and wasted bytes for one
+  transfer with given part size and parallelism. Put multi-GiB data under `src-tauri/target/` (D:), never on C:.
+  `throttle.mjs` in the scratchpad is a bandwidth-capping proxy for slow-link tests.
+- `keychain_check`, `saved_e2e`: saved connections against the real OS keychain using the TEST service name
+  `dev.s3explorer.app.test`. `updater_check`: the update check and a failing-signature install against a local server.
+- Linking can fail with "paging file is too small (os error 1455)" or a spurious `E0463`; rerun with `-j 2`.
+
+## When a test drives the real app
+- It uses the real keychain service and `%APPDATA%dev.s3explorer.app`. Back both up first, prefix test connections
+  with `e2e-`, delete them through the app, and prove afterwards (`cmdkey /list`, file hashes) that nothing is left.
+- Never click "Install and restart" or call `install_update` against the real repository.
+
 ## SeaweedFS limitations to know
 - Without `-volume.max=100 -master.volumeSizeLimitMB=1024` it runs out of volume slots and returns InternalError on larger runs.
 - It normalizes keys: `a//b.txt` is stored as `a/b.txt`, `..` segments are rejected and backslashes are rewritten. Double-slash and
