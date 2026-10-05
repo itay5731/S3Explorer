@@ -8,6 +8,13 @@ export interface Toast {
   kind: ToastKind;
   title: string;
   detail?: string;
+  /** Optional button; clicking it runs the action and dismisses the toast. */
+  action?: ToastAction;
+}
+
+export interface ToastAction {
+  label: string;
+  run(): void;
 }
 
 interface ToastState {
@@ -23,7 +30,7 @@ export const useToasts = create<ToastState>((set, get) => ({
   push(t, ttlMs) {
     const id = ++seq;
     set({ toasts: [...get().toasts.slice(-4), { ...t, id }] });
-    const ttl = ttlMs ?? (t.kind === "error" ? 8000 : 3500);
+    const ttl = ttlMs ?? (t.kind === "error" || t.action ? 8000 : 3500);
     setTimeout(() => get().dismiss(id), ttl);
   },
   dismiss(id) {
@@ -33,7 +40,8 @@ export const useToasts = create<ToastState>((set, get) => ({
 
 export const toast = {
   success: (title: string, detail?: string) => useToasts.getState().push({ kind: "success", title, detail }),
-  info: (title: string, detail?: string) => useToasts.getState().push({ kind: "info", title, detail }),
+  info: (title: string, detail?: string, action?: ToastAction) =>
+    useToasts.getState().push({ kind: "info", title, detail, action }),
   error: (title: string, err?: AppError | string) =>
     useToasts.getState().push({
       kind: "error",

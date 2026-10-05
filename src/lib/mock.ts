@@ -5,6 +5,7 @@
 import type { Backend, FileDropEvent, Unlisten } from "./api";
 import type {
   AppError,
+  AppSettings,
   Bucket,
   ConnectionConfig,
   ConnectionInfo,
@@ -14,11 +15,14 @@ import type {
   ObjectEntry,
   ObjectMeta,
   ProfileInfo,
+  SaveConnectionInput,
+  SavedConnection,
   Transfer,
-  TransferSettings,
+  UpdateInfo,
+  UpdateProgress,
 } from "./types";
-import { DEFAULT_TRANSFER_SETTINGS } from "./types";
-import { planParts, validateSettings } from "./settings";
+import { DEFAULT_APP_SETTINGS, SAVED_CONNECTION_NAME_MAX } from "./types";
+import { planParts, validateAppSettings } from "./settings";
 
 // ---- deterministic randomness ----------------------------------------------
 
@@ -239,20 +243,101 @@ function requireBucket(name: string): MockBucket {
 
 const MOCK_SETTINGS_KEY = "s3x.mock.settings";
 
-function loadMockSettings(): TransferSettings {
+/** Like the backend: missing fields (e.g. a v0.2.0 three-field value) take their defaults. */
+function loadMockSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
     if (raw) {
-      const merged = { ...DEFAULT_TRANSFER_SETTINGS, ...(JSON.parse(raw) as Partial<TransferSettings>) };
-      if (!validateSettings(merged)) return merged;
+      const merged = { ...DEFAULT_APP_SETTINGS, ...(JSON.parse(raw) as Partial<AppSettings>) };
+      if (!validateAppSettings(merged)) return merged;
     }
   } catch {
     /* fall back to defaults */
   }
-  return { ...DEFAULT_TRANSFER_SETTINGS };
+  return { ...DEFAULT_APP_SETTINGS };
 }
 
-let settings: TransferSettings = loadMockSettings();
+let settings: AppSettings = loadMockSettings();
+
+// ---- saved connections ---------------------------------------------------------------
+// Metadata is kept in localStorage (mock-only key) like the backend's connections.json.
+// Secrets stay in memory only, so after a reload a saved static connection has
+// `hasSecret: false` (which exercises the "secret missing" path).
+// Mock switches: a name containing "keychain-fail" makes saving fail with a Keychain error;
+// one containing "keychain-locked" makes connecting fail with a Keychain error.
+
+const MOCK_CONNECTIONS_KEY = "s3x.mock.connections";
+type StoredConnection = Omit<SavedConnection, "hasSecret">;
+
+function loadMockConnections(): StoredConnection[] {
+  try {
+    const raw = localStorage.getItem(MOCK_CONNECTIONS_KEY);
+    const list: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(list) ? (list as StoredConnection[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+let savedConnections: StoredConnection[] = loadMockConnections();
+const mockKeychain = new Map<string, string>();
+
+function persistConnections() {
+  try {
+    localStorage.setItem(MOCK_CONNECTIONS_KEY, JSON.stringify(savedConnections));
+  } catch {
+    /* in memory only */
+  }
+}
+
+const withSecretFlag = (c: StoredConnection): SavedConnection => ({
+  ...c,
+  hasSecret: c.kind === "static" && mockKeychain.has(c.id),
+});
+
+function sortConnections(list: SavedConnection[]): SavedConnection[] {
+  return list.sort((a, b) => {
+    if (a.lastUsedAt !== b.lastUsedAt) {
+      if (!a.lastUsedAt) return 1;
+      if (!b.lastUsedAt) return -1;
+      return b.lastUsedAt.localeCompare(a.lastUsedAt);
+    }
+    return a.name.localeCompare(b.name, undefined, { sensitivity: "base" });
+  });
+}
+
+// ---- updates ---------------------------------------------------------------------------
+// localStorage "s3x.mock.update" picks the outcome of check_for_update:
+// "none" (default, up to date) | "available" (installable) | "manual" (no signed package) | "error".
+
+const MOCK_VERSION = "0.3.0";
+const MOCK_UPDATE_KEY = "s3x.mock.update";
+const RELEASES_URL = "https://github.com/yonatand/S3Explorer/releases/latest";
+const MOCK_NOTES = [
+  "## What's new in 0.3.1",
+  "",
+  "- **Faster listings** for folders with more than 10,000 objects",
+  "- Saved connections now show when they were *last used*",
+  "- Fixed: the `MiB/s` speed could flicker during uploads",
+  "",
+  "### Fixes",
+  "",
+  "1. Theme no longer flashes on startup",
+  "2. Retry button on network errors, see [the issue](https://github.com/yonatand/S3Explorer/issues/42)",
+  "",
+  "<script>alert('raw html is never rendered')</script>",
+  "Thanks to everyone who reported bugs.",
+].join("\n");
+let lastUpdate: UpdateInfo | null = null;
+const updateListeners = new Set<(p: UpdateProgress) => void>();
+
+function mockUpdateMode(): string {
+  try {
+    return localStorage.getItem(MOCK_UPDATE_KEY) ?? "none";
+  } catch {
+    return "none";
+  }
+}
 
 // ---- transfers ------------------------------------------------------------------
 
@@ -602,13 +687,15 @@ export const mockBackend: Backend = {
 
   async updateSettings(next) {
     await delay(120);
-    const candidate: TransferSettings = {
+    const candidate: AppSettings = {
       partSizeMib: next.partSizeMib,
       maxConcurrentParts: next.maxConcurrentParts,
       maxConcurrentTransfers: next.maxConcurrentTransfers,
+      theme: next.theme,
+      checkUpdatesOnStartup: next.checkUpdatesOnStartup,
     };
-    const problem = validateSettings(candidate);
-    if (problem) throw fail("InvalidInput", `Invalid ${problem.field}: ${problem.message}`);
+    const problem = validateAppSettings(candidate);
+    if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
     settings = candidate;
     try {
       localStorage.setItem(MOCK_SETTINGS_KEY, JSON.stringify(settings));
@@ -618,6 +705,159 @@ export const mockBackend: Backend = {
     // A raised limit starts queued transfers at once; a lowered one never interrupts running ones.
     startQueued();
     return { ...settings };
+  },
+
+  async listSavedConnections() {
+    await delay(60);
+    return sortConnections(savedConnections.map(withSecretFlag));
+  },
+
+  async saveConnection(input: SaveConnectionInput) {
+    await delay(150);
+    const name = input.name.trim();
+    if (!name) throw fail("InvalidInput", "name must not be empty");
+    if ([...name].length > SAVED_CONNECTION_NAME_MAX) {
+      throw fail("InvalidInput", `name must be at most ${SAVED_CONNECTION_NAME_MAX} characters`);
+    }
+    const existing = input.id ? savedConnections.find((c) => c.id === input.id) : undefined;
+    if (input.id && !existing) throw fail("InvalidInput", "That saved connection no longer exists.");
+    if (savedConnections.some((c) => c.id !== input.id && c.name.toLowerCase() === name.toLowerCase())) {
+      throw fail("InvalidInput", `A saved connection named “${name}” already exists.`);
+    }
+    const cfg = input.config;
+    let secretToStore: string | null = null;
+    if (cfg.kind === "static") {
+      if (cfg.sessionToken && cfg.sessionToken.trim()) {
+        throw fail("InvalidInput", "Temporary credentials (with a session token) can't be saved.");
+      }
+      if (!cfg.accessKeyId.trim()) throw fail("InvalidInput", "accessKeyId must not be empty");
+      if (!cfg.region.trim()) throw fail("InvalidInput", "region must not be empty");
+      if (cfg.secretAccessKey) secretToStore = cfg.secretAccessKey;
+      else if (!existing) throw fail("InvalidInput", "secretAccessKey must not be empty");
+    } else if (!cfg.profile.trim()) {
+      throw fail("InvalidInput", "profile must not be empty");
+    }
+    if (name.toLowerCase().includes("keychain-fail")) {
+      throw fail("Keychain", "Couldn't write to the OS keychain: the keychain is locked (mock).");
+    }
+    const id = existing?.id ?? crypto.randomUUID();
+    const endpoint = (cfg.endpoint ?? "").trim() || null;
+    const stored: StoredConnection = {
+      id,
+      name,
+      kind: cfg.kind,
+      profile: cfg.kind === "profile" ? cfg.profile : null,
+      accessKeyId: cfg.kind === "static" ? cfg.accessKeyId.trim() : null,
+      region: (cfg.region ?? "").trim() || null,
+      endpoint,
+      forcePathStyle: cfg.kind === "static" ? (cfg.forcePathStyle ?? !!endpoint) : !!endpoint,
+      lastUsedAt: existing?.lastUsedAt ?? null,
+    };
+    if (cfg.kind === "static" && secretToStore !== null) mockKeychain.set(id, secretToStore);
+    if (cfg.kind === "profile") mockKeychain.delete(id);
+    savedConnections = existing ? savedConnections.map((c) => (c.id === id ? stored : c)) : [...savedConnections, stored];
+    persistConnections();
+    return withSecretFlag(stored);
+  },
+
+  async deleteSavedConnection(id) {
+    await delay(80);
+    savedConnections = savedConnections.filter((c) => c.id !== id);
+    mockKeychain.delete(id);
+    persistConnections();
+  },
+
+  async connectSaved(id) {
+    const c = savedConnections.find((x) => x.id === id);
+    if (!c) {
+      await delay(60);
+      throw fail("InvalidInput", "That saved connection no longer exists.");
+    }
+    let config: ConnectionConfig;
+    if (c.kind === "profile") {
+      config = { kind: "profile", profile: c.profile ?? "", region: c.region, endpoint: c.endpoint };
+    } else {
+      if (c.name.toLowerCase().includes("keychain-locked")) {
+        await delay(200);
+        throw fail("Keychain", "The OS keychain refused access (mock).");
+      }
+      const secret = mockKeychain.get(c.id);
+      if (!secret) {
+        await delay(120);
+        throw fail("InvalidInput", `The secret key for “${c.name}” is missing from the keychain. Enter it again.`);
+      }
+      config = {
+        kind: "static",
+        accessKeyId: c.accessKeyId ?? "",
+        secretAccessKey: secret,
+        region: c.region ?? "us-east-1",
+        endpoint: c.endpoint,
+        forcePathStyle: c.forcePathStyle,
+      };
+    }
+    const info = await mockBackend.connect(config);
+    c.lastUsedAt = new Date().toISOString();
+    persistConnections();
+    connection = { ...info, label: c.name };
+    return { ...connection };
+  },
+
+  async checkForUpdate() {
+    await delay(700 + rand() * 500);
+    const mode = mockUpdateMode();
+    if (mode === "error") throw fail("Network", "Couldn't reach github.com: connection timed out (mock).");
+    const available = mode === "available" || mode === "manual";
+    lastUpdate = {
+      currentVersion: MOCK_VERSION,
+      available,
+      latestVersion: available ? "0.3.1" : MOCK_VERSION,
+      notes: available ? MOCK_NOTES : null,
+      publishedAt: available ? new Date(NOW - 2 * DAY).toISOString() : null,
+      canInstall: mode === "available",
+      downloadUrl: RELEASES_URL,
+    };
+    return { ...lastUpdate };
+  },
+
+  async installUpdate() {
+    await delay(100);
+    if (!lastUpdate?.available || !lastUpdate.canInstall) {
+      throw fail("InvalidInput", "No installable update is known. Check for updates first.");
+    }
+    for (const s of sims.values()) {
+      if (s.t.status === "running" || s.t.status === "queued") {
+        throw fail("InvalidInput", "Transfers are still running. Wait for them to finish or cancel them, then install the update.");
+      }
+    }
+    const emitUpdate = (p: UpdateProgress) => {
+      for (const l of updateListeners) l({ ...p });
+    };
+    const total = 9_874_432;
+    const steps = 30;
+    for (let i = 0; i <= steps; i++) {
+      emitUpdate({ phase: "downloading", downloadedBytes: Math.round((total * i) / steps), totalBytes: total });
+      await delay(100);
+    }
+    emitUpdate({ phase: "installing", downloadedBytes: total, totalBytes: total });
+    await delay(700);
+    emitUpdate({ phase: "restarting", downloadedBytes: total, totalBytes: total });
+    await delay(500);
+    window.location.reload();
+  },
+
+  async onUpdateProgress(cb) {
+    updateListeners.add(cb);
+    return () => {
+      updateListeners.delete(cb);
+    };
+  },
+
+  async appVersion() {
+    return MOCK_VERSION;
+  },
+
+  async openExternal(url) {
+    console.info("[mock] open in browser:", url);
   },
 
   async pickFiles() {

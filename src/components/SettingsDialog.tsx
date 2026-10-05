@@ -8,6 +8,8 @@ import {
   Info,
   Loader2,
   Network,
+  Palette,
+  RefreshCcw,
   RotateCcw,
   Settings as SettingsIcon,
   X,
@@ -15,16 +17,28 @@ import {
 } from "lucide-react";
 import {
   AUTO_PART_SIZE_MIB,
-  DEFAULT_TRANSFER_SETTINGS,
+  DEFAULT_APP_SETTINGS,
   MIN_UPLOAD_PART_MIB,
   TRANSFER_SETTINGS_LIMITS,
   type AppError,
-  type TransferSettings,
+  type AppSettings,
+  type ThemeMode,
 } from "../lib/types";
-import { GIB, MIB, planParts, sameSettings, validateInteger, worstCasePartMib } from "../lib/settings";
+import { GIB, MIB, planParts, sameAppSettings, validateInteger, worstCasePartMib } from "../lib/settings";
 import { formatBytes } from "../lib/format";
-import { closeSettings, loadSettings, openSettings, saveSettings, useSettings } from "../store/settings";
+import { applyTheme } from "../lib/theme";
+import {
+  closeSettings,
+  loadSettings,
+  openSettings,
+  saveSettings,
+  useSettings,
+  type SettingsTabId,
+} from "../store/settings";
 import { toast } from "../store/toasts";
+import { useUpdates } from "../store/updates";
+import { AppearanceTab } from "./AppearanceTab";
+import { UpdatesTab } from "./UpdatesTab";
 
 // ---- draft model ------------------------------------------------------------------
 
@@ -38,19 +52,24 @@ interface TransferDraft {
   transfers: string;
 }
 
+/** One slice per tab. Every tab edits its own fields; the dialog has one Save for all of them. */
 interface Draft {
   transfers: TransferDraft;
+  theme: ThemeMode;
+  checkUpdatesOnStartup: boolean;
 }
 
 type TransferErrors = Record<"partSize" | "parts" | "transfers", string | null>;
 
-const toDraft = (s: TransferSettings): Draft => ({
+const toDraft = (s: AppSettings): Draft => ({
   transfers: {
     partMode: s.partSizeMib === null ? "auto" : "custom",
     partSize: String(s.partSizeMib ?? AUTO_PART_SIZE_MIB.standard),
     parts: String(s.maxConcurrentParts),
     transfers: String(s.maxConcurrentTransfers),
   },
+  theme: s.theme,
+  checkUpdatesOnStartup: s.checkUpdatesOnStartup,
 });
 
 function transferErrors(d: TransferDraft): TransferErrors {
@@ -62,7 +81,7 @@ function transferErrors(d: TransferDraft): TransferErrors {
 }
 
 /** The settings a draft describes, or null while any field is invalid. */
-function toSettings(d: Draft): TransferSettings | null {
+function toSettings(d: Draft): AppSettings | null {
   const t = d.transfers;
   const errs = transferErrors(t);
   if (errs.partSize || errs.parts || errs.transfers) return null;
@@ -70,8 +89,17 @@ function toSettings(d: Draft): TransferSettings | null {
     partSizeMib: t.partMode === "auto" ? null : Number(t.partSize),
     maxConcurrentParts: Number(t.parts),
     maxConcurrentTransfers: Number(t.transfers),
+    theme: d.theme,
+    checkUpdatesOnStartup: d.checkUpdatesOnStartup,
   };
 }
+
+const DEFAULT_DRAFT = toDraft(DEFAULT_APP_SETTINGS);
+const sameTransferDraft = (a: TransferDraft, b: TransferDraft) => {
+  const x = toSettings({ ...DEFAULT_DRAFT, transfers: a });
+  const y = toSettings({ ...DEFAULT_DRAFT, transfers: b });
+  return !!x && !!y && sameAppSettings(x, y);
+};
 
 /** A field's number when valid, for live previews. */
 const numberOrNull = (err: string | null, v: string) => (err ? null : Number(v));
@@ -85,10 +113,14 @@ interface TabContext {
 }
 
 interface SettingsTab {
-  id: string;
+  id: SettingsTabId;
   label: string;
   icon: LucideIcon;
   render(ctx: TabContext): ReactNode;
+  /** The draft with this tab's fields reset to their defaults. */
+  reset(d: Draft): Draft;
+  /** Whether this tab's fields are at their defaults. */
+  atDefaults(d: Draft): boolean;
 }
 
 /** Add a section by appending to this list (and its slice of `Draft`). */
@@ -104,6 +136,32 @@ const TABS: SettingsTab[] = [
         onChange={(transfers) => ctx.update({ ...ctx.draft, transfers })}
       />
     ),
+    reset: (d) => ({ ...d, transfers: DEFAULT_DRAFT.transfers }),
+    atDefaults: (d) => sameTransferDraft(d.transfers, DEFAULT_DRAFT.transfers),
+  },
+  {
+    id: "appearance",
+    label: "Appearance",
+    icon: Palette,
+    render: (ctx) => (
+      <AppearanceTab value={ctx.draft.theme} disabled={ctx.disabled} onChange={(theme) => ctx.update({ ...ctx.draft, theme })} />
+    ),
+    reset: (d) => ({ ...d, theme: DEFAULT_DRAFT.theme }),
+    atDefaults: (d) => d.theme === DEFAULT_DRAFT.theme,
+  },
+  {
+    id: "updates",
+    label: "Updates",
+    icon: RefreshCcw,
+    render: (ctx) => (
+      <UpdatesTab
+        checkOnStartup={ctx.draft.checkUpdatesOnStartup}
+        disabled={ctx.disabled}
+        onCheckOnStartupChange={(checkUpdatesOnStartup) => ctx.update({ ...ctx.draft, checkUpdatesOnStartup })}
+      />
+    ),
+    reset: (d) => ({ ...d, checkUpdatesOnStartup: DEFAULT_DRAFT.checkUpdatesOnStartup }),
+    atDefaults: (d) => d.checkUpdatesOnStartup === DEFAULT_DRAFT.checkUpdatesOnStartup,
   },
 ];
 
@@ -426,7 +484,7 @@ function SettingsDialogInner() {
   const loadError = useSettings((s) => s.error);
   const saving = useSettings((s) => s.saving);
 
-  const [tab, setTab] = useState(TABS[0].id);
+  const [tab, setTab] = useState<SettingsTabId>(() => useSettings.getState().initialTab);
   const [draft, setDraft] = useState<Draft | null>(() => (saved ? toDraft(saved) : null));
   const [saveError, setSaveError] = useState<AppError | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -440,10 +498,16 @@ function SettingsDialogInner() {
     if (saved && !draft) setDraft(toDraft(saved));
   }, [saved, draft]);
 
+  // Live theme preview; closing the dialog re-applies the saved theme (see closeSettings).
+  const previewTheme = draft?.theme;
+  useEffect(() => {
+    if (previewTheme) applyTheme(previewTheme);
+  }, [previewTheme]);
+
   // Initial focus on the active tab; restore focus to the opener on close.
   useEffect(() => {
     const opener = document.activeElement as HTMLElement | null;
-    tabRefs.current[0]?.focus();
+    tabRefs.current[Math.max(0, TABS.findIndex((t) => t.id === tab))]?.focus();
     return () => {
       if (opener && opener.isConnected) opener.focus();
     };
@@ -454,8 +518,7 @@ function SettingsDialogInner() {
   }, [confirmDiscard]);
 
   const next = draft ? toSettings(draft) : null;
-  const dirty = !!draft && !!saved && (next === null || !sameSettings(next, saved));
-  const atDefaults = !!next && sameSettings(next, DEFAULT_TRANSFER_SETTINGS);
+  const dirty = !!draft && !!saved && (next === null || !sameAppSettings(next, saved));
   const canSave = !!next && dirty && !saving;
 
   const update = (d: Draft) => {
@@ -532,6 +595,7 @@ function SettingsDialogInner() {
 
   const current = TABS.find((t) => t.id === tab) ?? TABS[0];
   const ready = !!draft && !!saved;
+  const atDefaults = !!draft && current.atDefaults(draft);
 
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && requestClose()} onKeyDown={onKeyDown}>
@@ -631,9 +695,9 @@ function SettingsDialogInner() {
                 <button
                   type="button"
                   className="btn"
-                  onClick={() => draft && update({ ...draft, ...toDraft(DEFAULT_TRANSFER_SETTINGS) })}
+                  onClick={() => draft && update(current.reset(draft))}
                   disabled={!ready || saving || atDefaults}
-                  title="Fill the form with the default values. Changes still need to be saved."
+                  title={`Reset the ${current.label} settings to their defaults. Changes still need to be saved.`}
                 >
                   <RotateCcw size={13} /> Reset to defaults
                 </button>
@@ -662,17 +726,19 @@ export function SettingsDialog() {
 
 export function SettingsButton({ className = "" }: { className?: string }) {
   const open = useSettings((s) => s.open);
+  const notice = useUpdates((s) => s.notice);
   return (
     <button
       type="button"
-      className={`icon-btn lg ${className}`}
-      onClick={openSettings}
-      aria-label="Settings"
+      className={`icon-btn lg settings-btn ${className}`}
+      onClick={() => openSettings(notice ? "updates" : "transfers")}
+      aria-label={notice ? "Settings (update available)" : "Settings"}
       aria-haspopup="dialog"
       aria-expanded={open}
-      title="Settings"
+      title={notice ? "Settings: an update is available" : "Settings"}
     >
       <SettingsIcon size={15} />
+      {notice && <span className="notice-dot" aria-hidden="true" />}
     </button>
   );
 }
