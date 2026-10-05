@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
@@ -12,6 +13,17 @@ use tokio_util::sync::CancellationToken;
 
 use super::{cancellable, plan, PartSettings, TransferEntry};
 use crate::error::{AppError, AppResult, ErrorCode};
+
+/// Config override for requests that carry a body (PutObject, UploadPart).
+///
+/// The SDK's `read_timeout` (30 s, see `state.rs`) runs from the start of a request until the
+/// response headers arrive, so it also covers *sending* the body. On a slow uplink a part can
+/// legitimately take minutes to send (100 MiB at 190 KiB/s is ~9 min), and every attempt would
+/// time out and start the part over. These requests run without it: a dead connection still
+/// fails through TCP, and a body that stops producing data through stalled-stream protection.
+fn body_upload_config() -> aws_sdk_s3::config::Builder {
+    aws_sdk_s3::config::Builder::default().timeout_config(TimeoutConfig::builder().disable_read_timeout().build())
+}
 
 pub(super) async fn run(
     client: &Client,
@@ -46,6 +58,8 @@ pub(super) async fn run(
                 .content_type(content_type)
                 .content_length(size as i64)
                 .body(body)
+                .customize()
+                .config_override(body_upload_config())
                 .send(),
         )
         .await??;
@@ -170,6 +184,8 @@ async fn upload_parts(
                     .part_number(part_number)
                     .content_length(len as i64)
                     .body(body)
+                    .customize()
+                    .config_override(body_upload_config())
                     .send(),
             )
             .await??;
