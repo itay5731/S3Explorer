@@ -1,9 +1,19 @@
 name: Build executables
 
 # Tauri cannot cross-compile, so each OS builds its own binary.
-# Run manually (Actions tab > Build executables > Run workflow) or push a tag like v0.1.0.
+#
+# - Push a tag like v0.2.0: builds every platform, then publishes a GitHub Release whose text
+#   is that version's section of CHANGELOG.md, with the executables and installers attached.
+# - Run manually without a tag: builds only, downloadable as workflow artifacts.
+# - Run manually with an existing tag (e.g. v0.1.0): builds that tag and publishes its Release,
+#   taking the notes from CHANGELOG.md on the branch the workflow is run from.
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish as a Release (leave empty to only build)"
+        required: false
+        default: ""
   push:
     tags: ["v*"]
 
@@ -28,6 +38,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Linux system dependencies
         if: runner.os == 'Linux'
@@ -69,3 +81,64 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.deb
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.rpm
             src-tauri/target/${{ matrix.target }}/release/bundle/**/*.AppImage
+
+  release:
+    name: Publish release with patch notes
+    needs: build
+    if: github.ref_type == 'tag' || inputs.tag != ''
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      # For a tag push this is the tagged commit; for a manual run it is the branch the run was
+      # started from, so older tags can be published with notes written later.
+      - uses: actions/checkout@v4
+
+      - name: Extract patch notes for this version from CHANGELOG.md
+        run: |
+          version="${TAG#v}"
+          awk -v ver="$version" '
+            /^## \[/ { if (found) exit; if (index($0, "## [" ver "]") == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for [$version]. Add patch notes before releasing."
+            exit 1
+          fi
+          echo "----- patch notes for $TAG -----"
+          cat notes.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect files and give each a platform-specific name
+        run: |
+          mkdir release
+          for dir in artifacts/s3explorer-*; do
+            platform="${dir#artifacts/s3explorer-}"
+            find "$dir" -type f | while read -r file; do
+              base="$(basename "$file")"
+              case "$base" in
+                s3explorer)     dest="s3explorer-${TAG}-${platform}" ;;
+                s3explorer.exe) dest="s3explorer-${TAG}-${platform}.exe" ;;
+                *)              dest="$(printf '%s' "$base" | tr ' ' '.')" ;;
+              esac
+              if [ -e "release/$dest" ]; then
+                echo "::error::Two files would both be published as $dest"
+                exit 1
+              fi
+              cp "$file" "release/$dest"
+            done
+          done
+          ls -la release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: S3 Explorer ${{ env.TAG }}
+          body_path: notes.md
+          files: release/*
+          fail_on_unmatched_files: true
