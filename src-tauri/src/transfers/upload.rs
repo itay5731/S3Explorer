@@ -10,23 +10,13 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{cancellable, part_count, TransferEntry, MAX_PARTS_IN_FLIGHT, MIB, MULTIPART_THRESHOLD};
+use super::{cancellable, plan, PartSettings, TransferEntry};
 use crate::error::{AppError, AppResult, ErrorCode};
-
-const MAX_PARTS: u64 = 10_000;
-
-/// 8 MiB, doubled until the upload fits in 10 000 parts.
-pub(crate) fn upload_part_size(size: u64) -> u64 {
-    let mut ps = 8 * MIB;
-    while size.div_ceil(ps) > MAX_PARTS {
-        ps *= 2;
-    }
-    ps
-}
 
 pub(super) async fn run(
     client: &Client,
     entry: &Arc<TransferEntry>,
+    cfg: PartSettings,
     bucket: &str,
     key: &str,
     src: &Path,
@@ -42,8 +32,10 @@ pub(super) async fn run(
     let content_type = mime_guess::from_path(src).first_or_octet_stream().essence_str().to_string();
     let token = entry.cancel.child_token();
 
-    if size <= MULTIPART_THRESHOLD {
-        entry.set_totals(size, 1);
+    let p = plan::plan_upload(size, cfg.part_size_mib);
+    entry.set_totals(size, p.parts_total());
+    if !p.multipart {
+        let _in_flight = entry.part_started();
         let body = ByteStream::from_path(src).await?;
         cancellable(
             &token,
@@ -62,9 +54,7 @@ pub(super) async fn run(
         return Ok(());
     }
 
-    let part_size = upload_part_size(size);
-    let parts = part_count(size, part_size);
-    entry.set_totals(size, u32::try_from(parts).unwrap_or(u32::MAX));
+    let (part_size, parts) = (p.part_size, p.parts);
 
     if token.is_cancelled() {
         return Err(AppError::cancelled());
@@ -81,7 +71,8 @@ pub(super) async fn run(
         if token.is_cancelled() {
             return Err(AppError::cancelled());
         }
-        let completed = upload_parts(client, entry, bucket, key, &upload_id, src, size, part_size, parts, &token).await?;
+        let completed = upload_parts(client, entry, bucket, key, &upload_id, src, size, part_size, parts, cfg.max_parts, &token)
+                .await?;
         // Not cancellable either: once all parts are up, let Complete finish so the reported
         // status always matches whether the object was actually committed.
         client
@@ -115,9 +106,10 @@ async fn upload_parts(
     size: u64,
     part_size: u64,
     parts: u64,
+    max_parts: usize,
     token: &CancellationToken,
 ) -> AppResult<Vec<CompletedPart>> {
-    let sem = Arc::new(Semaphore::new(MAX_PARTS_IN_FLIGHT));
+    let sem = Arc::new(Semaphore::new(max_parts.max(1)));
     let mut set: JoinSet<AppResult<(i32, String)>> = JoinSet::new();
     let mut etags: Vec<Option<String>> = vec![None; parts as usize];
     let mut first_err: Option<AppError> = None;
@@ -158,6 +150,7 @@ async fn upload_parts(
         let (bucket, key, upload_id, src) = (bucket.to_string(), key.to_string(), upload_id.to_string(), src.to_path_buf());
         set.spawn(async move {
             let _permit = permit;
+            let _in_flight = entry.part_started();
             // Stream the part straight from disk instead of buffering it: memory stays flat no
             // matter how large the parts get, and a path-backed body is replayable for SDK retries.
             let body = ByteStream::read_from()
@@ -207,18 +200,4 @@ async fn upload_parts(
             Ok(CompletedPart::builder().part_number((i + 1) as i32).e_tag(etag).build())
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn part_sizes() {
-        assert_eq!(upload_part_size(40 * MIB), 8 * MIB);
-        assert_eq!(upload_part_size(80_000 * MIB), 8 * MIB);
-        assert_eq!(upload_part_size(80_001 * MIB), 16 * MIB);
-        let five_tb = 5 * 1024 * 1024 * MIB;
-        assert!(five_tb.div_ceil(upload_part_size(five_tb)) <= MAX_PARTS);
-    }
 }

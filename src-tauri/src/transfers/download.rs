@@ -11,20 +11,12 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{cancellable, part_count, write_all_at, TransferEntry, MAX_PARTS_IN_FLIGHT, MIB, MULTIPART_THRESHOLD};
+use super::{cancellable, plan, write_all_at, PartSettings, TransferEntry};
 use crate::error::{AppError, AppResult, ErrorCode};
 
 const PART_ATTEMPTS: u32 = 3;
 /// A response body that delivers no bytes for this long is treated as a (retryable) network error.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn part_size_for(size: u64) -> u64 {
-    if size > 1024 * MIB {
-        16 * MIB
-    } else {
-        8 * MIB
-    }
-}
 
 /// Temp file next to `dest`, unique per transfer (`{dest}.{first 8 of id}.part`), so two
 /// downloads can never share one partially written file.
@@ -53,6 +45,7 @@ async fn next_chunk(body: &mut aws_sdk_s3::primitives::ByteStream) -> AppResult<
 pub(super) async fn run(
     client: &Client,
     entry: &Arc<TransferEntry>,
+    cfg: PartSettings,
     id: &str,
     bucket: &str,
     key: &str,
@@ -75,14 +68,13 @@ pub(super) async fn run(
     let tmp_owned = tmp.clone();
     let file = tokio::task::spawn_blocking(move || create_tmp(&tmp_owned)).await??;
 
-    let result = if size <= MULTIPART_THRESHOLD {
-        entry.set_totals(size, 1);
+    let p = plan::plan_download(size, cfg.part_size_mib);
+    entry.set_totals(size, p.parts_total());
+    let result = if !p.multipart {
+        let _in_flight = entry.part_started();
         single(client, entry, bucket, key, etag.as_deref(), size, file, &token).await
     } else {
-        let ps = part_size_for(size);
-        let parts = part_count(size, ps);
-        entry.set_totals(size, u32::try_from(parts).unwrap_or(u32::MAX));
-        ranged(client, entry, bucket, key, etag, size, ps, parts, file, &token).await
+        ranged(client, entry, bucket, key, etag, size, p.part_size, p.parts, cfg.max_parts, file, &token).await
     };
 
     match result {
@@ -150,6 +142,7 @@ async fn ranged(
     size: u64,
     part_size: u64,
     parts: u64,
+    max_parts: usize,
     file: std::fs::File,
     token: &CancellationToken,
 ) -> AppResult<()> {
@@ -159,7 +152,7 @@ async fn ranged(
     })
     .await??;
     let file = Arc::new(file);
-    let sem = Arc::new(Semaphore::new(MAX_PARTS_IN_FLIGHT));
+    let sem = Arc::new(Semaphore::new(max_parts.max(1)));
     let mut set: JoinSet<AppResult<()>> = JoinSet::new();
     let mut first_err: Option<AppError> = None;
 
@@ -190,6 +183,7 @@ async fn ranged(
         let (bucket, key, etag) = (bucket.to_string(), key.to_string(), etag.clone());
         set.spawn(async move {
             let _permit = permit;
+            let _in_flight = entry.part_started();
             let buf = fetch_range(&client, &entry, &bucket, &key, etag.as_deref(), start, end, &token).await?;
             let file2 = file.clone();
             tokio::task::spawn_blocking(move || write_all_at(&file2, &buf, start)).await??;

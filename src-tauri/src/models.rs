@@ -152,6 +152,136 @@ pub struct Transfer {
 
 pub const TRANSFER_PROGRESS_EVENT: &str = "transfer:progress";
 
+/// Inclusive limits for [`TransferSettings`] (mirror `TRANSFER_SETTINGS_LIMITS` in `types.ts`).
+pub const PART_SIZE_MIB_MIN: u32 = 1;
+pub const PART_SIZE_MIB_MAX: u32 = 256;
+pub const MAX_CONCURRENT_PARTS_MIN: u32 = 1;
+pub const MAX_CONCURRENT_PARTS_MAX: u32 = 32;
+pub const MAX_CONCURRENT_TRANSFERS_MIN: u32 = 1;
+pub const MAX_CONCURRENT_TRANSFERS_MAX: u32 = 10;
+/// Defaults (mirror `DEFAULT_TRANSFER_SETTINGS` in `types.ts`).
+pub const DEFAULT_MAX_CONCURRENT_PARTS: u32 = 8;
+pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: u32 = 4;
+
+/// User-tunable transfer settings. `part_size_mib: None` means Auto.
+///
+/// Deserialization is lenient (missing fields take their default, unknown fields are ignored) so
+/// the on-disk file stays forward compatible. Range checks are done by [`TransferSettings::validate`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferSettings {
+    #[serde(default)]
+    pub part_size_mib: Option<u32>,
+    #[serde(default = "default_max_concurrent_parts")]
+    pub max_concurrent_parts: u32,
+    #[serde(default = "default_max_concurrent_transfers")]
+    pub max_concurrent_transfers: u32,
+}
+
+fn default_max_concurrent_parts() -> u32 {
+    DEFAULT_MAX_CONCURRENT_PARTS
+}
+
+fn default_max_concurrent_transfers() -> u32 {
+    DEFAULT_MAX_CONCURRENT_TRANSFERS
+}
+
+impl Default for TransferSettings {
+    fn default() -> Self {
+        Self {
+            part_size_mib: None,
+            max_concurrent_parts: DEFAULT_MAX_CONCURRENT_PARTS,
+            max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
+        }
+    }
+}
+
+fn part_size_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "partSizeMib must be an integer from {PART_SIZE_MIB_MIN} to {PART_SIZE_MIB_MAX}, or null for Auto"
+    ))
+}
+
+fn parts_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "maxConcurrentParts must be an integer from {MAX_CONCURRENT_PARTS_MIN} to {MAX_CONCURRENT_PARTS_MAX}"
+    ))
+}
+
+fn transfers_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "maxConcurrentTransfers must be an integer from {MAX_CONCURRENT_TRANSFERS_MIN} to {MAX_CONCURRENT_TRANSFERS_MAX}"
+    ))
+}
+
+fn part_size_ok(v: Option<u32>) -> bool {
+    v.is_none_or(|v| (PART_SIZE_MIB_MIN..=PART_SIZE_MIB_MAX).contains(&v))
+}
+
+fn parts_ok(v: u32) -> bool {
+    (MAX_CONCURRENT_PARTS_MIN..=MAX_CONCURRENT_PARTS_MAX).contains(&v)
+}
+
+fn transfers_ok(v: u32) -> bool {
+    (MAX_CONCURRENT_TRANSFERS_MIN..=MAX_CONCURRENT_TRANSFERS_MAX).contains(&v)
+}
+
+impl TransferSettings {
+    /// Rejects (`InvalidInput`, naming the field and its range) the first out-of-range field.
+    pub fn validate(&self) -> crate::error::AppResult<()> {
+        if !part_size_ok(self.part_size_mib) {
+            return Err(part_size_error());
+        }
+        if !parts_ok(self.max_concurrent_parts) {
+            return Err(parts_error());
+        }
+        if !transfers_ok(self.max_concurrent_transfers) {
+            return Err(transfers_error());
+        }
+        Ok(())
+    }
+
+    /// Replaces each out-of-range field with its default (used for the on-disk file only).
+    pub fn sanitized(self) -> Self {
+        let d = Self::default();
+        Self {
+            part_size_mib: if part_size_ok(self.part_size_mib) { self.part_size_mib } else { d.part_size_mib },
+            max_concurrent_parts: if parts_ok(self.max_concurrent_parts) {
+                self.max_concurrent_parts
+            } else {
+                d.max_concurrent_parts
+            },
+            max_concurrent_transfers: if transfers_ok(self.max_concurrent_transfers) {
+                self.max_concurrent_transfers
+            } else {
+                d.max_concurrent_transfers
+            },
+        }
+    }
+
+    /// Strict parse of the `update_settings` argument: every field must be present and an
+    /// in-range integer (`partSizeMib` may be `null`). Non-integers (`2.5`, `"8"`, `-1`) and
+    /// out-of-range values are `InvalidInput` naming the field. Unknown fields are ignored.
+    pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
+        let obj = v.as_object().ok_or_else(|| crate::error::AppError::invalid("settings must be an object"))?;
+        let int = |name: &str, err: fn() -> crate::error::AppError| -> crate::error::AppResult<u32> {
+            obj.get(name).and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or_else(err)
+        };
+        let part_size_mib = match obj.get("partSizeMib") {
+            Some(serde_json::Value::Null) => None,
+            Some(_) => Some(int("partSizeMib", part_size_error)?),
+            None => return Err(part_size_error()),
+        };
+        let s = Self {
+            part_size_mib,
+            max_concurrent_parts: int("maxConcurrentParts", parts_error)?,
+            max_concurrent_transfers: int("maxConcurrentTransfers", transfers_error)?,
+        };
+        s.validate()?;
+        Ok(s)
+    }
+}
+
 /// Current time as ISO-8601 UTC with millisecond precision.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

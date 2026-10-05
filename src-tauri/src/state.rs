@@ -12,7 +12,8 @@ use dashmap::DashMap;
 use tokio::sync::RwLock;
 
 use crate::error::{is_access_denied, raw_status_and_region, AppError, AppResult};
-use crate::models::{ConnectionConfig, ConnectionInfo};
+use crate::models::{ConnectionConfig, ConnectionInfo, TransferSettings};
+use crate::settings::SettingsStore;
 use crate::transfers::{ProgressSink, TransferManager};
 
 const FALLBACK_REGION: &str = "us-east-1";
@@ -182,11 +183,23 @@ impl Connection {
 pub struct AppState {
     connection: RwLock<Option<Arc<Connection>>>,
     pub transfers: Arc<TransferManager>,
+    pub settings: SettingsStore,
 }
 
 impl AppState {
-    pub fn new(sink: Arc<dyn ProgressSink>) -> Self {
-        Self { connection: RwLock::new(None), transfers: TransferManager::new(sink) }
+    /// The transfer manager starts with the store's (loaded) settings.
+    pub fn new(sink: Arc<dyn ProgressSink>, settings: SettingsStore) -> Self {
+        let transfers = TransferManager::with_settings(sink, settings.get());
+        Self { connection: RwLock::new(None), transfers, settings }
+    }
+
+    pub fn get_settings(&self) -> TransferSettings {
+        self.settings.get()
+    }
+
+    /// Validates, persists and applies new settings (nothing changes on error).
+    pub async fn update_settings(&self, settings: TransferSettings) -> AppResult<TransferSettings> {
+        self.settings.update(settings, |s| self.transfers.apply_settings(s)).await
     }
 
     pub async fn set_connection(&self, conn: Option<Arc<Connection>>) {

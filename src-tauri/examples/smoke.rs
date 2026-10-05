@@ -5,13 +5,14 @@
 //!
 //! Run: `cargo run --example smoke`
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use s3explorer_lib::error::ErrorCode;
-use s3explorer_lib::models::{ConnectionConfig, Transfer, TransferStatus};
+use s3explorer_lib::models::{ConnectionConfig, Transfer, TransferSettings, TransferStatus};
 use s3explorer_lib::ops;
 use s3explorer_lib::state::Connection;
 use s3explorer_lib::transfers::{ProgressSink, TransferManager};
@@ -64,6 +65,141 @@ impl ProgressSink for Recorder {
 /// True if any `*.part` temp file is left in `dir`.
 fn part_files_exist(dir: &std::path::Path) -> std::io::Result<bool> {
     Ok(std::fs::read_dir(dir)?.filter_map(Result::ok).any(|e| e.file_name().to_string_lossy().ends_with(".part")))
+}
+
+fn settings(part_size_mib: Option<u32>, parts: u32, transfers: u32) -> TransferSettings {
+    let s = TransferSettings { part_size_mib, max_concurrent_parts: parts, max_concurrent_transfers: transfers };
+    assert!(s.validate().is_ok());
+    s
+}
+
+/// Highest number of `ids` simultaneously `running`, replaying the events in emit order.
+fn max_running(events: &[Transfer], ids: &[String]) -> usize {
+    let mut status: HashMap<&str, TransferStatus> = HashMap::new();
+    let mut max = 0;
+    for t in events.iter().filter(|t| ids.contains(&t.id)) {
+        status.insert(&t.id, t.status);
+        max = max.max(status.values().filter(|s| **s == TransferStatus::Running).count());
+    }
+    max
+}
+
+fn first_event(events: &[Transfer], id: &str, status: TransferStatus) -> Option<usize> {
+    events.iter().position(|t| t.id == id && t.status == status)
+}
+
+/// Transfer settings against the real server: part size, parts in flight, transfer limit.
+async fn settings_checks(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    dir: &std::path::Path,
+    big: &[u8],
+    big_src: &std::path::Path,
+    big_mib: u64,
+) -> Res<()> {
+    println!("settings");
+    let out = dir.join("settings-out");
+    let _ = tokio::fs::remove_dir_all(&out).await;
+    ops::delete_folder(client, bucket, "smoke-settings/").await?;
+    let rec = Arc::new(Recorder { events: Mutex::new(Vec::new()), count: AtomicUsize::new(0) });
+    let tm = TransferManager::with_settings(rec.clone(), settings(Some(4), 3, 4));
+    let src_key = "smoke/data/big.bin";
+    let want_sha = sha(big);
+
+    // partSizeMib=4, maxConcurrentParts=3.
+    let id = tm.start_download(client.clone(), bucket, src_key, out.join("p4.bin"))?;
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    let peak = tm.peak_parts_in_flight(&id).unwrap_or(0);
+    println!("  4 MiB parts: {:?} parts {}/{}, peak parts in flight {peak}", t.status, t.parts_done, t.parts_total);
+    check(t.status == TransferStatus::Completed, "4 MiB download completed")?;
+    check(u64::from(t.parts_total) == big_mib.div_ceil(4), "partSizeMib=4 -> partsTotal = ceil(size / 4 MiB)")?;
+    check((1..=3).contains(&peak), "peak parts in flight <= maxConcurrentParts (3)")?;
+    check(sha(&tokio::fs::read(out.join("p4.bin")).await?) == want_sha, "4 MiB parts sha256 matches")?;
+
+    // partSizeMib=64: a 40 MiB object is one GET.
+    tm.apply_settings(&settings(Some(64), 8, 4));
+    let id = tm.start_download(client.clone(), bucket, src_key, out.join("p64.bin"))?;
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    let peak = tm.peak_parts_in_flight(&id).unwrap_or(0);
+    println!("  64 MiB parts: {:?} parts {}/{}, peak {peak}", t.status, t.parts_done, t.parts_total);
+    let expect = if big_mib > 64 { big_mib.div_ceil(64) } else { 1 };
+    check(t.status == TransferStatus::Completed, "64 MiB download completed")?;
+    check(u64::from(t.parts_total) == expect && t.parts_done == t.parts_total, "partSizeMib=64 -> single GET")?;
+    check(sha(&tokio::fs::read(out.join("p64.bin")).await?) == want_sha, "64 MiB parts sha256 matches")?;
+
+    // partSizeMib=1 upload: raised to the 5 MiB S3 minimum.
+    tm.apply_settings(&settings(Some(1), 8, 4));
+    let up_key = "smoke-settings/big-1m.bin";
+    let id = tm.start_upload(client.clone(), bucket, up_key, big_src.to_path_buf());
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    let peak = tm.peak_parts_in_flight(&id).unwrap_or(0);
+    println!("  1 MiB upload: {:?} {:?} parts {}/{}, peak {peak}", t.status, t.error, t.parts_done, t.parts_total);
+    check(t.status == TransferStatus::Completed, "1 MiB-setting upload completed")?;
+    check(u64::from(t.parts_total) == big_mib.div_ceil(5), "upload used 5 MiB parts")?;
+    check(peak <= 8, "upload peak parts in flight <= 8")?;
+    let meta = ops::head_object(client, bucket, up_key).await?;
+    check(meta.size == big.len() as u64, "5 MiB-part upload size")?;
+    let id = tm.start_download(client.clone(), bucket, up_key, out.join("up1.bin"))?;
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    check(
+        t.status == TransferStatus::Completed && sha(&tokio::fs::read(out.join("up1.bin")).await?) == want_sha,
+        "5 MiB-part upload round-trips (sha256)",
+    )?;
+
+    // maxConcurrentTransfers=1: never more than one running. Small slow parts keep each running a while.
+    tm.apply_settings(&settings(Some(1), 1, 1));
+    let ids: Vec<String> = (0..3)
+        .map(|i| tm.start_download(client.clone(), bucket, src_key, out.join(format!("lim1-{i}.bin"))))
+        .collect::<Result<_, _>>()?;
+    for id in &ids {
+        let t = tm.wait(id).await.ok_or("missing transfer")?;
+        check(t.status == TransferStatus::Completed, "limit=1 download completed")?;
+    }
+    let mx = max_running(&rec.events.lock().map_err(|_| "poisoned")?, &ids);
+    println!("  limit 1: max running observed {mx}");
+    check(mx == 1, "maxConcurrentTransfers=1 -> never more than 1 running")?;
+
+    // Raise to 3 while #0 runs: #1 and #2 start at once, with the part size in effect when they start.
+    let ids: Vec<String> = (0..3)
+        .map(|i| tm.start_download(client.clone(), bucket, src_key, out.join(format!("raise-{i}.bin"))))
+        .collect::<Result<_, _>>()?;
+    let t0 = Instant::now();
+    while tm.get(&ids[0]).is_some_and(|t| t.status == TransferStatus::Queued) && t0.elapsed().as_secs() < 10 {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    let queued: Vec<_> = ids[1..].iter().filter_map(|id| tm.get(id)).map(|t| t.status).collect();
+    println!("  before raise: #0 {:?}, others {queued:?}", tm.get(&ids[0]).map(|t| t.status));
+    check(queued.iter().all(|s| *s == TransferStatus::Queued), "others queued while limit=1")?;
+    tm.apply_settings(&settings(Some(2), 1, 3));
+    let mut finals = Vec::new();
+    for id in &ids {
+        finals.push(tm.wait(id).await.ok_or("missing transfer")?);
+    }
+    let ev = rec.events.lock().map_err(|_| "poisoned")?.clone();
+    let mx = max_running(&ev, &ids);
+    let done0 = first_event(&ev, &ids[0], TransferStatus::Completed).unwrap_or(0);
+    let started_early = ids[1..]
+        .iter()
+        .all(|id| first_event(&ev, id, TransferStatus::Running).is_some_and(|i| i < done0));
+    println!(
+        "  raise to 3: max running {mx}, queued ones started before #0 finished: {started_early}, parts {:?}",
+        finals.iter().map(|t| t.parts_total).collect::<Vec<_>>()
+    );
+    check(finals.iter().all(|t| t.status == TransferStatus::Completed), "raised-limit downloads completed")?;
+    check(started_early, "raising the limit starts queued transfers immediately")?;
+    check((2..=3).contains(&mx), "running count rose above 1 and stayed <= 3")?;
+    check(u64::from(finals[0].parts_total) == big_mib, "#0 kept the 1 MiB part size it started with")?;
+    check(
+        finals[1..].iter().all(|t| u64::from(t.parts_total) == big_mib.div_ceil(2)),
+        "queued transfers snapshot the part size when they start (2 MiB)",
+    )?;
+    for i in 0..3 {
+        check(sha(&tokio::fs::read(out.join(format!("raise-{i}.bin"))).await?) == want_sha, "raised-limit sha256")?;
+    }
+
+    ops::delete_folder(client, bucket, "smoke-settings/").await?;
+    let _ = tokio::fs::remove_dir_all(&out).await;
+    Ok(())
 }
 
 fn static_config(endpoint: &str, ak: &str, sk: &str) -> ConnectionConfig {
@@ -222,6 +358,8 @@ async fn main() -> Res<()> {
     check(tm.list().len() == 6, "list_transfers has all transfers")?;
     tm.remove(&f)?;
     check(tm.list().len() == 5, "remove_transfer")?;
+
+    settings_checks(&client, bucket, &dir, &big, &big_src, big_mib).await?;
 
     println!("delete");
     {
