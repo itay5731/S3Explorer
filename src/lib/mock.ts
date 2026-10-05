@@ -11,6 +11,10 @@ import type {
   ConnectionInfo,
   ErrorCode,
   FolderEntry,
+  Job,
+  JobItem,
+  JobPreview,
+  JobRequest,
   ListPage,
   ObjectEntry,
   ObjectMeta,
@@ -21,7 +25,7 @@ import type {
   UpdateInfo,
   UpdateProgress,
 } from "./types";
-import { DEFAULT_APP_SETTINGS, SAVED_CONNECTION_NAME_MAX } from "./types";
+import { DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX } from "./types";
 import { planParts, validateAppSettings } from "./settings";
 
 // ---- deterministic randomness ----------------------------------------------
@@ -138,6 +142,29 @@ function seed() {
   put(assets, "日本語フォルダ/ファイル一覧.txt", 2_048, { ageDays: 33 });
   put(assets, "日本語フォルダ/写真 001.jpg", 2_400_000, { ageDays: 33 });
   put(assets, "empty folder/", 0, { ageDays: 10 });
+  // Unusual but legal prefixes: a double slash (empty segment) and leading/trailing spaces + unicode.
+  put(assets, "reports/annual 2025.pdf", 1_402_118, { ageDays: 60 });
+  put(assets, "reports//2026/q1 summary.csv", 44_012, { ageDays: 20 });
+  put(assets, "reports//2026/q2 summary.csv", 51_877, { ageDays: 12 });
+  put(assets, " Ünïcødé  spaces 📁 /notes – été.txt", 3_210, { ageDays: 5 });
+  put(assets, " Ünïcødé  spaces 📁 /photo 01.jpg", 1_800_000, { ageDays: 5 });
+  // Per-object failures: keys containing "fail-copy" can't be copied; Glacier / Deep Archive need a restore.
+  put(assets, "mixed/ok-1.txt", 1_024, { ageDays: 3 });
+  put(assets, "mixed/ok-2.txt", 2_048, { ageDays: 3 });
+  put(assets, "mixed/fail-copy-contract.pdf", 220_000, { ageDays: 3 });
+  put(assets, "mixed/archive-2019.tar", 48 * MB, { ageDays: 900, storageClass: "GLACIER" });
+  put(assets, "mixed/sub/deep.bin", 300 * MB, { ageDays: 1200, storageClass: "DEEP_ARCHIVE" });
+  put(assets, "mixed/sub/fine.json", 812, { ageDays: 3 });
+  put(assets, "docs/fail-copy-notes.txt", 9_400, { ageDays: 2 });
+  // Conflict scenarios: two batches whose names collide with what's already published.
+  put(assets, "published/report.csv", 1_000, { ageDays: 40 });
+  put(assets, "published/photo.jpg", 2_000, { ageDays: 40 });
+  put(assets, "staging/batch-1/report.csv", 1_111, { ageDays: 1 });
+  put(assets, "staging/batch-1/photo.jpg", 2_222, { ageDays: 1 });
+  put(assets, "staging/batch-1/new-1.txt", 111, { ageDays: 1 });
+  put(assets, "staging/batch-2/report.csv", 3_333, { ageDays: 1 });
+  put(assets, "staging/batch-2/photo.jpg", 4_444, { ageDays: 1 });
+  put(assets, "staging/batch-2/new-2.txt", 222, { ageDays: 1 });
 
   // 2. acme-logs: the 5,000-object folder (virtualization stress test)
   const logs = addBucket("acme-logs", "2022-07-01T00:00:00Z");
@@ -157,6 +184,10 @@ function seed() {
   }
   for (const svc of ["api-gateway", "auth-service", "billing", "worker"]) {
     for (let i = 0; i < 30; i++) put(logs, `app/${svc}/2026-10-${String(1 + (i % 5)).padStart(2, "0")}/part-${i}.log`, between(10 * KB, 50 * MB));
+  }
+  // More than JOB_MAX_ITEMS objects in one folder (selection guard).
+  for (let i = 0; i < 10_050; i++) {
+    put(logs, `firehose/2026/10/05/events-${String(i).padStart(5, "0")}.json.gz`, between(1 * KB, 64 * KB), { ageDays: 1 });
   }
   put(logs, "README.txt", 1_204, { ageDays: 800 });
   put(logs, "cloudfront/", 0, { ageDays: 900 });
@@ -482,6 +513,380 @@ const fakeSize = (path: string) => {
   return path.endsWith(".mp4") ? 300 * MB + (h % (900 * MB)) : 40 * KB + (h % (60 * MB));
 };
 
+// ---- jobs (delete / copy / move) -----------------------------------------------------
+// Mirrors "Object operations (jobs)" in docs/CONTRACT.md: validation, prefix expansion,
+// conflicts, skip vs overwrite, move = copy then delete each source as it goes, per-object
+// failures, at most 2 running jobs (FIFO queue), cooperative cancel.
+// Mock switches: keys containing "fail-copy" fail to copy; GLACIER / DEEP_ARCHIVE objects
+// fail to copy until restored (like real S3).
+
+const JOB_MAX_RUNNING = 2;
+const JOB_PREVIEW_CAP = 100_000;
+const JOB_ERRORS_MAX = 50;
+const JOB_LIST_PER_TICK = 700; // keys "listed" per 100 ms while in the listing phase
+
+interface JobWork {
+  src: string;
+  dest: string | null;
+}
+
+interface JobSim {
+  job: Job;
+  req: JobRequest;
+  itemIdx: number;
+  listing: { keys: string[]; pos: number; item: JobItem } | null;
+  work: JobWork[];
+  workPos: number;
+  seenSrc: Set<string>;
+}
+
+const jobSims = new Map<string, JobSim>();
+const jobListeners = new Set<(j: Job) => void>();
+let jobTicker: ReturnType<typeof setInterval> | null = null;
+let jobSeq = 0;
+
+/** Every preview/start request the mock received, verbatim (deep-cloned), for test inspection. */
+const jobCallLog: { cmd: "preview_job" | "start_job"; request: unknown; at: string }[] = [];
+function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
+  jobCallLog.push({ cmd, request: JSON.parse(JSON.stringify(request)), at: new Date().toISOString() });
+}
+// Test hook (mock only): inspect requests and the in-memory tree from a driver script.
+(globalThis as Record<string, unknown>).__s3xMock = {
+  jobCalls: jobCallLog,
+  has: (bucket: string, key: string) => !!buckets.get(bucket)?.objects.has(key),
+  size: (bucket: string, key: string) => buckets.get(bucket)?.objects.get(key)?.size ?? null,
+  keys: (bucket: string, prefix: string) => {
+    const b = buckets.get(bucket);
+    if (!b) return [];
+    const keys = sortedKeys(b);
+    const out: string[] = [];
+    for (let i = lowerBound(keys, prefix); i < keys.length && keys[i].startsWith(prefix); i++) out.push(keys[i]);
+    return out;
+  },
+};
+
+const cloneJob = (j: Job): Job => ({ ...j, errors: j.errors.map((e) => ({ ...e })) });
+
+function emitJob(j: Job) {
+  const copy = cloneJob(j);
+  for (const l of jobListeners) l(copy);
+}
+
+const invalid = (message: string) => fail("InvalidInput", message);
+
+/** Contract validation. Throws InvalidInput (nothing is changed). */
+function validateJobRequest(req: JobRequest) {
+  requireConnection();
+  if (!req || (req.kind !== "delete" && req.kind !== "copy" && req.kind !== "move")) {
+    throw invalid("kind must be one of delete, copy, move");
+  }
+  if (!Array.isArray(req.items) || req.items.length === 0) throw invalid("items must not be empty");
+  if (req.items.length > JOB_MAX_ITEMS) {
+    throw invalid(`items: at most ${JOB_MAX_ITEMS.toLocaleString("en-US")} per job (got ${req.items.length.toLocaleString("en-US")})`);
+  }
+  if (req.onConflict !== "overwrite" && req.onConflict !== "skip") throw invalid("onConflict must be overwrite or skip");
+  requireBucket(req.srcBucket);
+  const transfer = req.kind !== "delete";
+  if (transfer) {
+    if (!req.destBucket) throw invalid(`destBucket is required for ${req.kind}`);
+    requireBucket(req.destBucket);
+  } else if (req.destBucket != null) {
+    throw invalid("destBucket must be null for delete");
+  }
+  const sameBucket = transfer && req.destBucket === req.srcBucket;
+  const dests: { to: string; isPrefix: boolean; i: number }[] = [];
+  req.items.forEach((it, i) => {
+    const at = `items[${i}]`;
+    if (typeof it.from !== "string" || it.from === "") throw invalid(`${at}.from must not be empty`);
+    if (it.isPrefix) {
+      if (it.from === "/") throw invalid(`${at}.from: the prefix "/" is not allowed`);
+      if (!it.from.endsWith("/")) throw invalid(`${at}.from must end with "/" when isPrefix is true`);
+    }
+    if (!transfer) {
+      if (it.to != null) throw invalid(`${at}.to must be null for delete`);
+      return;
+    }
+    if (it.to == null) throw invalid(`${at}.to is required for ${req.kind}`);
+    if (it.isPrefix) {
+      if (it.to === "" || it.to === "/") throw invalid(`${at}.to: the prefix "${it.to}" is not allowed`);
+      if (!it.to.endsWith("/")) throw invalid(`${at}.to must end with "/" when isPrefix is true`);
+    } else {
+      if (it.to === "") throw invalid(`${at}.to must not be empty`);
+      if (it.to.endsWith("/")) throw invalid(`${at}.to: an object destination must not end with "/" (${it.to})`);
+    }
+    if (sameBucket && it.to === it.from) throw invalid(`${at}: the destination is the same as the source (${it.from})`);
+    if (sameBucket && it.isPrefix && it.to.startsWith(it.from)) {
+      throw invalid(`${at}: cannot ${req.kind} the folder ${it.from} into itself (${it.to})`);
+    }
+    dests.push({ to: it.to, isPrefix: it.isPrefix, i });
+  });
+  // Two items that would write the same destination key: identical destinations, or a
+  // destination inside another item's destination prefix.
+  dests.sort((a, b) => (a.to < b.to ? -1 : a.to > b.to ? 1 : 0));
+  const stack: { to: string; i: number }[] = [];
+  for (let k = 0; k < dests.length; k++) {
+    const d = dests[k];
+    if (k > 0 && dests[k - 1].to === d.to) {
+      throw invalid(`items[${dests[k - 1].i}] and items[${d.i}] would both write to ${d.to}`);
+    }
+    while (stack.length && !d.to.startsWith(stack[stack.length - 1].to)) stack.pop();
+    if (stack.length) throw invalid(`items[${stack[stack.length - 1].i}] and items[${d.i}] would write into the same destination (${d.to})`);
+    if (d.isPrefix) stack.push(d);
+  }
+}
+
+function expandJobItem(b: MockBucket, it: JobItem): string[] {
+  if (!it.isPrefix) return b.objects.has(it.from) ? [it.from] : [];
+  const keys = sortedKeys(b);
+  const out: string[] = [];
+  for (let i = lowerBound(keys, it.from); i < keys.length && keys[i].startsWith(it.from); i++) out.push(keys[i]);
+  return out;
+}
+
+const destKeyOf = (it: JobItem, key: string): string | null =>
+  it.to == null ? null : it.isPrefix ? it.to + key.slice(it.from.length) : it.to;
+
+function previewJobSync(req: JobRequest): JobPreview {
+  validateJobRequest(req);
+  const src = buckets.get(req.srcBucket)!;
+  const dest = req.kind === "delete" ? null : buckets.get(req.destBucket!)!;
+  let objects = 0;
+  let bytes = 0;
+  let conflicts = 0;
+  let truncated = false;
+  const seenSrc = new Set<string>();
+  const seenDest = new Set<string>();
+  outer: for (const it of req.items) {
+    for (const key of expandJobItem(src, it)) {
+      if (seenSrc.has(key)) continue;
+      if (objects >= JOB_PREVIEW_CAP) {
+        truncated = true;
+        break outer;
+      }
+      seenSrc.add(key);
+      objects++;
+      bytes += src.objects.get(key)!.size;
+      if (dest) {
+        const d = destKeyOf(it, key)!;
+        if (seenDest.has(d)) throw invalid(`Two items would write the same destination key: ${d}`);
+        seenDest.add(d);
+        if (dest.objects.has(d)) conflicts++;
+      }
+    }
+  }
+  return { objects, bytes, conflicts, truncated };
+}
+
+const leafOf = (keyOrPrefix: string) => {
+  const trimmed = keyOrPrefix.endsWith("/") ? keyOrPrefix.slice(0, -1) : keyOrPrefix;
+  const i = trimmed.lastIndexOf("/");
+  return trimmed.slice(i + 1) + (keyOrPrefix.endsWith("/") ? "/" : "");
+};
+const parentOf = (keyOrPrefix: string) => keyOrPrefix.slice(0, keyOrPrefix.length - leafOf(keyOrPrefix).length);
+
+function jobLabel(req: JobRequest): string {
+  const n = req.items.length;
+  const first = req.items[0];
+  const what = n === 1 ? leafOf(first.from) || first.from : `${n.toLocaleString("en-US")} items`;
+  if (req.kind === "delete") return `Delete ${what}`;
+  if (n === 1 && req.kind === "move" && req.destBucket === req.srcBucket && first.to && parentOf(first.to) === parentOf(first.from)) {
+    return `Rename ${what} to ${leafOf(first.to)}`;
+  }
+  const where = first.to ? parentOf(first.to) : "";
+  return `${req.kind === "copy" ? "Copy" : "Move"} ${what} to ${req.destBucket}/${where}`;
+}
+
+function startJobSync(req: JobRequest): string {
+  validateJobRequest(req);
+  // The real backend also detects colliding expanded destinations; the mock checks up front.
+  if (req.kind !== "delete") previewJobSync(req);
+  const id = `job-${++jobSeq}-${hex(6)}`;
+  const job: Job = {
+    id,
+    kind: req.kind,
+    srcBucket: req.srcBucket,
+    destBucket: req.kind === "delete" ? null : req.destBucket,
+    label: jobLabel(req),
+    phase: "listing",
+    totalItems: 0,
+    doneItems: 0,
+    skippedItems: 0,
+    failedItems: 0,
+    totalBytes: 0,
+    doneBytes: 0,
+    status: "queued",
+    error: null,
+    errors: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+  };
+  const sim: JobSim = {
+    job,
+    req: JSON.parse(JSON.stringify(req)) as JobRequest,
+    itemIdx: 0,
+    listing: null,
+    work: [],
+    workPos: 0,
+    seenSrc: new Set(),
+  };
+  jobSims.set(id, sim);
+  emitJob(job);
+  if (!jobTicker) jobTicker = setInterval(jobTick, 100);
+  return id;
+}
+
+function jobError(sim: JobSim, key: string, message: string) {
+  sim.job.failedItems++;
+  if (sim.job.errors.length < JOB_ERRORS_MAX) sim.job.errors.push({ key, message });
+}
+
+function finishJob(sim: JobSim, status: "completed" | "failed" | "cancelled") {
+  sim.job.status = status;
+  sim.job.phase = "done";
+  sim.job.finishedAt = new Date().toISOString();
+  emitJob(sim.job);
+}
+
+const ARCHIVED: Record<string, string> = { GLACIER: "Glacier Flexible Retrieval", DEEP_ARCHIVE: "Glacier Deep Archive" };
+
+/** List up to `budget` keys. Returns true when every item has been expanded. */
+function listStep(sim: JobSim, budget: number): boolean {
+  const src = buckets.get(sim.req.srcBucket);
+  if (!src) {
+    sim.job.error = `The bucket “${sim.req.srcBucket}” no longer exists.`;
+    return true;
+  }
+  const add = (it: JobItem, key: string) => {
+    if (sim.seenSrc.has(key)) return;
+    sim.seenSrc.add(key);
+    sim.work.push({ src: key, dest: destKeyOf(it, key) });
+    sim.job.totalItems++;
+    sim.job.totalBytes += src.objects.get(key)?.size ?? 0;
+  };
+  while (budget > 0) {
+    if (sim.listing) {
+      const { keys, item } = sim.listing;
+      while (budget > 0 && sim.listing.pos < keys.length) {
+        add(item, keys[sim.listing.pos++]);
+        budget--;
+      }
+      if (sim.listing.pos >= keys.length) sim.listing = null;
+      continue;
+    }
+    if (sim.itemIdx >= sim.req.items.length) return true;
+    const it = sim.req.items[sim.itemIdx++];
+    if (!it.isPrefix) {
+      if (src.objects.has(it.from)) add(it, it.from);
+      else if (sim.req.kind === "delete") {
+        // DeleteObjects on a missing key succeeds on S3 (nothing to delete).
+        sim.job.totalItems++;
+        sim.job.doneItems++;
+      } else {
+        sim.job.totalItems++;
+        jobError(sim, it.from, "NoSuchKey: The specified key does not exist.");
+      }
+      budget--;
+      continue;
+    }
+    const keys = expandJobItem(src, it);
+    if (!keys.length) {
+      sim.job.totalItems++;
+      jobError(sim, it.from, "No objects found under this prefix.");
+      budget--;
+      continue;
+    }
+    sim.listing = { keys, pos: 0, item: it };
+  }
+  return false;
+}
+
+function workOne(sim: JobSim, w: JobWork) {
+  const j = sim.job;
+  const src = buckets.get(sim.req.srcBucket)!;
+  const o = src.objects.get(w.src);
+  if (!o) {
+    if (sim.req.kind === "delete") j.doneItems++;
+    else jobError(sim, w.src, "NoSuchKey: The source object no longer exists.");
+    return;
+  }
+  if (sim.req.kind === "delete") {
+    src.objects.delete(w.src);
+    src.sorted = null;
+    j.doneItems++;
+    j.doneBytes += o.size;
+    return;
+  }
+  if (w.src.includes("fail-copy")) {
+    jobError(sim, w.src, "AccessDenied: Access Denied for s3:GetObject on this key (mock: keys containing “fail-copy” cannot be copied).");
+    return;
+  }
+  if (ARCHIVED[o.storageClass]) {
+    jobError(sim, w.src, `InvalidObjectState: The object is archived in ${ARCHIVED[o.storageClass]} and must be restored before it can be copied.`);
+    return;
+  }
+  const dest = buckets.get(sim.req.destBucket!)!;
+  if (dest.objects.has(w.dest!) && sim.req.onConflict === "skip") {
+    // Left untouched; in a move the source is NOT deleted.
+    j.skippedItems++;
+    return;
+  }
+  dest.objects.set(w.dest!, {
+    ...o,
+    metadata: { ...o.metadata },
+    lastModified: new Date().toISOString(),
+    etag: hex(32),
+    versionId: null,
+  });
+  dest.sorted = null;
+  // Move: the source is deleted only after its own copy succeeded, object by object.
+  if (sim.req.kind === "move") {
+    src.objects.delete(w.src);
+    src.sorted = null;
+  }
+  j.doneItems++;
+  j.doneBytes += o.size;
+}
+
+function jobTick() {
+  let running = 0;
+  let active = 0;
+  for (const s of jobSims.values()) if (s.job.status === "running") running++;
+  // FIFO: Map iteration order is insertion order.
+  for (const s of jobSims.values()) {
+    if (running >= JOB_MAX_RUNNING) break;
+    if (s.job.status !== "queued") continue;
+    s.job.status = "running";
+    running++;
+    emitJob(s.job);
+  }
+  for (const sim of jobSims.values()) {
+    const j = sim.job;
+    if (j.status === "queued") active++;
+    if (j.status !== "running") continue;
+    active++;
+    if (j.phase === "listing") {
+      if (listStep(sim, JOB_LIST_PER_TICK)) {
+        if (j.error) {
+          finishJob(sim, "failed");
+          continue;
+        }
+        j.phase = "working";
+      }
+      emitJob(j);
+      continue;
+    }
+    // ~16 operations in flight; scaled so large folders take a few seconds and stay visible.
+    const perTick = Math.max(2, Math.ceil(sim.work.length / 45));
+    for (let n = 0; n < perTick && sim.workPos < sim.work.length; n++) workOne(sim, sim.work[sim.workPos++]);
+    if (sim.workPos >= sim.work.length) finishJob(sim, j.failedItems > 0 ? "failed" : "completed");
+    else emitJob(j);
+  }
+  if (active === 0 && jobTicker) {
+    clearInterval(jobTicker);
+    jobTicker = null;
+  }
+}
+
 // ---- the backend ---------------------------------------------------------------------
 
 export const mockBackend: Backend = {
@@ -612,22 +1017,6 @@ export const mockBackend: Backend = {
     put(b, p, 0, { ageDays: 0 });
   },
 
-  async deleteFolder(bucket, prefix) {
-    await delay(400 + rand() * 600);
-    const b = requireBucket(bucket);
-    if (!prefix || prefix === "/") throw fail("InvalidInput", "Refusing to delete the whole bucket.");
-    if (!prefix.endsWith("/")) prefix += "/";
-    let deleted = 0;
-    for (const key of [...b.objects.keys()]) {
-      if (key.startsWith(prefix)) {
-        b.objects.delete(key);
-        deleted++;
-      }
-    }
-    b.sorted = null;
-    return { deleted, errors: [] };
-  },
-
   async startDownload(bucket, key, destPath) {
     await delay(40);
     if (!key || key.endsWith("/")) throw fail("InvalidInput", "Key must name an object, not a folder.");
@@ -677,6 +1066,46 @@ export const mockBackend: Backend = {
     progressListeners.add(cb);
     return () => {
       progressListeners.delete(cb);
+    };
+  },
+
+  async previewJob(request) {
+    await delay(250 + rand() * 350);
+    logJobCall("preview_job", request);
+    return previewJobSync(request);
+  },
+
+  async startJob(request) {
+    await delay(60);
+    logJobCall("start_job", request);
+    return startJobSync(request);
+  },
+
+  async cancelJob(id) {
+    await delay(30);
+    const sim = jobSims.get(id);
+    if (!sim) throw fail("InvalidInput", "Unknown job.");
+    if (sim.job.status === "running" || sim.job.status === "queued") finishJob(sim, "cancelled");
+  },
+
+  async removeJob(id) {
+    await delay(20);
+    const sim = jobSims.get(id);
+    if (sim && (sim.job.status === "running" || sim.job.status === "queued")) {
+      throw fail("InvalidInput", "Cannot remove a job that is still running. Cancel it first.");
+    }
+    jobSims.delete(id);
+  },
+
+  async listJobs() {
+    await delay(20);
+    return [...jobSims.values()].map((s) => cloneJob(s.job));
+  },
+
+  async onJobProgress(cb) {
+    jobListeners.add(cb);
+    return () => {
+      jobListeners.delete(cb);
     };
   },
 
@@ -827,6 +1256,11 @@ export const mockBackend: Backend = {
     for (const s of sims.values()) {
       if (s.t.status === "running" || s.t.status === "queued") {
         throw fail("InvalidInput", "Transfers are still running. Wait for them to finish or cancel them, then install the update.");
+      }
+    }
+    for (const j of jobSims.values()) {
+      if (j.job.status === "running" || j.job.status === "queued") {
+        throw fail("InvalidInput", "File operations are still running. Wait for them to finish or cancel them, then install the update.");
       }
     }
     const emitUpdate = (p: UpdateProgress) => {

@@ -1,11 +1,15 @@
 import { Fragment } from "react";
 import {
   ChevronRight,
+  ClipboardPaste,
+  Copy,
   Download,
   FolderPlus,
   PanelRightClose,
   PanelRightOpen,
+  PencilLine,
   RefreshCw,
+  Scissors,
   Search,
   Trash2,
   Upload,
@@ -14,9 +18,18 @@ import {
   ArrowUp,
 } from "lucide-react";
 import { navigate, openModal, refresh, setDetailsOpen, setFilter, useApp } from "../store/app";
+import { clearClipboard, useClipboard } from "../store/clipboard";
+import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
 import { downloadObjects, pickAndUpload } from "../store/actions";
 import { getSelected, useSelectionInfo, useViewRows } from "../store/view";
-import { displayName, formatBytes, parentPrefix, prefixSegments } from "../lib/format";
+import { displayName, formatBytes, parentPrefix, prefixSegments, s3Uri } from "../lib/format";
+import { plural } from "../lib/ops";
+
+function clipTitle(mode: "copy" | "cut", keys: string[]): string {
+  const shown = keys.slice(0, 20).join("\n");
+  const more = keys.length > 20 ? `\n… and ${keys.length - 20} more` : "";
+  return `${mode === "cut" ? "Cut (moves on paste)" : "Copied"}:\n${shown}${more}`;
+}
 
 export function Toolbar() {
   const bucket = useApp((s) => s.bucket);
@@ -25,6 +38,8 @@ export function Toolbar() {
   const loading = useApp((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
   const sel = useSelectionInfo();
+  const selCount = sel.folders + sel.objects;
+  const clip = useClipboard((s) => s.clip);
   const disabled = !bucket;
 
   return (
@@ -36,7 +51,7 @@ export function Toolbar() {
         </button>
         <button className="btn" disabled={disabled} onClick={() => openModal({ kind: "newFolder" })} title="New folder">
           <FolderPlus size={14} />
-          <span className="btn-label">New folder</span>
+          <span className="btn-label secondary">New folder</span>
         </button>
         <button
           className="btn"
@@ -47,14 +62,33 @@ export function Toolbar() {
           <Download size={14} />
           <span className="btn-label secondary">Download</span>
         </button>
+        <span className="tool-sep" />
+        <button className="icon-btn lg" disabled={disabled || selCount === 0} onClick={() => copySelection("copy")} title="Copy (Ctrl+C)" aria-label="Copy">
+          <Copy size={15} />
+        </button>
+        <button className="icon-btn lg" disabled={disabled || selCount === 0} onClick={() => copySelection("cut")} title="Cut (Ctrl+X)" aria-label="Cut">
+          <Scissors size={15} />
+        </button>
+        <button
+          className="icon-btn lg"
+          disabled={disabled || !clip}
+          onClick={() => requestPaste()}
+          title={clip ? `Paste into this folder (Ctrl+V)` : "Paste (clipboard is empty)"}
+          aria-label="Paste"
+        >
+          <ClipboardPaste size={15} />
+        </button>
+        <button className="icon-btn lg" disabled={disabled || selCount !== 1} onClick={() => requestRename()} title="Rename (F2)" aria-label="Rename">
+          <PencilLine size={15} />
+        </button>
         <button
           className="btn btn-danger-ghost"
-          disabled={disabled || !sel.folder}
-          onClick={() => sel.folder && openModal({ kind: "deleteFolder", prefix: sel.folder.prefix })}
-          title="Delete folder (recursive)"
+          disabled={disabled || selCount === 0}
+          onClick={() => requestDelete()}
+          title={selCount > 1 ? `Delete ${selCount} items (Delete)` : "Delete (Delete)"}
         >
           <Trash2 size={14} />
-          <span className="btn-label secondary">Delete folder</span>
+          <span className="btn-label secondary">Delete</span>
         </button>
         <span className="tool-sep" />
         <button className="icon-btn lg" disabled={disabled || !prefix} onClick={() => bucket && navigate(bucket, parentPrefix(prefix))} title="Up one level (Backspace)">
@@ -65,6 +99,20 @@ export function Toolbar() {
         </button>
       </div>
       <div className="tool-group right">
+        {clip && (
+          <div className={`clip-chip ${clip.mode}`} title={clipTitle(clip.mode, clip.items.map((i) => i.key))}>
+            {clip.mode === "cut" ? <Scissors size={12} /> : <Copy size={12} />}
+            <span className="clip-count">
+              {plural(clip.items.length, "item")} {clip.mode === "cut" ? "cut" : "copied"}
+            </span>
+            <span className="clip-from">
+              from <span className="mono">{s3Uri(clip.bucket, clip.prefix).slice(5)}</span>
+            </span>
+            <button className="icon-btn" onClick={clearClipboard} aria-label="Clear clipboard" title="Clear clipboard">
+              <X size={12} />
+            </button>
+          </div>
+        )}
         <div className="search-box toolbar-search">
           <Search size={13} />
           <input

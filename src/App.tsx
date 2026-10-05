@@ -3,6 +3,7 @@ import { Loader2 } from "lucide-react";
 import * as api from "./lib/api";
 import { setConnected, useApp } from "./store/app";
 import { startTransferSync } from "./store/transfers";
+import { startJobSync } from "./store/jobs";
 import { ConnectScreen } from "./components/ConnectScreen";
 import { Explorer } from "./components/Explorer";
 import { Toasts } from "./components/Toasts";
@@ -16,6 +17,7 @@ export default function App() {
 
   useEffect(() => {
     let stop: (() => void) | null = null;
+    let stopJobs: (() => void) | null = null;
     let cancelUpdateCheck: (() => void) | null = null;
     let disposed = false;
     // Settings work while disconnected, so load them independently of the connection.
@@ -25,6 +27,9 @@ export default function App() {
     });
     startTransferSync()
       .then((s) => (disposed ? s() : (stop = s)))
+      .catch(() => {});
+    startJobSync()
+      .then((s) => (disposed ? s() : (stopJobs = s)))
       .catch(() => {});
     api
       .connectionStatus()
@@ -36,6 +41,7 @@ export default function App() {
     return () => {
       disposed = true;
       stop?.();
+      stopJobs?.();
       cancelUpdateCheck?.();
     };
   }, []);

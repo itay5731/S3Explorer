@@ -2,7 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Copy, Download, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
-import { navigate, openModal, setDetailsOpen, useApp } from "../store/app";
+import { navigate, setDetailsOpen, useApp } from "../store/app";
+import { requestDelete } from "../store/ops";
 import { copyText, downloadObjects } from "../store/actions";
 import { getSelected, useSelectionInfo } from "../store/view";
 import { displayName, formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
@@ -154,7 +155,7 @@ export function DetailsPanel() {
           <button className="btn" onClick={() => navigate(bucket, f.prefix)}>
             <FolderOpen size={14} /> Open
           </button>
-          <button className="btn btn-danger-ghost" onClick={() => openModal({ kind: "deleteFolder", prefix: f.prefix })}>
+          <button className="btn btn-danger-ghost" onClick={() => requestDelete()}>
             <Trash2 size={14} /> Delete
           </button>
         </div>
@@ -191,6 +192,11 @@ export function DetailsPanel() {
           </div>
         )}
         {sel.folders > 0 && <p className="muted small dnote">Folders are skipped when downloading a selection.</p>}
+        <div className="dactions">
+          <button className="btn btn-danger-ghost" onClick={() => requestDelete()}>
+            <Trash2 size={14} /> Delete {(sel.folders + sel.objects).toLocaleString()} items…
+          </button>
+        </div>
       </>
     );
   } else {

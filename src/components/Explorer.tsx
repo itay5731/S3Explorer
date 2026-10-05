@@ -3,11 +3,12 @@ import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
 import { disconnect, useApp } from "../store/app";
 import { installTransferEffects, uploadPaths } from "../store/actions";
+import { installJobEffects } from "../store/ops";
 import { Sidebar } from "./Sidebar";
 import { Breadcrumbs, Toolbar } from "./Toolbar";
 import { ObjectTable } from "./ObjectTable";
 import { DetailsPanel } from "./DetailsPanel";
-import { TransfersPanel } from "./TransfersPanel";
+import { ActivityPanel } from "./TransfersPanel";
 import { ContextMenu } from "./ContextMenu";
 import { Modals } from "./Modals";
 import { Logo } from "./Logo";
@@ -104,6 +105,7 @@ export function Explorer() {
   const dragging = useFileDrop();
 
   useEffect(() => installTransferEffects(), []);
+  useEffect(() => installJobEffects(), []);
 
   return (
     <div className="app">
@@ -136,7 +138,7 @@ export function Explorer() {
         </main>
         {detailsOpen && <DetailsPanel />}
       </div>
-      <TransfersPanel />
+      <ActivityPanel />
       <ContextMenu />
       <Modals />
     </div>

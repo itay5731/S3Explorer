@@ -89,31 +89,6 @@ export async function createFolder(name: string): Promise<boolean> {
   }
 }
 
-export async function deleteFolder(prefix: string): Promise<boolean> {
-  const { bucket } = useApp.getState();
-  if (!bucket) return false;
-  try {
-    // Exactly the prefix the user confirmed. Never normalize it: "a//" must not become "a/".
-    const res = await api.deleteFolder(bucket, prefix);
-    if (res.errors.length) {
-      toast.error(
-        `Deleted ${res.deleted} objects, ${res.errors.length} failed`,
-        res.errors
-          .slice(0, 3)
-          .map((e) => `${e.key}: ${e.message}`)
-          .join("\n"),
-      );
-    } else {
-      toast.success(`Deleted ${res.deleted.toLocaleString()} object${res.deleted === 1 ? "" : "s"}`, `s3://${bucket}/${prefix}`);
-    }
-    refresh();
-    return true;
-  } catch (e) {
-    toast.error("Could not delete folder", e as AppError);
-    return false;
-  }
-}
-
 export async function copyText(text: string, what: string) {
   try {
     await navigator.clipboard.writeText(text);
