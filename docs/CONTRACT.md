@@ -205,3 +205,16 @@ Semantics:
   (uploads stream from disk). The UI shows this estimate and warns above 1 GiB total
   (`maxConcurrentTransfers × maxConcurrentParts × partSize`).
 - `Transfer.partsTotal` reflects the part size the transfer actually used.
+
+Implementation notes (settled during implementation):
+
+- **Upload Auto** is 8 MiB at every file size; the 16 MiB step above 1 GiB applies to downloads only.
+- **Upload part growth** past the 10,000-part limit is by doubling the effective part size (5 → 10 → 20 MiB …),
+  not the smallest size that fits.
+- `update_settings` requires all three fields. `partSizeMib` must be present as `null` or an integer. Error
+  messages start with the field name, e.g. `maxConcurrentParts must be an integer from 1 to 32`.
+- A settings file that fails to parse falls back to defaults wholesale; one that parses but has out-of-range
+  values keeps its valid fields and resets only the bad ones.
+- Queued transfers start in FIFO order. A transfer's run slot is released after its final progress event, so the
+  number of transfers reported `running` never exceeds `maxConcurrentTransfers` (except right after lowering it).
+- A disk failure while saving returns `Io` and leaves the active settings unchanged.
