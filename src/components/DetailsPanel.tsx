@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Copy, Download, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle } from "lucide-react";
+import { ChevronRight, Copy, Download, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
 import { navigate, setDetailsOpen, useApp } from "../store/app";
@@ -33,6 +33,8 @@ export function DetailsPanel() {
   const [meta, setMeta] = useState<ObjectMeta | null>(null);
   const [metaError, setMetaError] = useState<AppError | null>(null);
   const [loading, setLoading] = useState(false);
+  // The technical fields (storage class, ETag, metadata…) stay folded until asked for.
+  const [showMore, setShowMore] = useState(false);
 
   const objKey = obj?.key ?? null;
   useEffect(() => {
@@ -88,9 +90,6 @@ export function DetailsPanel() {
           </button>
         </div>
         <div className="dsection">
-          <Field label="Key" mono copy={obj.key}>
-            {obj.key}
-          </Field>
           <Field label="Size">
             {formatBytes(obj.size, 2)} <span className="muted">({obj.size.toLocaleString()} bytes)</span>
           </Field>
@@ -98,40 +97,50 @@ export function DetailsPanel() {
             {formatExact(m?.lastModified ?? obj.lastModified) || "—"}{" "}
             <span className="muted">· {formatRelative(m?.lastModified ?? obj.lastModified)}</span>
           </Field>
-          <Field label="Storage class">{formatStorageClass(m?.storageClass ?? obj.storageClass ?? "STANDARD")}</Field>
-          <Field label="ETag" mono copy={(m?.etag ?? obj.etag) || undefined}>
-            {(m?.etag ?? obj.etag)?.replace(/"/g, "") || "—"}
+          <Field label="Path" mono copy={obj.key}>
+            {obj.key}
           </Field>
-          <Field label="Content type" mono>
-            {m ? m.contentType ?? "—" : loading ? <Loader2 size={12} className="spin" /> : "—"}
-          </Field>
-          {m?.versionId && (
-            <Field label="Version ID" mono copy={m.versionId}>
-              {m.versionId}
-            </Field>
-          )}
         </div>
         <div className="dsection">
-          <div className="dsection-title">User metadata</div>
-          {metaError ? (
-            <div className="inline-error">
-              <AlertCircle size={13} /> {metaError.message}
-            </div>
-          ) : !m ? (
-            <div className="muted small">{loading ? "Loading…" : "—"}</div>
-          ) : metaEntries.length === 0 ? (
-            <div className="muted small">No user metadata</div>
-          ) : (
-            <table className="meta-table">
-              <tbody>
-                {metaEntries.map(([k, v]) => (
-                  <tr key={k}>
-                    <td className="mono">{k}</td>
-                    <td className="mono">{v}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <button type="button" className="disclosure" onClick={() => setShowMore((v) => !v)} aria-expanded={showMore}>
+            <ChevronRight size={14} className={showMore ? "rot90" : ""} /> More details
+          </button>
+          {showMore && (
+            <>
+              <Field label="Storage class">{formatStorageClass(m?.storageClass ?? obj.storageClass ?? "STANDARD")}</Field>
+              <Field label="ETag" mono copy={(m?.etag ?? obj.etag) || undefined}>
+                {(m?.etag ?? obj.etag)?.replace(/"/g, "") || "—"}
+              </Field>
+              <Field label="Content type" mono>
+                {m ? m.contentType ?? "—" : loading ? <Loader2 size={12} className="spin" /> : "—"}
+              </Field>
+              {m?.versionId && (
+                <Field label="Version ID" mono copy={m.versionId}>
+                  {m.versionId}
+                </Field>
+              )}
+              <div className="dsection-title">User metadata</div>
+              {metaError ? (
+                <div className="inline-error">
+                  <AlertCircle size={13} /> {metaError.message}
+                </div>
+              ) : !m ? (
+                <div className="muted small">{loading ? "Loading…" : "—"}</div>
+              ) : metaEntries.length === 0 ? (
+                <div className="muted small">No user metadata</div>
+              ) : (
+                <table className="meta-table">
+                  <tbody>
+                    {metaEntries.map(([k, v]) => (
+                      <tr key={k}>
+                        <td className="mono">{k}</td>
+                        <td className="mono">{v}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </>
           )}
         </div>
       </>

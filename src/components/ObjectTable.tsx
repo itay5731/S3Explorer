@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { AlertCircle, ArrowDown, ArrowUp, FolderOpen, Loader2, RefreshCw, Upload, Archive } from "lucide-react";
+import { AlertCircle, ArrowDown, ArrowUp, FolderOpen, Loader2, RefreshCw, Upload } from "lucide-react";
 import {
   loadMore,
   navigate,
@@ -15,6 +15,7 @@ import {
 import { getViewRows, useViewRows, type Row } from "../store/view";
 import { formatBytes, formatExact, formatRelative, formatStorageClass, parentPrefix, displayName } from "../lib/format";
 import { FileIcon } from "./FileIcon";
+import { Welcome } from "./Welcome";
 import { pickAndUpload } from "../store/actions";
 import { useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
@@ -294,15 +295,7 @@ export function ObjectTable() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  if (!bucket) {
-    return (
-      <div className="table-empty">
-        <Archive size={36} strokeWidth={1.25} />
-        <div className="empty-title">Select a bucket</div>
-        <div className="muted">Choose a bucket from the sidebar to browse its contents.</div>
-      </div>
-    );
-  }
+  if (!bucket) return <Welcome />;
 
   return (
     <div className="object-table" role="grid" aria-rowcount={rows.length}>

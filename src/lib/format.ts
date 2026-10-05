@@ -153,6 +153,16 @@ export function uniqueFileName(name: string, taken: Set<string>): string {
   return candidate;
 }
 
+/** Number of tile colours defined in styles.css (--tone-0 … --tone-3). */
+const TONE_COUNT = 4;
+
+/** A stable tile colour (0 … TONE_COUNT - 1) for a name: the same name always gets the same colour. */
+export function nameTone(name: string): number {
+  let hash = 0;
+  for (const ch of name) hash = (hash * 31 + ch.codePointAt(0)!) >>> 0;
+  return hash % TONE_COUNT;
+}
+
 /** Last path segment of a local filesystem path (handles both \ and /). */
 export function basename(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);

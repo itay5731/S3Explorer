@@ -3,10 +3,10 @@
 
 import { create } from "zustand";
 import * as api from "../lib/api";
-import { applyTheme, readThemeMirror, writeThemeMirror } from "../lib/theme";
+import { applyAccent, applyTheme, readAccentMirror, readThemeMirror, writeAccentMirror, writeThemeMirror } from "../lib/theme";
 import type { AppError, AppSettings } from "../lib/types";
 
-export type SettingsTabId = "transfers" | "appearance" | "updates";
+export type SettingsTabId = "transfers" | "appearance" | "notifications" | "updates";
 
 interface SettingsState {
   /** Last values confirmed by the backend; null until the first load succeeds. */
@@ -31,10 +31,23 @@ export const useSettings = create<SettingsState>(() => ({
 
 const set = useSettings.setState;
 
-/** Apply the confirmed theme and refresh the pre-render mirror. Skipped while the dialog previews one. */
+/**
+ * Apply the text settings: the size scales the whole interface through the webview's zoom, and the
+ * weight goes to ordinary text through a CSS variable (see `body` in styles.css).
+ */
+export function applyTextStyle(size: number, weight: number) {
+  document.documentElement.style.setProperty("--text-weight", String(weight));
+  api.setZoom(size / 100).catch(() => {});
+}
+
+/** Apply the confirmed look and refresh the pre-render mirrors. Skipped while the dialog previews one. */
 function syncTheme(settings: AppSettings) {
   writeThemeMirror(settings.theme);
-  if (!useSettings.getState().open) applyTheme(settings.theme);
+  writeAccentMirror(settings.accent);
+  if (useSettings.getState().open) return;
+  applyTheme(settings.theme);
+  applyAccent(settings.accent);
+  applyTextStyle(settings.textSize, settings.textWeight);
 }
 
 export async function loadSettings(): Promise<void> {
@@ -55,6 +68,7 @@ export async function saveSettings(next: AppSettings): Promise<AppSettings> {
     const settings = await api.updateSettings(next);
     set({ settings, saving: false, error: null });
     writeThemeMirror(settings.theme);
+    writeAccentMirror(settings.accent);
     return settings;
   } catch (e) {
     set({ saving: false });
@@ -71,5 +85,8 @@ export const openSettings = (tab: SettingsTabId = "transfers") => {
 /** Close the dialog and drop any live theme preview in favor of the saved theme. */
 export const closeSettings = () => {
   set({ open: false });
-  applyTheme(useSettings.getState().settings?.theme ?? readThemeMirror());
+  const saved = useSettings.getState().settings;
+  applyTheme(saved?.theme ?? readThemeMirror());
+  applyAccent(saved?.accent ?? readAccentMirror());
+  if (saved) applyTextStyle(saved.textSize, saved.textWeight);
 };
