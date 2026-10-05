@@ -22,3 +22,14 @@ exist because each one was a real bug found in review.
   full IPC: arbitrary local file upload and arbitrary path download.
 - **Destructive commands get a regression test** against the local S3 server (`smoke-test` skill)
   that asserts what survived, not only what was deleted.
+- **Never trust silence from the server.** A delete counts only if the response lists the key as deleted; a
+  listing is complete only when there is no continuation token; a copy is done only when verified. "No error"
+  is not confirmation.
+- **A job must not be able to write into its own sources.** Validate it, re-check after expansion, guard at run
+  time. In a move, delete a source only after its own copy is verified, conditionally on the ETag that was copied.
+- **Every wait needs a bound that a healthy slow link cannot hit**: scale timeouts to the payload, count a retry
+  as progress only past a meaningful number of bytes, and cap total attempts.
+- **Capture what a confirmation shows, then send exactly that.** Never recompute a destructive request from live
+  state at confirm time, and never include items the user cannot currently see.
+- **Tests for destructive code assert what survived**, by diffing a full snapshot of the bucket, and every fix
+  gets a test that fails without it.
