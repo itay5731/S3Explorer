@@ -15,7 +15,10 @@ import type {
   ObjectMeta,
   ProfileInfo,
   Transfer,
+  TransferSettings,
 } from "./types";
+import { DEFAULT_TRANSFER_SETTINGS } from "./types";
+import { planParts, validateSettings } from "./settings";
 
 // ---- deterministic randomness ----------------------------------------------
 
@@ -230,6 +233,27 @@ function requireBucket(name: string): MockBucket {
   return b;
 }
 
+// ---- settings ------------------------------------------------------------------
+// The real backend persists settings.json in the app config dir; the mock keeps them in
+// localStorage (mock-only key) so a page reload behaves like an app restart.
+
+const MOCK_SETTINGS_KEY = "s3x.mock.settings";
+
+function loadMockSettings(): TransferSettings {
+  try {
+    const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
+    if (raw) {
+      const merged = { ...DEFAULT_TRANSFER_SETTINGS, ...(JSON.parse(raw) as Partial<TransferSettings>) };
+      if (!validateSettings(merged)) return merged;
+    }
+  } catch {
+    /* fall back to defaults */
+  }
+  return { ...DEFAULT_TRANSFER_SETTINGS };
+}
+
+let settings: TransferSettings = loadMockSettings();
+
 // ---- transfers ------------------------------------------------------------------
 
 interface Sim {
@@ -255,18 +279,28 @@ function ensureTicker() {
   if (!ticker) ticker = setInterval(tick, 100);
 }
 
-function tick() {
+/** Start queued transfers (oldest first) while fewer than `maxConcurrentTransfers` run. */
+function startQueued() {
   const now = Date.now();
   let running = 0;
   for (const s of sims.values()) if (s.t.status === "running") running++;
   for (const s of sims.values()) {
-    if (s.t.status === "queued" && running < 4) {
-      s.t.status = "running";
-      s.startedMs = now;
-      running++;
-      emit(s.t);
-    }
+    if (running >= settings.maxConcurrentTransfers) break;
+    if (s.t.status !== "queued") continue;
+    // Part size is snapshotted when the transfer starts running.
+    const plan = planParts(s.t.kind, settings.partSizeMib, s.t.totalBytes);
+    s.partSize = plan.partBytes;
+    s.t.partsTotal = plan.parts;
+    s.t.status = "running";
+    s.startedMs = now;
+    running++;
+    emit(s.t);
   }
+}
+
+function tick() {
+  const now = Date.now();
+  startQueued();
   let active = 0;
   for (const s of sims.values()) {
     if (s.t.status !== "running") {
@@ -281,7 +315,7 @@ function tick() {
     let next = Math.max(prev, Math.floor(s.t.totalBytes * shaped));
     if (s.t.kind === "upload") {
       // Uploads only report whole completed parts (small files jump 0 -> 100%).
-      next = s.t.totalBytes <= 8 * MB ? 0 : Math.max(prev, Math.floor(next / s.partSize) * s.partSize);
+      next = s.t.partsTotal <= 1 ? 0 : Math.max(prev, Math.floor(next / s.partSize) * s.partSize);
     }
     if (s.failAt !== null && frac >= s.failAt) {
       s.t.status = "failed";
@@ -319,7 +353,7 @@ function tick() {
 
 function startSim(kind: Transfer["kind"], bucket: string, key: string, localPath: string, size: number, failMessage?: string): string {
   const id = `mock-${++idSeq}-${hex(6)}`;
-  const partSize = size > 1 * GB ? 16 * MB : 8 * MB;
+  const { partBytes: partSize, parts } = planParts(kind, settings.partSizeMib, size);
   const t: Transfer = {
     id,
     kind,
@@ -328,7 +362,7 @@ function startSim(kind: Transfer["kind"], bucket: string, key: string, localPath
     localPath,
     totalBytes: size,
     transferredBytes: 0,
-    partsTotal: size > 8 * MB ? Math.ceil(size / partSize) : 1,
+    partsTotal: parts,
     partsDone: 0,
     bytesPerSec: 0,
     status: "queued",
@@ -559,6 +593,31 @@ export const mockBackend: Backend = {
     return () => {
       progressListeners.delete(cb);
     };
+  },
+
+  async getSettings() {
+    await delay(30);
+    return { ...settings };
+  },
+
+  async updateSettings(next) {
+    await delay(120);
+    const candidate: TransferSettings = {
+      partSizeMib: next.partSizeMib,
+      maxConcurrentParts: next.maxConcurrentParts,
+      maxConcurrentTransfers: next.maxConcurrentTransfers,
+    };
+    const problem = validateSettings(candidate);
+    if (problem) throw fail("InvalidInput", `Invalid ${problem.field}: ${problem.message}`);
+    settings = candidate;
+    try {
+      localStorage.setItem(MOCK_SETTINGS_KEY, JSON.stringify(settings));
+    } catch {
+      /* storage unavailable: keep in memory only */
+    }
+    // A raised limit starts queued transfers at once; a lowered one never interrupts running ones.
+    startQueued();
+    return { ...settings };
   },
 
   async pickFiles() {

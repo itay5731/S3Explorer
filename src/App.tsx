@@ -6,6 +6,8 @@ import { startTransferSync } from "./store/transfers";
 import { ConnectScreen } from "./components/ConnectScreen";
 import { Explorer } from "./components/Explorer";
 import { Toasts } from "./components/Toasts";
+import { SettingsDialog } from "./components/SettingsDialog";
+import { loadSettings } from "./store/settings";
 
 export default function App() {
   const connected = useApp((s) => s.connection !== null);
@@ -14,6 +16,8 @@ export default function App() {
   useEffect(() => {
     let stop: (() => void) | null = null;
     let disposed = false;
+    // Settings work while disconnected, so load them independently of the connection.
+    void loadSettings();
     startTransferSync()
       .then((s) => (disposed ? s() : (stop = s)))
       .catch(() => {});
@@ -51,6 +55,7 @@ export default function App() {
       ) : (
         <ConnectScreen />
       )}
+      <SettingsDialog />
       <Toasts />
     </>
   );
