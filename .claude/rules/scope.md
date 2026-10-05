@@ -9,6 +9,9 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
 5. Download objects (parallel ranged parts).
 6. Create folders and delete folders (recursive).
 
-Explicitly **not** in v1: deleting or renaming single objects, copying/moving, bucket
+7. Settings view with transfer tuning: part size, parallel parts per transfer, simultaneous
+   transfers (added on request after v1; see "Settings" in `docs/CONTRACT.md`).
+
+Explicitly **not** in scope: deleting or renaming single objects, copying/moving, bucket
 creation/deletion, versioning UI, presigned URLs, permissions/ACL editing, sync.
 If a task seems to need one of these, stop and ask the user instead of adding it.

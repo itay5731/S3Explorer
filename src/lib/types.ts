@@ -71,3 +71,31 @@ export interface Transfer {
 }
 
 export const TRANSFER_PROGRESS_EVENT = "transfer:progress";
+
+// ---- Settings (see "Settings" in docs/CONTRACT.md) ----
+
+export interface TransferSettings {
+  /** null = Auto (8 MiB; 16 MiB for objects over 1 GiB). Otherwise an integer number of MiB. */
+  partSizeMib: number | null;
+  /** Parts in flight per transfer. */
+  maxConcurrentParts: number;
+  /** Transfers running at once; the rest queue. */
+  maxConcurrentTransfers: number;
+}
+
+export const DEFAULT_TRANSFER_SETTINGS: TransferSettings = {
+  partSizeMib: null,
+  maxConcurrentParts: 8,
+  maxConcurrentTransfers: 4,
+};
+
+export const TRANSFER_SETTINGS_LIMITS = {
+  partSizeMib: { min: 1, max: 256 },
+  maxConcurrentParts: { min: 1, max: 32 },
+  maxConcurrentTransfers: { min: 1, max: 10 },
+} as const;
+
+/** Part size Auto mode uses for objects up to 1 GiB / above 1 GiB. */
+export const AUTO_PART_SIZE_MIB = { standard: 8, large: 16 } as const;
+/** S3 minimum for non-final multipart upload parts. */
+export const MIN_UPLOAD_PART_MIB = 5;
