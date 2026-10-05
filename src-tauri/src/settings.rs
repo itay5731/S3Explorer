@@ -142,7 +142,11 @@ mod tests {
                 "maxConcurrentParts": 8,
                 "maxConcurrentTransfers": 4,
                 "theme": "system",
-                "checkUpdatesOnStartup": false
+                "checkUpdatesOnStartup": false,
+                "notifyOnFinish": true,
+                "textSize": 100,
+                "textWeight": 400,
+                "accent": "yellow"
             })
         );
         assert!(d.validate().is_ok());
@@ -174,11 +178,15 @@ mod tests {
         }
     }
 
-    /// Adds the two v0.3.0 fields (at their defaults) when the case does not set them.
+    /// Adds the fields introduced after v0.2.0 (at their defaults) when the case does not set them.
     fn full(mut v: serde_json::Value) -> serde_json::Value {
         let o = v.as_object_mut().expect("object");
         o.entry("theme").or_insert(json!("system"));
         o.entry("checkUpdatesOnStartup").or_insert(json!(false));
+        o.entry("notifyOnFinish").or_insert(json!(true));
+        o.entry("textSize").or_insert(json!(100));
+        o.entry("textWeight").or_insert(json!(400));
+        o.entry("accent").or_insert(json!("yellow"));
         v
     }
 
@@ -218,7 +226,8 @@ mod tests {
 
     #[test]
     fn strict_parse_theme_and_update_flag() {
-        let base = json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4});
+        let base =
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow"});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -259,6 +268,76 @@ mod tests {
     }
 
     #[test]
+    fn strict_parse_notify_flag() {
+        let with = |flag: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match flag {
+                Some(flag) => o.insert("notifyOnFinish".into(), flag),
+                None => o.remove("notifyOnFinish"),
+            };
+            v
+        };
+        for flag in [true, false] {
+            let got = AppSettings::from_json_strict(&with(Some(json!(flag)))).expect("valid");
+            assert_eq!(got.notify_on_finish, flag);
+        }
+        for bad in [Some(json!("true")), Some(json!(1)), Some(serde_json::Value::Null), None] {
+            let v = with(bad);
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with("notifyOnFinish"), "{v} -> {}", e.message);
+        }
+    }
+
+    #[test]
+    fn text_size_and_weight_bounds() {
+        let with = |field: &str, value: serde_json::Value| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            v.as_object_mut().expect("object").insert(field.into(), value);
+            v
+        };
+        for (field, min, max) in [("textSize", 80, 150), ("textWeight", 300, 600)] {
+            for ok in [min, max] {
+                assert!(AppSettings::from_json_strict(&with(field, json!(ok))).is_ok(), "{field} {ok}");
+            }
+            for bad in [json!(min - 1), json!(max + 1), json!(100.5), json!("100"), serde_json::Value::Null] {
+                let v = with(field, bad);
+                let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+                assert_eq!(e.code, ErrorCode::InvalidInput);
+                assert!(e.message.starts_with(field), "{v} -> {}", e.message);
+                // The on-disk file is read leniently: the bad field alone falls back to its default.
+                assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{v}");
+            }
+        }
+        let got = AppSettings::from_json_strict(&with("textSize", json!(125))).expect("valid");
+        assert_eq!((got.text_size, got.text_weight), (125, 400));
+    }
+
+    #[test]
+    fn accent_is_one_of_four_colours() {
+        let with = |value: serde_json::Value| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            v.as_object_mut().expect("object").insert("accent".into(), value);
+            v
+        };
+        let colours =
+            [("yellow", AccentColor::Yellow), ("green", AccentColor::Green), ("blue", AccentColor::Blue), ("red", AccentColor::Red)];
+        for (name, colour) in colours {
+            assert_eq!(AppSettings::from_json_strict(&with(json!(name))).expect("valid").accent, colour);
+            assert_eq!(AppSettings::from_json_lenient(&with(json!(name))).accent, colour);
+        }
+        for bad in [json!("purple"), json!("Blue"), json!(""), json!(1), serde_json::Value::Null] {
+            let v = with(bad);
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with("accent"), "{v} -> {}", e.message);
+            // The on-disk file is read leniently: an unknown colour falls back to yellow.
+            assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{v}");
+        }
+    }
+
+    #[test]
     fn loads_literal_v020_file() {
         let dir = temp_dir("v020");
         let path = dir.join(SETTINGS_FILE);
@@ -273,6 +352,10 @@ mod tests {
                 max_concurrent_transfers: 3,
                 theme: ThemeMode::System,
                 check_updates_on_startup: false,
+                notify_on_finish: true,
+                text_size: 100,
+                text_weight: 400,
+                accent: AccentColor::Yellow,
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
@@ -295,6 +378,10 @@ mod tests {
                     max_concurrent_transfers: 1,
                     theme: ThemeMode::System,
                     check_updates_on_startup: true,
+                    notify_on_finish: true,
+                    text_size: 100,
+                    text_weight: 400,
+                    accent: AccentColor::Yellow,
                 },
             ),
             // Non-boolean flag: only the flag falls back.
@@ -312,6 +399,9 @@ mod tests {
                 r#"{"partSizeMib": 2.5, "maxConcurrentParts": -1, "checkUpdatesOnStartup": true}"#,
                 AppSettings { check_updates_on_startup: true, ..AppSettings::default() },
             ),
+            // Notifications switched off; a non-boolean value falls back to on.
+            (r#"{"notifyOnFinish": false}"#, AppSettings { notify_on_finish: false, ..AppSettings::default() }),
+            (r#"{"notifyOnFinish": "no"}"#, AppSettings::default()),
         ];
         for (text, want) in cases {
             std::fs::write(&path, text).expect("write");

@@ -7,7 +7,8 @@ use std::collections::HashSet;
 
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{
-    clean_etag, fmt_dt, last_segment, Bucket, FolderEntry, ListPage, ObjectEntry, ObjectMeta,
+    clean_etag, fmt_dt, last_segment, Bucket, FolderEntry, ListPage, ObjectEntry, ObjectMeta, RecentListing,
+    RECENT_MAX_RESULTS, RECENT_SCAN_LIMIT,
 };
 
 pub async fn list_buckets(client: &Client) -> AppResult<Vec<Bucket>> {
@@ -61,14 +62,7 @@ pub async fn list_objects(
             if key == prefix {
                 return None; // folder marker
             }
-            Some(ObjectEntry {
-                key: key.to_string(),
-                name: last_segment(key),
-                size: o.size().unwrap_or(0).max(0) as u64,
-                last_modified: fmt_dt(o.last_modified()),
-                etag: clean_etag(o.e_tag()),
-                storage_class: o.storage_class().map(|s| s.as_str().to_string()),
-            })
+            Some(object_entry(o, key))
         })
         .collect();
 
@@ -81,6 +75,17 @@ pub async fn list_objects(
         NextPage::Error(why) => return Err(listing_error(bucket, prefix, why)),
     };
     Ok(ListPage { folders, objects, is_truncated: next.is_some(), next_continuation_token: next })
+}
+
+fn object_entry(o: &aws_sdk_s3::types::Object, key: &str) -> ObjectEntry {
+    ObjectEntry {
+        key: key.to_string(),
+        name: last_segment(key),
+        size: o.size().unwrap_or(0).max(0) as u64,
+        last_modified: fmt_dt(o.last_modified()),
+        etag: clean_etag(o.e_tag()),
+        storage_class: o.storage_class().map(|s| s.as_str().to_string()),
+    }
 }
 
 /// What to do after one `ListObjectsV2` page.
@@ -182,9 +187,73 @@ pub async fn list_all_keys(client: &Client, bucket: &str, prefix: &str) -> AppRe
     }
 }
 
+/// The most recently modified objects under `prefix`, at any depth, newest first. S3 only lists in
+/// key order, so this scans the listing (no delimiter) and keeps the newest as it goes. It stops
+/// after [`RECENT_SCAN_LIMIT`] objects and says so through `truncated`.
+pub async fn list_recent(client: &Client, bucket: &str, prefix: &str) -> AppResult<RecentListing> {
+    // (modification time in seconds, object); objects without a time sort last.
+    let mut newest: Vec<(i64, ObjectEntry)> = Vec::new();
+    let mut scanned: u64 = 0;
+    let mut token: Option<String> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        let page =
+            client.list_objects_v2().bucket(bucket).prefix(prefix).set_continuation_token(token.clone()).send().await?;
+        for o in page.contents() {
+            // A key ending in '/' is a folder marker, not a file.
+            let Some(key) = o.key().filter(|k| !k.ends_with('/')) else { continue };
+            scanned += 1;
+            newest.push((o.last_modified().map_or(i64::MIN, |t| t.secs()), object_entry(o, key)));
+        }
+        keep_newest(&mut newest, RECENT_MAX_RESULTS);
+        let listing = |truncated| RecentListing {
+            objects: newest.iter().map(|(_, o)| o.clone()).collect(),
+            scanned,
+            truncated,
+        };
+        match next_list_page(page.is_truncated(), page.next_continuation_token(), |t| seen.contains(t)) {
+            NextPage::Done => return Ok(listing(false)),
+            // More pages exist, so stopping here is a truncated result, never a complete one.
+            NextPage::Continue(_) if scanned >= RECENT_SCAN_LIMIT => return Ok(listing(true)),
+            NextPage::Continue(t) => {
+                seen.insert(t.clone());
+                token = Some(t);
+            }
+            NextPage::Error(why) => return Err(listing_error(bucket, prefix, why)),
+        }
+    }
+}
+
+/// Sorts newest first (ties by key, so the order is stable between scans) and keeps the first `max`.
+fn keep_newest(items: &mut Vec<(i64, ObjectEntry)>, max: usize) {
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.key.cmp(&b.1.key)));
+    items.truncate(max);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{folder_prefix, next_list_page, NextPage};
+    use super::{folder_prefix, keep_newest, next_list_page, NextPage};
+    use crate::models::ObjectEntry;
+
+    #[test]
+    fn keep_newest_orders_by_time_then_key_and_caps() {
+        let entry = |key: &str| ObjectEntry {
+            key: key.to_string(),
+            name: key.to_string(),
+            size: 0,
+            last_modified: None,
+            etag: None,
+            storage_class: None,
+        };
+        let mut items =
+            vec![(10, entry("old")), (30, entry("b-new")), (i64::MIN, entry("undated")), (30, entry("a-new")), (20, entry("mid"))];
+        keep_newest(&mut items, 4);
+        let keys: Vec<&str> = items.iter().map(|(_, o)| o.key.as_str()).collect();
+        // Newest first, equal times by key, and the undated object (which sorts last) is the one dropped.
+        assert_eq!(keys, ["a-new", "b-new", "mid", "old"]);
+        keep_newest(&mut items, 10);
+        assert_eq!(items.len(), 4, "a larger cap never adds anything");
+    }
 
     #[test]
     fn paging_follows_tokens_not_is_truncated() {

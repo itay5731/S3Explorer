@@ -1,7 +1,7 @@
 use tauri::State;
 
 use crate::error::AppResult;
-use crate::models::{Bucket, ListPage, ObjectMeta};
+use crate::models::{Bucket, ListPage, ObjectMeta, RecentListing};
 use crate::ops;
 use crate::state::AppState;
 
@@ -21,6 +21,16 @@ pub async fn list_objects(
 ) -> AppResult<ListPage> {
     let client = state.client_for_bucket(&bucket).await?;
     ops::list_objects(&client, &bucket, prefix.as_deref().unwrap_or(""), continuation_token, page_size).await
+}
+
+#[tauri::command]
+pub async fn list_recent(
+    state: State<'_, AppState>,
+    bucket: String,
+    prefix: Option<String>,
+) -> AppResult<RecentListing> {
+    let client = state.client_for_bucket(&bucket).await?;
+    ops::list_recent(&client, &bucket, prefix.as_deref().unwrap_or("")).await
 }
 
 #[tauri::command]
