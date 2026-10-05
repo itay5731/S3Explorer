@@ -17,6 +17,8 @@ pub enum ErrorCode {
     Io,
     Cancelled,
     InvalidInput,
+    /// The OS keychain is unavailable or refused access (saved-connection secrets).
+    Keychain,
     Unknown,
 }
 

@@ -7,22 +7,28 @@
 pub mod commands;
 pub mod error;
 pub mod jobs;
+pub mod keychain;
 pub mod models;
 pub mod ops;
 pub mod profiles;
+pub mod saved;
 pub mod settings;
 pub mod state;
 pub mod transfers;
+pub mod updates;
 
 use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
 
 use crate::jobs::JobSink;
+use crate::keychain::OsKeychain;
 use crate::models::{Job, Transfer, JOB_PROGRESS_EVENT, TRANSFER_PROGRESS_EVENT};
+use crate::saved::ConnectionStore;
 use crate::settings::SettingsStore;
 use crate::state::AppState;
 use crate::transfers::ProgressSink;
+use crate::updates::UpdaterState;
 
 /// Forwards transfer snapshots to the webview as `transfer:progress` events.
 struct TauriSink(tauri::AppHandle);
@@ -47,15 +53,25 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let sink: Arc<dyn ProgressSink> = Arc::new(TauriSink(app.handle().clone()));
             let job_sink: Arc<dyn JobSink> = Arc::new(TauriJobSink(app.handle().clone()));
-            // Never fail startup over settings: no config dir means in-memory defaults.
-            let store = match app.path().app_config_dir() {
-                Ok(dir) => SettingsStore::load(dir.join(settings::SETTINGS_FILE)),
-                Err(_) => SettingsStore::in_memory(Default::default()),
+            // Never fail startup over settings or saved connections: no config dir means in-memory.
+            let config_dir = app.path().app_config_dir().ok();
+            let store = match &config_dir {
+                Some(dir) => SettingsStore::load(dir.join(settings::SETTINGS_FILE)),
+                None => SettingsStore::in_memory(Default::default()),
+            };
+            let keychain = Arc::new(OsKeychain::new());
+            let connections = match &config_dir {
+                Some(dir) => ConnectionStore::load(dir.join(saved::CONNECTIONS_FILE), keychain),
+                None => ConnectionStore::in_memory(keychain),
             };
             app.manage(AppState::new(sink, job_sink, store));
+            app.manage(connections);
+            app.manage(UpdaterState::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -79,6 +95,12 @@ pub fn run() {
             commands::jobs::list_jobs,
             commands::settings::get_settings,
             commands::settings::update_settings,
+            commands::saved::list_saved_connections,
+            commands::saved::save_connection,
+            commands::saved::delete_saved_connection,
+            commands::saved::connect_saved,
+            commands::updates::check_for_update,
+            commands::updates::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

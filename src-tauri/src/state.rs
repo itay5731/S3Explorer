@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 
 use crate::error::{is_access_denied, raw_status_and_region, AppError, AppResult};
 use crate::jobs::{JobManager, JobSink};
-use crate::models::{ConnectionConfig, ConnectionInfo, TransferSettings};
+use crate::models::{AppSettings, ConnectionConfig, ConnectionInfo};
 use crate::settings::SettingsStore;
 use crate::transfers::{ProgressSink, TransferManager};
 
@@ -195,12 +195,12 @@ impl AppState {
         Self { connection: RwLock::new(None), transfers, jobs: JobManager::new(job_sink), settings }
     }
 
-    pub fn get_settings(&self) -> TransferSettings {
+    pub fn get_settings(&self) -> AppSettings {
         self.settings.get()
     }
 
     /// Validates, persists and applies new settings (nothing changes on error).
-    pub async fn update_settings(&self, settings: TransferSettings) -> AppResult<TransferSettings> {
+    pub async fn update_settings(&self, settings: AppSettings) -> AppResult<AppSettings> {
         self.settings.update(settings, |s| self.transfers.apply_settings(s)).await
     }
 
