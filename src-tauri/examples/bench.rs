@@ -153,7 +153,8 @@ async fn main() -> Res<()> {
         n => Some(n.parse()?),
     };
     let parts: u32 = get("parts", "8").parse()?;
-    let settings = TransferSettings { part_size_mib, max_concurrent_parts: parts, max_concurrent_transfers: 1 };
+    let settings =
+        TransferSettings { part_size_mib, max_concurrent_parts: parts, max_concurrent_transfers: 1, ..Default::default() };
     settings.validate().map_err(|e| e.message)?;
     let conn = Connection::open(ConnectionConfig::Static {
         access_key_id: get("ak", "minioadmin"),

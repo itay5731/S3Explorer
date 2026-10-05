@@ -368,6 +368,11 @@ impl TransferManager {
         Ok(())
     }
 
+    /// True while any transfer is queued or running (the updater refuses to install then).
+    pub fn has_active(&self) -> bool {
+        self.entries.iter().any(|e| e.snapshot().status.is_active())
+    }
+
     /// All known transfers, oldest first.
     pub fn list(&self) -> Vec<Transfer> {
         let mut v: Vec<(u64, Transfer)> = self.entries.iter().map(|e| (e.seq, e.snapshot())).collect();

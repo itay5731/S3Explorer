@@ -1,38 +1,46 @@
-//! Persisted transfer settings (`settings.json` in the app config dir).
+//! Persisted app settings (`settings.json` in the app config dir).
 //!
 //! Free of Tauri types: the path is resolved by the caller (the Tauri `setup` hook), so the store
 //! is unit-testable against a temp dir.
 //!
-//! Loading never fails: a missing, unreadable or unparsable file (including a field of the wrong
-//! type) yields the defaults wholesale; a file that parses but has out-of-range values keeps its
-//! valid fields and falls back to the default for each out-of-range one.
+//! Loading never fails: a missing, unreadable or unparsable (not JSON) file yields the defaults
+//! wholesale; in a file that parses, each field that is missing, of the wrong type, unknown or out
+//! of range falls back to its own default and the valid fields are kept (see
+//! [`AppSettings::from_json_lenient`]). A v0.2.0 file (three fields) loads with the new fields at
+//! their defaults.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::models::TransferSettings;
+use crate::models::AppSettings;
 
 pub const SETTINGS_FILE: &str = "settings.json";
 
 /// Reads settings from `path`, falling back to defaults (see module docs). Never fails.
-pub fn load(path: &Path) -> TransferSettings {
+pub fn load(path: &Path) -> AppSettings {
     std::fs::read(path)
         .ok()
-        .and_then(|bytes| serde_json::from_slice::<TransferSettings>(&bytes).ok())
-        .map(TransferSettings::sanitized)
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|v| AppSettings::from_json_lenient(&v))
         .unwrap_or_default()
 }
 
-/// Writes `settings` to `path` atomically: a unique temp file in the same directory is written and
-/// flushed to disk, then renamed over the target. Creates the directory if missing.
-pub fn save(path: &Path, settings: &TransferSettings) -> AppResult<()> {
-    let io = |what: &str, e: std::io::Error| AppError::new(ErrorCode::Io, format!("Could not {what} settings: {e}"));
+/// Writes `settings` to `path` atomically (see [`write_json_atomic`]).
+pub fn save(path: &Path, settings: &AppSettings) -> AppResult<()> {
+    write_json_atomic(path, settings, "settings")
+}
+
+/// Writes `value` as pretty JSON to `path` atomically: a unique temp file in the same directory is
+/// written and flushed to disk, then renamed over the target. Creates the directory if missing.
+/// `what` names the data in error messages ("Could not save {what}: ...").
+pub fn write_json_atomic<T: serde::Serialize + ?Sized>(path: &Path, value: &T, what: &str) -> AppResult<()> {
+    let io = |action: &str, e: std::io::Error| AppError::new(ErrorCode::Io, format!("Could not {action} {what}: {e}"));
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| io("create the folder for", e))?;
-    let json = serde_json::to_vec_pretty(settings)
-        .map_err(|e| AppError::new(ErrorCode::Unknown, format!("Could not serialize settings: {e}")))?;
-    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| SETTINGS_FILE.into());
+    let json = serde_json::to_vec_pretty(value)
+        .map_err(|e| AppError::new(ErrorCode::Unknown, format!("Could not serialize {what}: {e}")))?;
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "data.json".into());
     let tmp = dir.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let write = || -> std::io::Result<()> {
         use std::io::Write;
@@ -52,7 +60,7 @@ pub fn save(path: &Path, settings: &TransferSettings) -> AppResult<()> {
 /// Current settings plus where they persist. `path: None` keeps them in memory only.
 pub struct SettingsStore {
     path: Option<PathBuf>,
-    current: Mutex<TransferSettings>,
+    current: Mutex<AppSettings>,
     /// Serializes updates so the file, the in-memory value and whatever `apply` feeds always agree.
     update_lock: tokio::sync::Mutex<()>,
 }
@@ -65,7 +73,7 @@ impl SettingsStore {
     }
 
     /// In-memory store (no persistence), e.g. when the config dir cannot be resolved.
-    pub fn in_memory(settings: TransferSettings) -> Self {
+    pub fn in_memory(settings: AppSettings) -> Self {
         Self { path: None, current: Mutex::new(settings), update_lock: tokio::sync::Mutex::new(()) }
     }
 
@@ -73,7 +81,7 @@ impl SettingsStore {
         self.path.as_deref()
     }
 
-    pub fn get(&self) -> TransferSettings {
+    pub fn get(&self) -> AppSettings {
         *self.current.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -82,9 +90,9 @@ impl SettingsStore {
     /// or disk error nothing changes.
     pub async fn update(
         &self,
-        settings: TransferSettings,
-        apply: impl FnOnce(&TransferSettings),
-    ) -> AppResult<TransferSettings> {
+        settings: AppSettings,
+        apply: impl FnOnce(&AppSettings),
+    ) -> AppResult<AppSettings> {
         settings.validate()?;
         let _guard = self.update_lock.lock().await;
         if let Some(path) = self.path.clone() {
@@ -108,8 +116,13 @@ mod tests {
         d
     }
 
-    fn s(part: Option<u32>, parts: u32, transfers: u32) -> TransferSettings {
-        TransferSettings { part_size_mib: part, max_concurrent_parts: parts, max_concurrent_transfers: transfers }
+    fn s(part: Option<u32>, parts: u32, transfers: u32) -> AppSettings {
+        AppSettings {
+            part_size_mib: part,
+            max_concurrent_parts: parts,
+            max_concurrent_transfers: transfers,
+            ..AppSettings::default()
+        }
     }
 
     fn err_msg(r: AppResult<()>) -> String {
@@ -120,11 +133,17 @@ mod tests {
 
     #[test]
     fn defaults_match_contract() {
-        let d = TransferSettings::default();
+        let d = AppSettings::default();
         assert_eq!(d, s(None, 8, 4));
         assert_eq!(
             serde_json::to_value(d).expect("ser"),
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4})
+            json!({
+                "partSizeMib": null,
+                "maxConcurrentParts": 8,
+                "maxConcurrentTransfers": 4,
+                "theme": "system",
+                "checkUpdatesOnStartup": false
+            })
         );
         assert!(d.validate().is_ok());
     }
@@ -155,16 +174,24 @@ mod tests {
         }
     }
 
+    /// Adds the two v0.3.0 fields (at their defaults) when the case does not set them.
+    fn full(mut v: serde_json::Value) -> serde_json::Value {
+        let o = v.as_object_mut().expect("object");
+        o.entry("theme").or_insert(json!("system"));
+        o.entry("checkUpdatesOnStartup").or_insert(json!(false));
+        v
+    }
+
     #[test]
     fn strict_parse_for_update_command() {
-        let ok = TransferSettings::from_json_strict(
-            &json!({"partSizeMib": 16, "maxConcurrentParts": 3, "maxConcurrentTransfers": 2, "extra": true}),
-        )
+        let ok = AppSettings::from_json_strict(&full(
+            json!({"partSizeMib": 16, "maxConcurrentParts": 3, "maxConcurrentTransfers": 2, "extra": true}),
+        ))
         .expect("valid");
         assert_eq!(ok, s(Some(16), 3, 2));
-        let auto = TransferSettings::from_json_strict(
-            &json!({"partSizeMib": null, "maxConcurrentParts": 1, "maxConcurrentTransfers": 10}),
-        )
+        let auto = AppSettings::from_json_strict(&full(
+            json!({"partSizeMib": null, "maxConcurrentParts": 1, "maxConcurrentTransfers": 10}),
+        ))
         .expect("valid");
         assert_eq!(auto, s(None, 1, 10));
 
@@ -181,11 +208,128 @@ mod tests {
             (json!({"partSizeMib": null, "maxConcurrentParts": 8}), "maxConcurrentTransfers"),
         ];
         for (v, field) in cases {
-            let e = TransferSettings::from_json_strict(&v).expect_err(&v.to_string());
+            let v = full(v);
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
             assert_eq!(e.code, ErrorCode::InvalidInput);
             assert!(e.message.starts_with(field), "{v} -> {}", e.message);
         }
-        assert!(TransferSettings::from_json_strict(&json!([1, 2])).is_err());
+        assert!(AppSettings::from_json_strict(&json!([1, 2])).is_err());
+    }
+
+    #[test]
+    fn strict_parse_theme_and_update_flag() {
+        let base = json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4});
+        let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
+            let mut v = base.clone();
+            let o = v.as_object_mut().expect("object");
+            if let Some(theme) = theme {
+                o.insert("theme".into(), theme);
+            }
+            if let Some(flag) = flag {
+                o.insert("checkUpdatesOnStartup".into(), flag);
+            }
+            v
+        };
+        for (theme, mode) in [("system", ThemeMode::System), ("light", ThemeMode::Light), ("dark", ThemeMode::Dark)] {
+            for flag in [true, false] {
+                let got = AppSettings::from_json_strict(&with(Some(json!(theme)), Some(json!(flag)))).expect("valid");
+                assert_eq!(got.theme, mode);
+                assert_eq!(got.check_updates_on_startup, flag);
+                assert_eq!((got.part_size_mib, got.max_concurrent_parts, got.max_concurrent_transfers), (None, 8, 4));
+            }
+        }
+        let f = Some(json!(false));
+        let bad = [
+            (with(Some(json!("purple")), f.clone()), "theme"),
+            (with(Some(json!("Dark")), f.clone()), "theme"),
+            (with(Some(json!("")), f.clone()), "theme"),
+            (with(Some(json!(1)), f.clone()), "theme"),
+            (with(Some(serde_json::Value::Null), f.clone()), "theme"),
+            (with(None, f.clone()), "theme"),
+            (with(Some(json!("dark")), Some(json!("true"))), "checkUpdatesOnStartup"),
+            (with(Some(json!("dark")), Some(json!(1))), "checkUpdatesOnStartup"),
+            (with(Some(json!("dark")), Some(serde_json::Value::Null)), "checkUpdatesOnStartup"),
+            (with(Some(json!("dark")), None), "checkUpdatesOnStartup"),
+        ];
+        for (v, field) in bad {
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with(field), "{v} -> {}", e.message);
+        }
+    }
+
+    #[test]
+    fn loads_literal_v020_file() {
+        let dir = temp_dir("v020");
+        let path = dir.join(SETTINGS_FILE);
+        // Exactly what v0.2.0's `save` wrote (serde_json pretty, three fields).
+        std::fs::write(&path, "{\n  \"partSizeMib\": 32,\n  \"maxConcurrentParts\": 12,\n  \"maxConcurrentTransfers\": 3\n}")
+            .expect("write");
+        assert_eq!(
+            load(&path),
+            AppSettings {
+                part_size_mib: Some(32),
+                max_concurrent_parts: 12,
+                max_concurrent_transfers: 3,
+                theme: ThemeMode::System,
+                check_updates_on_startup: false,
+            }
+        );
+        std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
+            .expect("write");
+        assert_eq!(load(&path), AppSettings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lenient_load_resets_only_bad_fields() {
+        let dir = temp_dir("lenient");
+        let path = dir.join(SETTINGS_FILE);
+        let cases = [
+            // Unknown theme: only the theme falls back.
+            (
+                r#"{"partSizeMib": 4, "maxConcurrentParts": 2, "maxConcurrentTransfers": 1, "theme": "purple", "checkUpdatesOnStartup": true}"#,
+                AppSettings {
+                    part_size_mib: Some(4),
+                    max_concurrent_parts: 2,
+                    max_concurrent_transfers: 1,
+                    theme: ThemeMode::System,
+                    check_updates_on_startup: true,
+                },
+            ),
+            // Non-boolean flag: only the flag falls back.
+            (
+                r#"{"partSizeMib": 4, "theme": "dark", "checkUpdatesOnStartup": "yes"}"#,
+                AppSettings { part_size_mib: Some(4), theme: ThemeMode::Dark, ..AppSettings::default() },
+            ),
+            // Wrong-typed transfer field next to valid new fields.
+            (
+                r#"{"maxConcurrentParts": "eight", "maxConcurrentTransfers": 2, "theme": "light"}"#,
+                AppSettings { max_concurrent_transfers: 2, theme: ThemeMode::Light, ..AppSettings::default() },
+            ),
+            // Fractional / negative numbers.
+            (
+                r#"{"partSizeMib": 2.5, "maxConcurrentParts": -1, "checkUpdatesOnStartup": true}"#,
+                AppSettings { check_updates_on_startup: true, ..AppSettings::default() },
+            ),
+        ];
+        for (text, want) in cases {
+            std::fs::write(&path, text).expect("write");
+            assert_eq!(load(&path), want, "{text}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_fields_round_trip_through_file() {
+        let dir = temp_dir("newfields");
+        let path = dir.join(SETTINGS_FILE);
+        let v = AppSettings { theme: ThemeMode::Dark, check_updates_on_startup: true, ..s(Some(8), 4, 2) };
+        save(&path, &v).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"theme\": \"dark\"") && text.contains("\"checkUpdatesOnStartup\": true"), "{text}");
+        assert_eq!(load(&path), v);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -214,11 +358,11 @@ mod tests {
     fn missing_corrupt_partial_and_out_of_range_files() {
         let dir = temp_dir("load");
         let path = dir.join(SETTINGS_FILE);
-        assert_eq!(load(&path), TransferSettings::default(), "missing");
+        assert_eq!(load(&path), AppSettings::default(), "missing");
 
         for corrupt in ["", "{", "not json", "[]", r#"{"maxConcurrentParts":"eight"}"#, r#"{"partSizeMib":-3}"#] {
             std::fs::write(&path, corrupt).expect("write");
-            assert_eq!(load(&path), TransferSettings::default(), "corrupt: {corrupt}");
+            assert_eq!(load(&path), AppSettings::default(), "corrupt: {corrupt}");
         }
 
         std::fs::write(&path, r#"{"maxConcurrentParts": 3, "futureField": {"x": 1}}"#).expect("write");
@@ -235,7 +379,7 @@ mod tests {
         let dir = temp_dir("store");
         let path = dir.join(SETTINGS_FILE);
         let store = SettingsStore::load(path.clone());
-        assert_eq!(store.get(), TransferSettings::default());
+        assert_eq!(store.get(), AppSettings::default());
 
         let mut applied = None;
         let v = s(Some(4), 3, 1);
@@ -265,7 +409,7 @@ mod tests {
         let e = store.update(s(Some(4), 3, 1), |_| called = true).await.expect_err("io");
         assert_eq!(e.code, ErrorCode::Io);
         assert!(!called);
-        assert_eq!(store.get(), TransferSettings::default());
+        assert_eq!(store.get(), AppSettings::default());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

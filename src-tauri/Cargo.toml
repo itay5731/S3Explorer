@@ -31,6 +31,16 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = { version = "0.7", features = ["io"] }
 chrono = { version = "0.4", features = ["serde"] }
 mime_guess = "2"
+# OS keychain for saved-connection secrets. Default feature `v1` picks the native store per
+# platform: Windows Credential Manager, macOS Keychain, Linux Secret Service (pure-Rust zbus,
+# no libdbus). There is no silent in-memory fallback: an unavailable store is an error.
+keyring = "4.2"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
+# Same reqwest/rustls (ring) stack the updater plugin already uses: no second TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+semver = "1"
 
 [profile.release]
 codegen-units = 1
@@ -44,3 +54,6 @@ opt-level = 1
 
 [dev-dependencies]
 sha2 = "0.10"
+# Mock runtime for the updater live check (examples/updater_check.rs). Dev-only: never in the app.
+tauri = { version = "2", features = ["test"] }
+base64 = "0.22"

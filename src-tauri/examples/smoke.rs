@@ -92,7 +92,12 @@ async fn delete_prefix(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) 
 }
 
 fn settings(part_size_mib: Option<u32>, parts: u32, transfers: u32) -> TransferSettings {
-    let s = TransferSettings { part_size_mib, max_concurrent_parts: parts, max_concurrent_transfers: transfers };
+    let s = TransferSettings {
+        part_size_mib,
+        max_concurrent_parts: parts,
+        max_concurrent_transfers: transfers,
+        ..Default::default()
+    };
     assert!(s.validate().is_ok());
     s
 }

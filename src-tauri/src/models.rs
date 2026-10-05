@@ -12,7 +12,9 @@ pub struct ProfileInfo {
     pub has_credentials: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Connection parameters from the UI. `Debug` is implemented by hand so the secret access key
+/// and session token can never end up in a log or panic message.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ConnectionConfig {
     #[serde(rename_all = "camelCase")]
@@ -35,6 +37,67 @@ pub enum ConnectionConfig {
         #[serde(default)]
         force_path_style: Option<bool>,
     },
+}
+
+impl std::fmt::Debug for ConnectionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Profile { profile, region, endpoint } => f
+                .debug_struct("Profile")
+                .field("profile", profile)
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .finish(),
+            Self::Static { access_key_id, secret_access_key: _, session_token, region, endpoint, force_path_style } => f
+                .debug_struct("Static")
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"<redacted>")
+                .field("session_token", &session_token.as_ref().map(|_| "<redacted>"))
+                .field("region", region)
+                .field("endpoint", endpoint)
+                .field("force_path_style", force_path_style)
+                .finish(),
+        }
+    }
+}
+
+// ---- Saved connections ---------------------------------------------------------------------
+
+/// Longest saved-connection name, in characters after trimming (mirror `SAVED_CONNECTION_NAME_MAX`).
+pub const SAVED_CONNECTION_NAME_MAX: usize = 64;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SavedConnectionKind {
+    Profile,
+    Static,
+}
+
+/// A saved connection as returned to the frontend. Never carries secret material.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedConnection {
+    pub id: String,
+    pub name: String,
+    pub kind: SavedConnectionKind,
+    pub profile: Option<String>,
+    pub access_key_id: Option<String>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub force_path_style: bool,
+    pub has_secret: bool,
+    pub last_used_at: Option<String>,
+}
+
+/// `save_connection` argument. `config` may carry a secret, so `Debug` goes through
+/// [`ConnectionConfig`]'s redacting implementation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveConnectionInput {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub name: String,
+    pub config: ConnectionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,31 +201,60 @@ pub struct Transfer {
 
 pub const TRANSFER_PROGRESS_EVENT: &str = "transfer:progress";
 
-/// Inclusive limits for [`TransferSettings`] (mirror `TRANSFER_SETTINGS_LIMITS` in `types.ts`).
+/// Inclusive limits for the transfer fields of [`AppSettings`] (mirror `TRANSFER_SETTINGS_LIMITS` in `types.ts`).
 pub const PART_SIZE_MIB_MIN: u32 = 1;
 pub const PART_SIZE_MIB_MAX: u32 = 256;
 pub const MAX_CONCURRENT_PARTS_MIN: u32 = 1;
 pub const MAX_CONCURRENT_PARTS_MAX: u32 = 32;
 pub const MAX_CONCURRENT_TRANSFERS_MIN: u32 = 1;
 pub const MAX_CONCURRENT_TRANSFERS_MAX: u32 = 10;
-/// Defaults (mirror `DEFAULT_TRANSFER_SETTINGS` in `types.ts`).
+/// Defaults (mirror `DEFAULT_APP_SETTINGS` in `types.ts`).
 pub const DEFAULT_MAX_CONCURRENT_PARTS: u32 = 8;
 pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: u32 = 4;
 
-/// User-tunable transfer settings. `part_size_mib: None` means Auto.
+/// UI color theme. `System` follows the OS (`prefers-color-scheme`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+/// User settings (flat object, `AppSettings` in `types.ts`). `part_size_mib: None` means Auto.
 ///
-/// Deserialization is lenient (missing fields take their default, unknown fields are ignored) so
-/// the on-disk file stays forward compatible. Range checks are done by [`TransferSettings::validate`].
+/// Parsing goes through [`AppSettings::from_json_lenient`] (the on-disk file) or
+/// [`AppSettings::from_json_strict`] (the `update_settings` argument); range checks are done by
+/// [`AppSettings::validate`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct TransferSettings {
+pub struct AppSettings {
     #[serde(default)]
     pub part_size_mib: Option<u32>,
     #[serde(default = "default_max_concurrent_parts")]
     pub max_concurrent_parts: u32,
     #[serde(default = "default_max_concurrent_transfers")]
     pub max_concurrent_transfers: u32,
+    #[serde(default)]
+    pub theme: ThemeMode,
+    #[serde(default)]
+    pub check_updates_on_startup: bool,
 }
+
+/// v0.2.0 name of the settings type; the transfer code only reads the transfer fields.
+pub type TransferSettings = AppSettings;
 
 fn default_max_concurrent_parts() -> u32 {
     DEFAULT_MAX_CONCURRENT_PARTS
@@ -172,12 +264,14 @@ fn default_max_concurrent_transfers() -> u32 {
     DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
-impl Default for TransferSettings {
+impl Default for AppSettings {
     fn default() -> Self {
         Self {
             part_size_mib: None,
             max_concurrent_parts: DEFAULT_MAX_CONCURRENT_PARTS,
             max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
+            theme: ThemeMode::System,
+            check_updates_on_startup: false,
         }
     }
 }
@@ -200,6 +294,14 @@ fn transfers_error() -> crate::error::AppError {
     ))
 }
 
+fn theme_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(r#"theme must be "system", "light" or "dark""#)
+}
+
+fn check_updates_error() -> crate::error::AppError {
+    crate::error::AppError::invalid("checkUpdatesOnStartup must be true or false")
+}
+
 fn part_size_ok(v: Option<u32>) -> bool {
     v.is_none_or(|v| (PART_SIZE_MIB_MIN..=PART_SIZE_MIB_MAX).contains(&v))
 }
@@ -212,8 +314,14 @@ fn transfers_ok(v: u32) -> bool {
     (MAX_CONCURRENT_TRANSFERS_MIN..=MAX_CONCURRENT_TRANSFERS_MAX).contains(&v)
 }
 
-impl TransferSettings {
+/// A JSON value as a `u32`, only if it is a non-negative integer that fits.
+fn json_u32(v: &serde_json::Value) -> Option<u32> {
+    v.as_u64().and_then(|n| u32::try_from(n).ok())
+}
+
+impl AppSettings {
     /// Rejects (`InvalidInput`, naming the field and its range) the first out-of-range field.
+    /// `theme` and `checkUpdatesOnStartup` are valid by construction.
     pub fn validate(&self) -> crate::error::AppResult<()> {
         if !part_size_ok(self.part_size_mib) {
             return Err(part_size_error());
@@ -227,7 +335,7 @@ impl TransferSettings {
         Ok(())
     }
 
-    /// Replaces each out-of-range field with its default (used for the on-disk file only).
+    /// Replaces each out-of-range field with its default.
     pub fn sanitized(self) -> Self {
         let d = Self::default();
         Self {
@@ -242,16 +350,50 @@ impl TransferSettings {
             } else {
                 d.max_concurrent_transfers
             },
+            ..self
         }
     }
 
-    /// Strict parse of the `update_settings` argument: every field must be present and an
-    /// in-range integer (`partSizeMib` may be `null`). Non-integers (`2.5`, `"8"`, `-1`) and
-    /// out-of-range values are `InvalidInput` naming the field. Unknown fields are ignored.
+    /// Lenient parse of the on-disk file: never fails. A value that is not an object yields the
+    /// defaults; each field that is missing, of the wrong type, unknown (`theme`) or out of range
+    /// takes its default on its own, so one bad field never resets the others. Unknown fields are
+    /// ignored (forward compatible; a v0.2.0 file with three fields loads with the new ones at
+    /// their defaults).
+    pub fn from_json_lenient(v: &serde_json::Value) -> Self {
+        let d = Self::default();
+        let Some(obj) = v.as_object() else { return d };
+        let part_size_mib = match obj.get("partSizeMib") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => json_u32(v).filter(|n| part_size_ok(Some(*n))),
+        };
+        Self {
+            part_size_mib,
+            max_concurrent_parts: obj
+                .get("maxConcurrentParts")
+                .and_then(json_u32)
+                .filter(|n| parts_ok(*n))
+                .unwrap_or(d.max_concurrent_parts),
+            max_concurrent_transfers: obj
+                .get("maxConcurrentTransfers")
+                .and_then(json_u32)
+                .filter(|n| transfers_ok(*n))
+                .unwrap_or(d.max_concurrent_transfers),
+            theme: obj.get("theme").and_then(serde_json::Value::as_str).and_then(ThemeMode::parse).unwrap_or(d.theme),
+            check_updates_on_startup: obj
+                .get("checkUpdatesOnStartup")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(d.check_updates_on_startup),
+        }
+    }
+
+    /// Strict parse of the `update_settings` argument: all five fields must be present. Transfer
+    /// fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the three
+    /// modes; `checkUpdatesOnStartup` a boolean. Anything else is `InvalidInput` naming the field.
+    /// Unknown fields are ignored.
     pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
         let obj = v.as_object().ok_or_else(|| crate::error::AppError::invalid("settings must be an object"))?;
         let int = |name: &str, err: fn() -> crate::error::AppError| -> crate::error::AppResult<u32> {
-            obj.get(name).and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok()).ok_or_else(err)
+            obj.get(name).and_then(json_u32).ok_or_else(err)
         };
         let part_size_mib = match obj.get("partSizeMib") {
             Some(serde_json::Value::Null) => None,
@@ -262,6 +404,15 @@ impl TransferSettings {
             part_size_mib,
             max_concurrent_parts: int("maxConcurrentParts", parts_error)?,
             max_concurrent_transfers: int("maxConcurrentTransfers", transfers_error)?,
+            theme: obj
+                .get("theme")
+                .and_then(serde_json::Value::as_str)
+                .and_then(ThemeMode::parse)
+                .ok_or_else(theme_error)?,
+            check_updates_on_startup: obj
+                .get("checkUpdatesOnStartup")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(check_updates_error)?,
         };
         s.validate()?;
         Ok(s)
