@@ -5,6 +5,27 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **A new look.** A marigold accent on neutral surfaces in both themes, new typefaces, and a new icon with a white bucket on a yellow tile.
+- **A start screen for your connections.** Saved connections are tiles: drag them into the order you want, right-click one for Connect, Edit and Delete, and scroll a page of six at a time when you have more. Behind them, pulses travel from small servers into your connections.
+- **Newest files.** The lower part of the sidebar lists the files most recently changed in the open bucket, wherever they are, with the folder each one is in. Narrow the list to the last hour, 24 hours or 7 days, to chosen file types, or by searching. Click a file to open its folder, or download it directly. It looks again by itself after an upload. The scan looks at up to 20,000 files and says so when it stops there.
+- **Desktop notifications** when your transfers are done, or a copy, move or delete finishes, while the app is in the background. Turn them off in Settings under Notifications.
+- **Switch between light and dark from the top bar**, without opening Settings.
+- **The window title shows the connection** you are in.
+- **Resizable sidebar.** Drag its right edge to set the width, and the divider between the buckets and Newest files to set how the height is shared. Double-click either to reset.
+- **Accent colour** in Settings under Appearance: yellow, green, blue or red.
+- **Size and text weight** sliders in Settings under Appearance. Size scales the whole window, text and icons together.
+
+### Improved
+
+- **New connections are saved by default**, under a suggested name if you do not type one. Untick the box to connect without saving.
+- **The details panel leads with size, date and path.** Storage class, ETag, content type and metadata are under "More details".
+- **Before a bucket is open**, the main area explains what to do next instead of showing a disabled toolbar.
+- **The logo in the top bar** takes you back to your connections.
+- **Copy the current path** with the button at the end of the path bar.
+- On a large window the side panels are wider.
+
 ## [0.3.0] - 2026-10-05
 
 Manage your files, not just look at them. This version adds delete, rename, copy and move, saved connections, a theme switch, in-app updates and a new icon.
