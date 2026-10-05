@@ -309,12 +309,20 @@ async fn a_delete(t: &T) -> Res<()> {
     let many: Vec<String> = (0..2150).map(|i| format!("d/many/k{i:05}")).collect();
     t.put_many(A, &many).await?;
     let others: Vec<String> =
-        ["d/many/", "d/foo/", "d/foo/x", "d/foobar/y", "d/foo", "d/foo2", "d/single.txt", "d/many-sibling", "keep/z"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        ["d/many/", "d/foobar/y", "d/foo2", "d/single.txt", "d/many-sibling", "keep/z"].iter().map(|s| s.to_string()).collect();
     t.put_many(A, &others).await?;
+    // The object `d/foo` and the folder `d/foo/` share a name. SeaweedFS stores folders as
+    // directories, so the order matters: written concurrently it sometimes rejects the marker with
+    // 409 ExistingObjectIsFile (file first), or silently replaces the file with the directory
+    // (file, then child). Marker, then child, then file is accepted and keeps both.
+    for k in ["d/foo/", "d/foo/x", "d/foo"] {
+        t.put(A, k, body_for(k)).await?;
+    }
     let before = t.snap(A).await?;
+    check(
+        before.contains_key("d/foo") && before.contains_key("d/foo/x"),
+        "setup: the object d/foo and the folder d/foo/ both exist",
+    )?;
     let j = t
         .run(req(
             JobKind::Delete,

@@ -5,6 +5,7 @@
 import { useSyncExternalStore } from "react";
 import type { ThemeMode } from "./types";
 
+// Keep in sync with public/theme-init.js, which applies the mirror before the first paint.
 const MIRROR_KEY = "s3x.theme";
 const MODES: readonly ThemeMode[] = ["system", "light", "dark"];
 
