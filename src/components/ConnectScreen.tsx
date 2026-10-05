@@ -4,6 +4,7 @@ import * as api from "../lib/api";
 import type { AppError, ConnectionConfig, ProfileInfo } from "../lib/types";
 import { setConnected, writePref } from "../store/app";
 import { Logo } from "./Logo";
+import { SettingsButton } from "./SettingsDialog";
 
 type Mode = "profile" | "static";
 
@@ -129,6 +130,9 @@ export function ConnectScreen() {
 
   return (
     <div className="connect-screen">
+      <div className="screen-corner">
+        <SettingsButton />
+      </div>
       <form className="connect-card" onSubmit={submit}>
         <div className="connect-head">
           <Logo size={40} />

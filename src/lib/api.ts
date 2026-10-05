@@ -20,6 +20,7 @@ import {
   type ObjectMeta,
   type ProfileInfo,
   type Transfer,
+  type TransferSettings,
 } from "./types";
 
 export type Unlisten = () => void;
@@ -47,6 +48,8 @@ export interface Backend {
   removeTransfer(id: string): Promise<void>;
   listTransfers(): Promise<Transfer[]>;
   onTransferProgress(cb: (t: Transfer) => void): Promise<Unlisten>;
+  getSettings(): Promise<TransferSettings>;
+  updateSettings(settings: TransferSettings): Promise<TransferSettings>;
   // Platform helpers (dialogs, paths, shell, drag & drop)
   pickFiles(): Promise<string[]>;
   pickSavePath(defaultName: string): Promise<string | null>;
@@ -97,6 +100,8 @@ const tauriBackend: Backend = {
   removeTransfer: (id) => invoke<void>("remove_transfer", { id }),
   listTransfers: () => invoke<Transfer[]>("list_transfers"),
   onTransferProgress: (cb) => listen<Transfer>(TRANSFER_PROGRESS_EVENT, (e) => cb(e.payload)),
+  getSettings: () => invoke<TransferSettings>("get_settings"),
+  updateSettings: (settings) => invoke<TransferSettings>("update_settings", { settings }),
 
   async pickFiles() {
     const res = await open({ multiple: true, directory: false, title: "Upload files" });
@@ -173,6 +178,8 @@ export const cancelTransfer = (id: string) => call("cancelTransfer", id);
 export const removeTransfer = (id: string) => call("removeTransfer", id);
 export const listTransfers = () => call("listTransfers");
 export const onTransferProgress = (cb: (t: Transfer) => void) => call("onTransferProgress", cb);
+export const getSettings = () => call("getSettings");
+export const updateSettings = (settings: TransferSettings) => call("updateSettings", settings);
 
 export const pickFiles = () => call("pickFiles");
 export const pickSavePath = (defaultName: string) => call("pickSavePath", defaultName);

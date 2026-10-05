@@ -11,6 +11,7 @@ import { TransfersPanel } from "./TransfersPanel";
 import { ContextMenu } from "./ContextMenu";
 import { Modals } from "./Modals";
 import { Logo } from "./Logo";
+import { SettingsButton } from "./SettingsDialog";
 
 function ConnectionChip() {
   const conn = useApp((s) => s.connection);
@@ -113,6 +114,7 @@ export function Explorer() {
         </div>
         <div className="spacer" />
         <ConnectionChip />
+        <SettingsButton />
       </header>
       <div className={`workspace ${detailsOpen ? "with-details" : ""}`}>
         <Sidebar />
