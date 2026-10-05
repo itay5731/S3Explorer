@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- S3 Explorer app icon: a storage bucket with a compass needle.
+       Regenerate every platform icon with:  npx tauri icon src-tauri/app-icon.svg -->
+  <defs>
+    <linearGradient id="bg" x1="0.1" y1="0" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#4C8DFF"/>
+      <stop offset="0.55" stop-color="#6D5CFF"/>
+      <stop offset="1" stop-color="#9B4DFF"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.28" cy="0.18" r="0.75">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.34"/>
+      <stop offset="0.6" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#DCE6FF"/>
+      <stop offset="0.38" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#C9D2FF"/>
+    </linearGradient>
+    <linearGradient id="inside" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B2A7A"/>
+      <stop offset="1" stop-color="#4338CA"/>
+    </linearGradient>
+    <linearGradient id="north" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#FF8A4C"/>
+      <stop offset="1" stop-color="#FF4D6D"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="22" stdDeviation="26" flood-color="#1E1B6B" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+
+  <!-- tile -->
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#bg)"/>
+  <rect x="64" y="64" width="896" height="896" rx="208" fill="url(#glow)"/>
+  <rect x="67" y="67" width="890" height="890" rx="205" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="6"/>
+
+  <!-- bucket -->
+  <g filter="url(#shadow)">
+    <!-- body: tapered, with a rounded base -->
+    <path d="M236 372 L306 742 C312 792 404 824 512 824 C620 824 712 792 718 742 L788 372 Z" fill="url(#body)"/>
+    <!-- storage bands -->
+    <path d="M262 508 C300 552 398 574 512 574 C626 574 724 552 762 508" fill="none" stroke="#6D5CFF" stroke-opacity="0.30" stroke-width="20" stroke-linecap="round"/>
+    <path d="M286 636 C322 674 410 694 512 694 C614 694 702 674 738 636" fill="none" stroke="#6D5CFF" stroke-opacity="0.22" stroke-width="20" stroke-linecap="round"/>
+    <!-- rim and opening -->
+    <ellipse cx="512" cy="372" rx="276" ry="92" fill="#FFFFFF"/>
+    <ellipse cx="512" cy="372" rx="232" ry="66" fill="url(#inside)"/>
+  </g>
+
+  <!-- compass needle rising out of the bucket -->
+  <g transform="rotate(38 512 372)">
+    <path d="M512 118 L584 372 L512 372 Z" fill="url(#north)"/>
+    <path d="M512 118 L440 372 L512 372 Z" fill="#FF9E6B"/>
+    <path d="M512 626 L584 372 L512 372 Z" fill="#3730A3"/>
+    <path d="M512 626 L440 372 L512 372 Z" fill="#5B50E6"/>
+    <circle cx="512" cy="372" r="34" fill="#FFFFFF"/>
+    <circle cx="512" cy="372" r="16" fill="#4338CA"/>
+  </g>
+</svg>
