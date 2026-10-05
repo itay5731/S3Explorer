@@ -7,8 +7,7 @@ import {
   TRANSFER_SETTINGS_LIMITS,
   type AppSettings,
   type TransferKind,
-  type TransferSettings,
-} from "./types";
+  type TransferSettings, DOWNLOAD_BUFFER_CAP_MIB } from "./types";
 
 export const MIB = 1024 * 1024;
 export const GIB = 1024 * MIB;
@@ -70,8 +69,12 @@ export function planParts(kind: TransferKind, partSizeMib: number | null, size: 
   return { partBytes, parts: size > partBytes ? Math.ceil(size / partBytes) : 1 };
 }
 
-/** Worst-case part size for memory estimates (Auto can use 16 MiB parts). */
-export const worstCasePartMib = (partSizeMib: number | null) => partSizeMib ?? AUTO_PART_SIZE_MIB.large;
+/**
+ * Worst-case memory held per in-flight download part, in MiB. Parts up to the buffer cap are held
+ * whole; larger parts are streamed to disk, so memory stops growing with part size.
+ */
+export const worstCasePartMib = (partSizeMib: number | null) =>
+  Math.min(partSizeMib ?? AUTO_PART_SIZE_MIB.large, DOWNLOAD_BUFFER_CAP_MIB);
 
 /** Full settings comparison (transfer fields plus the v0.3.0 fields). */
 export const sameAppSettings = (a: AppSettings, b: AppSettings) =>

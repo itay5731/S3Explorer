@@ -415,8 +415,8 @@ function ImpactSummary({ value, errors }: { value: TransferDraft; errors: Transf
             {level === "danger" ? <strong>Very high memory use. </strong> : <strong>High memory use. </strong>}
             Running downloads may hold up to {formatBytes(memory)} in RAM.
             {level === "danger"
-              ? " This can exhaust memory on most machines; lower the part size, parallel parts or simultaneous transfers."
-              : " Consider fewer parallel parts or a smaller part size."}
+              ? " This can exhaust memory on most machines; lower parallel parts or simultaneous transfers."
+              : " Consider fewer parallel parts or fewer simultaneous transfers."}
           </span>
         </div>
       )}
