@@ -16,6 +16,10 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
 9. (v0.3.0) Light / dark / system theme switch in Settings.
 10. (v0.3.0) Saved connections, with secrets in the OS keychain only.
 11. (v0.3.0) Check for updates from GitHub Releases and install them (signed packages only).
+12. Desktop notifications when a transfer or job finishes while the app is in the background
+    (added on request after v0.3.0; see "Desktop notifications" in `docs/CONTRACT.md`).
+13. Newest files of the open bucket in the sidebar, found by a bounded scan (added on request after
+    v0.3.0; see "Newest files" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, versioning UI (listing or restoring old
 versions), presigned URLs, permissions/ACL editing, sync, recursive folder upload/download.
