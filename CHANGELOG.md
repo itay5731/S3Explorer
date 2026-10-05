@@ -5,6 +5,8 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-05
+
 Manage your files, not just look at them. This version adds delete, rename, copy and move, saved connections, a theme switch, in-app updates and a new icon.
 
 ### New
@@ -45,10 +47,11 @@ S3 has no real move or rename, so the app copies and then deletes the original. 
 - Updating from 0.2.0 to this version is still a manual download. In-app updates work from this version onward.
 - On Windows, an in-app update installs the app. If you run the standalone exe, download the new one instead.
 - On Linux, saving a connection with a secret needs a keyring service such as GNOME Keyring or KWallet.
+- Disconnecting does not stop transfers or file operations that are already running; they finish in the background.
 - On versioned buckets, delete adds a delete marker and older versions remain.
 - Archived objects (Glacier, Deep Archive) cannot be copied or moved until restored.
 - Copies keep content type, metadata, storage class and tags. They do not keep ACLs.
-- Still not tested against real AWS by anyone but the author's own use, and macOS and Linux builds are still untried by a human.
+- Delete, rename, copy and move have been tested thoroughly against a local S3 server, but not yet against real AWS. macOS and Linux builds are still untried by a human.
 
 ## [0.2.0] - 2026-10-05
 

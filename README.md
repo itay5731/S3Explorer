@@ -1,8 +1,10 @@
+<p align="center"><img src="src-tauri/icons/128x128@2x.png" width="112" alt="S3 Explorer icon"></p>
+
 # S3 Explorer
 
-A fast desktop file browser for Amazon S3 and S3-compatible storage. One small native executable, no Electron, no subscription.
+A fast desktop file manager for Amazon S3 and S3-compatible storage. One small native executable, no Electron, no subscription.
 
-![Browsing a bucket while several downloads run](docs/screenshots/explorer.png)
+![A bucket open, with a copy and a download running in the Activity panel](docs/screenshots/explorer.png)
 
 ## Why this exists
 
@@ -17,16 +19,35 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
 - **Download in parallel parts.** Large objects are split into byte ranges and fetched over several connections at once.
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
-- **Create folders** and **delete folders** recursively.
-- **Transfers panel** with live speed, parts, ETA, cancel, and "show in folder".
+- **Delete, rename, copy and move** objects and folders, within a bucket or between buckets, from the right-click menu, the toolbar or the keyboard (`Delete`, `F2`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`). Every delete, move or overwrite shows you the exact keys and how much is affected before it happens.
+- **Create folders.**
+- **Activity panel** for transfers and file operations: live speed, parts, time remaining, cancel, a list of anything that failed, and "show in folder".
+- **Saved connections.** Keep an AWS profile or access keys under a name and connect with one click. Secret keys live in your operating system's keychain, never in a file.
 - **Settings** for part size, parallel parts per transfer and simultaneous transfers, with a live estimate of connections and memory before you save.
-- Dark and light themes that follow your system.
+- **Light, dark or system theme.**
+- **Updates from inside the app.** Check for a new version, read its patch notes, install it. Only updates signed by this project are installed.
 
-![The settings dialog](docs/screenshots/settings.png)
+![Moving files: the exact keys, the totals, and an explicit choice for files that already exist](docs/screenshots/move.png)
+
+| | |
+|---|---|
+| ![Saved connections on the connect screen](docs/screenshots/connections.png) | ![The explorer in the light theme](docs/screenshots/light.png) |
 
 ### What it does not do (yet)
 
-Deleting or renaming a single object, copy and move, creating or deleting buckets, versioning, presigned URLs, permissions, sync. It was scoped small on purpose.
+Creating or deleting buckets, browsing or restoring old versions, restoring archived objects, presigned URLs, permissions, sync, and uploading or downloading whole folders. It is scoped small on purpose.
+
+## How move, rename and delete stay safe
+
+S3 has no move or rename. The app copies, then deletes the original, and it is careful about the order:
+
+- An original is deleted only after its own copy is confirmed, and not if the original changed in the meantime.
+- A delete is counted only when the server confirms it.
+- A cancelled or failed move leaves every object in exactly one place.
+- A request that would write into its own source, such as moving a folder into itself, is refused.
+- Nothing is overwritten unless you choose Overwrite. The default is to skip what already exists.
+- Keys are never altered. Spaces, unicode and unusual characters are sent exactly as they are.
+- What the confirmation shows is exactly what is sent, and items hidden by the filter are never included.
 
 ## How downloads are split
 
@@ -38,13 +59,13 @@ With the default settings:
 | over 8 MiB, up to 1 GiB | 8 MiB | parallel ranged GETs |
 | over 1 GiB | 16 MiB | parallel ranged GETs |
 
-Up to 8 parts of a file are in flight at once, and up to 4 transfers run at the same time while the rest wait in a queue. Each part is written straight to its offset in a pre-sized temp file, which is renamed when the last part lands. Every request carries the object's ETag, so a file that changes mid-download fails instead of being stitched together from two versions. Failed parts are retried.
+Up to 8 parts of a file are in flight at once, and up to 4 transfers run at the same time while the rest wait in a queue. Each part is written straight to its offset in a pre-sized temp file, which is renamed when the last part lands. Every request carries the object's ETag, so a file that changes mid-download fails instead of being stitched together from two versions. A part that fails resumes from where it stopped.
 
-All three numbers are yours to change in Settings (the gear button): part size from 1 to 256 MiB, 1 to 32 parallel parts, and 1 to 10 simultaneous transfers. An object no larger than one part is fetched in a single request. Uploads always use parts of at least 5 MiB because S3 requires it. Bigger parts and more parallelism use more memory, and the dialog tells you roughly how much.
+All three numbers are yours to change in Settings (the gear button): part size from 1 to 256 MiB, 1 to 32 parallel parts, and 1 to 10 simultaneous transfers. An object no larger than one part is fetched in a single request. Uploads always use parts of at least 5 MiB because S3 requires it. Parts larger than 16 MiB are streamed straight to disk, so a bigger part size does not cost more memory; more parallel parts do, and the dialog tells you roughly how much.
 
 ## Get it
 
-**Download a build.** Every version is built for Windows, macOS (Apple Silicon and Intel) and Linux by GitHub Actions. Grab the file for your system from the [Releases page](../../releases): either the bare executable or an installer. Each release comes with patch notes.
+**Download a build.** Every version is built for Windows, macOS (Apple Silicon and Intel) and Linux by GitHub Actions. Grab the file for your system from the [Releases page](../../releases): either the bare executable or an installer. Each release comes with patch notes. From v0.3.0 on, the app can also update itself from Settings.
 
 **Or build it yourself.** You need [Node.js](https://nodejs.org) 22+, [Rust](https://rustup.rs) (the exact toolchain is pinned in `src-tauri/rust-toolchain.toml` and installs itself), and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your OS.
 
@@ -68,7 +89,7 @@ S3 Explorer only does what your credentials allow. It needs no permissions outsi
 | See object details, download | `HeadObject`, `GetObject` | `s3:GetObject` on the objects |
 | Upload, create a folder | `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` | `s3:PutObject` and `s3:AbortMultipartUpload` on the objects |
 | Delete objects and folders | `ListObjectsV2`, `DeleteObjects` | `s3:ListBucket` on the bucket, `s3:DeleteObject` on the objects |
-| Copy | `ListObjectsV2`, `HeadObject`, `CopyObject`, `UploadPartCopy` (objects over 5 GiB) | `s3:ListBucket` and `s3:GetObject` on the source; `s3:ListBucket`, `s3:GetObject` and `s3:PutObject` on the destination (the app checks what already exists there and confirms each copy before a move deletes anything) |
+| Copy | `ListObjectsV2`, `HeadObject`, `CopyObject`; for objects over 5 GiB `CreateMultipartUpload`, `UploadPartCopy`, `CompleteMultipartUpload`, `GetObjectTagging` | `s3:ListBucket` and `s3:GetObject` on the source; `s3:ListBucket`, `s3:GetObject` and `s3:PutObject` on the destination (the app checks what already exists there and confirms each copy before a move deletes anything) |
 | Move and rename | Copy, then delete the original | Everything for Copy, plus `s3:DeleteObject` on the source |
 
 Two things that surprise people:
@@ -152,22 +173,26 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.2.0`:
+Honest status, as of `v0.3.0`:
 
 | | |
 |---|---|
-| Tested end to end on Windows against a local S3 server | yes |
-| Unit tests, lint, and an integration smoke test with checksum verification | yes |
-| Independent AI code review, with every finding fixed | yes |
+| Tested end to end on Windows against a local S3 server, including every delete, rename, copy and move path | yes |
+| Destructive operations tested by comparing a full snapshot of the bucket before and after | yes |
+| Unit tests, lint, and integration tests with checksum verification | yes |
+| Independent AI code review of the delete, move and download code, with every finding fixed | yes |
 | Builds and packages in CI for Windows, macOS and Linux | yes |
-| Tested against real AWS S3 | **not yet** |
+| Browsing and large downloads used against real AWS S3 by the author | yes |
+| Delete, rename, copy and move tested against real AWS S3 | **not yet** |
+| In-app update installed for real on any platform | **not yet** |
 | macOS and Linux builds actually run by a human | **not yet** |
 | Reviewed line by line by a human | **no** |
 
 Some things were done carefully because this tool can delete data and write to your disk:
 
-- Your secret key is never written to disk by the app. Only the profile name, region, endpoint and access key id are remembered.
-- Folder deletion sends exactly the prefix shown in the confirmation dialog, byte for byte.
+- Your secret key is never written to a file by the app. A saved connection keeps it in the operating system's keychain; everything else remembers only the name, region, endpoint and access key id.
+- Deletes and moves send exactly the keys shown in the confirmation dialog, byte for byte. See [How move, rename and delete stay safe](#how-move-rename-and-delete-stay-safe).
+- Updates are installed only if they carry this project's signature.
 - File names coming from S3 are sanitized before they become local paths, so a hostile key can't write outside the folder you picked.
 - The webview runs under a restrictive content security policy and all S3 traffic goes through the Rust side.
 
@@ -175,11 +200,11 @@ Still: it is young, AI-written software. Try it on a bucket you can afford to lo
 
 ## How it's built
 
-- **[Tauri v2](https://tauri.app)** shell: the UI runs in the operating system's own webview, which is why the Windows executable is about 14 MB.
+- **[Tauri v2](https://tauri.app)** shell: the UI runs in the operating system's own webview, which is why the Windows executable is about 17 MB.
 - **Rust** backend using the official AWS SDK and tokio. Transfers run entirely on this side.
 - **React + TypeScript + Vite** frontend with a virtualized table.
 
-The two halves talk through a small set of commands and one progress event, all written down in [docs/CONTRACT.md](docs/CONTRACT.md).
+The two halves talk through a small set of commands and a few progress events, all written down in [docs/CONTRACT.md](docs/CONTRACT.md).
 
 ### Developing
 
@@ -192,14 +217,15 @@ npm run tauri dev    # the real desktop app with hot reload
 cd src-tauri
 cargo clippy --all-targets
 cargo test
-cargo run --example smoke   # end-to-end test against a local S3-compatible server
+cargo run --example smoke   # transfers, end to end against a local S3-compatible server
+cargo run --example jobs    # delete, copy and move, with before/after snapshots of the bucket
 ```
 
 `npm run build` type-checks and bundles the frontend.
 
 ### How the vibe coding actually worked
 
-One AI session acted as orchestrator. It picked the stack, wrote the contract between backend and frontend, then handed the two halves to separate agents that built them in parallel. A third agent drove the real executable end to end against a local S3 server, and a fourth did a read-only code review whose findings were fixed before the first tag.
+One AI session acted as orchestrator. It picked the stack, wrote the contract between backend and frontend, then handed the two halves to separate agents that built them in parallel. A third agent drove the real executable end to end against a local S3 server, and a fourth did a read-only code review whose findings were fixed before the first tag. Every version since has gone the same way: contract first, halves in parallel, review, end-to-end run, then release.
 
 The rules and playbooks the agents follow are checked in under [.claude/](.claude/), if you're curious what steering an AI-built project looks like in practice.
 
