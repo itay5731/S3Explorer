@@ -21,5 +21,6 @@ The main session is the orchestrator and manager. Implementation work goes to Op
 - **Keep a git history.** The repo is on `main`. Commit after each verified milestone (gate
   passing), one logical change per commit: contract/spec changes separately from implementation,
   backend and frontend halves separately when they land separately. Subagents do not commit; the
-  orchestrator commits after re-running the gate. Never push until the user provides the remote
-  and asks for it.
+  orchestrator commits after re-running the gate. Remote is `origin`
+  (https://github.com/yonatand/S3Explorer.git); push verified milestone commits to `main`. Never
+  force-push, never push unverified work, and scan for credentials or machine-specific paths first.
