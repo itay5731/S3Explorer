@@ -2,7 +2,7 @@
 
 A fast desktop file browser for Amazon S3 and S3-compatible storage. One small native executable, no Electron, no subscription.
 
-![Browsing a bucket with the details panel open](docs/screenshots/browser.png)
+![Browsing a bucket while several downloads run](docs/screenshots/explorer.png)
 
 ## Why this exists
 
@@ -19,9 +19,10 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
 - **Create folders** and **delete folders** recursively.
 - **Transfers panel** with live speed, parts, ETA, cancel, and "show in folder".
+- **Settings** for part size, parallel parts per transfer and simultaneous transfers, with a live estimate of connections and memory before you save.
 - Dark and light themes that follow your system.
 
-![Transfers in progress](docs/screenshots/transfers.png)
+![The settings dialog](docs/screenshots/settings.png)
 
 ### What it does not do (yet)
 
@@ -29,13 +30,17 @@ Deleting or renaming a single object, copy and move, creating or deleting bucket
 
 ## How downloads are split
 
+With the default settings:
+
 | Object size | Part size | How it downloads |
 |---|---|---|
 | 8 MiB or less | not split | one ordinary GET |
 | over 8 MiB, up to 1 GiB | 8 MiB | parallel ranged GETs |
 | over 1 GiB | 16 MiB | parallel ranged GETs |
 
-Up to 8 parts of a file are in flight at once, and up to 4 transfers run at the same time. Each part is written straight to its offset in a pre-sized temp file, which is renamed when the last part lands. Every request carries the object's ETag, so a file that changes mid-download fails instead of being stitched together from two versions. Failed parts are retried.
+Up to 8 parts of a file are in flight at once, and up to 4 transfers run at the same time while the rest wait in a queue. Each part is written straight to its offset in a pre-sized temp file, which is renamed when the last part lands. Every request carries the object's ETag, so a file that changes mid-download fails instead of being stitched together from two versions. Failed parts are retried.
+
+All three numbers are yours to change in Settings (the gear button): part size from 1 to 256 MiB, 1 to 32 parallel parts, and 1 to 10 simultaneous transfers. An object no larger than one part is fetched in a single request. Uploads always use parts of at least 5 MiB because S3 requires it. Bigger parts and more parallelism use more memory, and the dialog tells you roughly how much.
 
 ## Get it
 
@@ -54,13 +59,14 @@ The executable lands in `src-tauri/target/release/`, with installers under `src-
 
 ## Should you trust it?
 
-Honest status, as of `v0.1.0`:
+Honest status, as of `v0.2.0`:
 
 | | |
 |---|---|
 | Tested end to end on Windows against a local S3 server | yes |
 | Unit tests, lint, and an integration smoke test with checksum verification | yes |
 | Independent AI code review, with every finding fixed | yes |
+| Builds and packages in CI for Windows, macOS and Linux | yes |
 | Tested against real AWS S3 | **not yet** |
 | macOS and Linux builds actually run by a human | **not yet** |
 | Reviewed line by line by a human | **no** |
