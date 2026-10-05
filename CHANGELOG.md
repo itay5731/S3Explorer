@@ -5,6 +5,51 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+Manage your files, not just look at them. This version adds delete, rename, copy and move, saved connections, a theme switch, in-app updates and a new icon.
+
+### New
+
+- **Delete, rename, copy and move** for objects and folders, within a bucket or between buckets. Use the right-click menu, the toolbar, or the keyboard: `Delete`, `F2`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`.
+  - Before anything is deleted, moved or overwritten you get a confirmation that lists the exact keys and how many objects and bytes are affected.
+  - If something already exists at the destination you choose: skip it or overwrite it. Nothing is overwritten unless you pick that.
+  - These run in the background and show up in the bottom panel, now called **Activity**, next to your transfers, with progress, cancel, and a list of anything that failed.
+- **Saved connections.** Save an AWS profile or access keys under a name and connect with one click. Secret keys go into your operating system's keychain, never into a file.
+- **Light, dark or system theme**, in Settings under Appearance.
+- **Updates from inside the app.** Settings has an Updates tab: check for a new version, read its patch notes, and install it. You can also have the app check when it starts. Only updates signed by this project are installed.
+- **A new icon.**
+
+### Improved
+
+- **Downloads use far less memory with large parts.** Parts are written to disk as they arrive. With 100 MiB parts and 32 in parallel, memory dropped from about 3.2 GiB to about 100 MiB, and large-part downloads got faster on fast disks.
+- **A dropped connection no longer restarts a part.** The download resumes from where it stopped, and the progress bar no longer jumps backwards.
+- **Sizes and speeds are labelled correctly** as KiB, MiB, GiB and MiB/s. The numbers were always binary; the labels said MB and GB.
+- The memory estimate in Settings matches the new behavior.
+
+### Fixed
+
+- **Uploads on slow connections failed after 30 seconds.** A timeout wrongly counted the time spent sending the file.
+- Small downloads are now flushed to disk before they are marked complete.
+- A download that keeps getting cut off now gives up with an error instead of retrying forever, and an upload whose connection silently dies no longer waits forever.
+
+### How move and delete keep your data safe
+
+S3 has no real move or rename, so the app copies and then deletes the original. It does that carefully:
+
+- An original is deleted only after its own copy is confirmed, and not if the original changed in the meantime.
+- A cancelled or failed move leaves every object in exactly one place.
+- A request that would write into its own source, such as moving a folder into itself, is refused.
+- Keys are never altered: spaces, unicode and unusual characters are sent exactly as they are.
+
+### Good to know
+
+- Updating from 0.2.0 to this version is still a manual download. In-app updates work from this version onward.
+- On Windows, an in-app update installs the app. If you run the standalone exe, download the new one instead.
+- On Linux, saving a connection with a secret needs a keyring service such as GNOME Keyring or KWallet.
+- On versioned buckets, delete adds a delete marker and older versions remain.
+- Archived objects (Glacier, Deep Archive) cannot be copied or moved until restored.
+- Copies keep content type, metadata, storage class and tags. They do not keep ACLs.
+- Still not tested against real AWS by anyone but the author's own use, and macOS and Linux builds are still untried by a human.
+
 ## [0.2.0] - 2026-10-05
 
 Settings. You can now tune how transfers run instead of living with fixed numbers.
