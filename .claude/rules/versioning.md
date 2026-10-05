@@ -37,13 +37,20 @@ Release procedure (orchestrator only, after the `verify` gate passes):
 
 To publish a Release for a tag that predates its notes, run the workflow manually with the `tag` input.
 
-Never move or delete a pushed **version** tag (`vX.Y.Z`); fix forward with a new PATCH version.
+**Never move or delete a pushed tag.** No exceptions as a practice; fix forward with a new PATCH version.
 
-**Release candidates are temporary.** Use a tag like `vX.Y.Z-rc.1` only to test a change to the release pipeline
-itself (it is published as a pre-release, which `releases/latest` and the in-app updater ignore). As soon as it
-has answered its question, delete it: `git push origin :refs/tags/vX.Y.Z-rc.1` and `git tag -d vX.Y.Z-rc.1`.
-GitHub then keeps the release as a hidden draft that only the owner can delete (Releases page), so tell the
-user it is there. Do not leave a release candidate published next to the real release.
+**A tag marks a version, nothing else.** Do not create a tag to try something out, and in particular do not
+create a tag to test the release pipeline. A release-candidate tag is only legitimate when it is a real
+candidate: its own commit, expected to differ from the final release. A tag on the same commit as the release
+it precedes is not a candidate, it is a mistake.
+
+If a change to the release pipeline needs testing before a real release, do not reach for a tag. Either ask the
+user to run the workflow manually (a manual run without a tag builds every platform and publishes nothing), or
+release normally and fix forward with a patch version if the pipeline misbehaves.
+
+History of this rule: on 2026-10-05 `v0.3.0-rc.1` was pushed on the same commit as `v0.3.0` purely to check that
+signed update packages were produced. The user called it out. It was deleted as a one-off because no commits
+separated it from the release; creating it was the error, not keeping it.
 
 History: `v0.1.0` = first working app (list, browse, upload, download, folders). It was tagged before the
 release job existed, so its Release has to be published by a manual workflow run with `tag: v0.1.0`.
