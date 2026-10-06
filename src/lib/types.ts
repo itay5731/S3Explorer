@@ -263,7 +263,7 @@ export const TAG_LIMITS = {
   valueMaxChars: 256,
   reservedKeyPrefix: "aws:",
   /** Letters, numbers, spaces and + - = . _ : / @ */
-  allowedChars: /^[\p{L}\p{N} +\-=._:/@]*$/u,
+  allowedChars: /^[\p{L}\p{N}\p{Z}+\-=._:/@]*$/u,
 } as const;
 
 export interface TagOperation {
