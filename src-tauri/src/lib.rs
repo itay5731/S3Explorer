@@ -9,6 +9,7 @@ pub mod commands;
 pub mod error;
 pub mod jobs;
 pub mod keychain;
+pub mod lifecycle;
 pub mod models;
 pub mod ops;
 pub mod profiles;
@@ -120,6 +121,10 @@ pub fn run() {
             commands::tags::put_bucket_tags,
             commands::tags::get_object_tags,
             commands::tags::put_object_tags,
+            commands::lifecycle::get_lifecycle,
+            commands::lifecycle::validate_lifecycle,
+            commands::lifecycle::put_lifecycle,
+            commands::lifecycle::get_bucket_versioning,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

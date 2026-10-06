@@ -694,6 +694,166 @@ pub struct AddedBucket {
     pub added_at: String,
 }
 
+// ---- v0.4.0: lifecycle configuration (see "Lifecycle configuration" in docs/CONTRACT.md) ------
+//
+// Numbers (days, sizes, version counts) are `serde_json::Number` so that a value the UI sends that
+// is not a whole number (1.5, -3) reaches `validate_lifecycle` and becomes a placed issue instead
+// of failing deserialization. Values read from S3 are always whole numbers.
+// Fields the contract types as required numbers are `Option` here for the same reason (an empty
+// form field sent as `null` is an issue, not a bridge error); values read from S3 always set them.
+
+/// `RuleStatus` in `types.ts` (S3's own spelling).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "PascalCase")]
+pub enum RuleStatus {
+    Enabled,
+    Disabled,
+}
+
+/// `TransitionStorageClass` in `types.ts` (S3's own spelling).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StorageClass {
+    StandardIa,
+    OnezoneIa,
+    IntelligentTiering,
+    GlacierIr,
+    Glacier,
+    DeepArchive,
+}
+
+impl StorageClass {
+    /// S3's name for the class (`STANDARD_IA`, ...), as in the JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageClass::StandardIa => "STANDARD_IA",
+            StorageClass::OnezoneIa => "ONEZONE_IA",
+            StorageClass::IntelligentTiering => "INTELLIGENT_TIERING",
+            StorageClass::GlacierIr => "GLACIER_IR",
+            StorageClass::Glacier => "GLACIER",
+            StorageClass::DeepArchive => "DEEP_ARCHIVE",
+        }
+    }
+
+    /// Coldness (`STORAGE_CLASS_RANK` in `types.ts`): a later transition must be strictly colder.
+    pub fn rank(self) -> u8 {
+        match self {
+            StorageClass::StandardIa | StorageClass::OnezoneIa | StorageClass::IntelligentTiering => 1,
+            StorageClass::GlacierIr => 2,
+            StorageClass::Glacier => 3,
+            StorageClass::DeepArchive => 4,
+        }
+    }
+}
+
+/// `LifecycleFilter` in `types.ts`. All conditions empty: the rule applies to the whole bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleFilter {
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
+    #[serde(default)]
+    pub object_size_greater_than: Option<serde_json::Number>,
+    #[serde(default)]
+    pub object_size_less_than: Option<serde_json::Number>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleTransition {
+    #[serde(default)]
+    pub days: Option<serde_json::Number>,
+    #[serde(default)]
+    pub date: Option<String>,
+    pub storage_class: StorageClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleExpiration {
+    #[serde(default)]
+    pub days: Option<serde_json::Number>,
+    #[serde(default)]
+    pub date: Option<String>,
+    #[serde(default)]
+    pub expired_object_delete_marker: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoncurrentTransition {
+    #[serde(default)]
+    pub noncurrent_days: Option<serde_json::Number>,
+    #[serde(default)]
+    pub newer_noncurrent_versions: Option<serde_json::Number>,
+    pub storage_class: StorageClass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NoncurrentExpiration {
+    #[serde(default)]
+    pub noncurrent_days: Option<serde_json::Number>,
+    #[serde(default)]
+    pub newer_noncurrent_versions: Option<serde_json::Number>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AbortIncompleteMultipartUpload {
+    #[serde(default)]
+    pub days_after_initiation: Option<serde_json::Number>,
+}
+
+/// `LifecycleRule` in `types.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleRule {
+    #[serde(default)]
+    pub id: String,
+    pub status: RuleStatus,
+    #[serde(default)]
+    pub filter: LifecycleFilter,
+    #[serde(default)]
+    pub transitions: Vec<LifecycleTransition>,
+    #[serde(default)]
+    pub expiration: Option<LifecycleExpiration>,
+    #[serde(default)]
+    pub noncurrent_version_transitions: Vec<NoncurrentTransition>,
+    #[serde(default)]
+    pub noncurrent_version_expiration: Option<NoncurrentExpiration>,
+    #[serde(default)]
+    pub abort_incomplete_multipart_upload: Option<AbortIncompleteMultipartUpload>,
+}
+
+/// `LifecycleConfiguration` in `types.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleConfiguration {
+    #[serde(default)]
+    pub rules: Vec<LifecycleRule>,
+}
+
+/// `LifecycleIssue` in `types.ts`: `rule_index`/`field` place the message in the editor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleIssue {
+    pub rule_index: Option<usize>,
+    pub field: Option<String>,
+    pub message: String,
+}
+
+/// `BucketVersioning` in `types.ts`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub enum BucketVersioning {
+    Enabled,
+    Suspended,
+    Off,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct JobPreview {
