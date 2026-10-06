@@ -131,7 +131,13 @@ export function displayName(name: string): string {
   return name === "" ? "(empty name)" : name;
 }
 
-const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+/**
+ * Windows device names, any case, with or without an extension: CON PRN AUX NUL CONIN$ CONOUT$,
+ * COM1-9 and LPT1-9 plus the superscript digits ¹ ² ³. The stem (the text before the first ".")
+ * is compared with its trailing spaces removed, because Windows ignores them: "CON .txt" is CON.
+ * The backend's `sanitize_segment` (src-tauri/src/batches/localname.rs) applies the same rule.
+ */
+const WINDOWS_RESERVED = /^(con|prn|aux|nul|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³]) *(\..*)?$/i;
 
 /**
  * Turn an S3 name segment into a safe local file name. Keys are only split on "/", so a

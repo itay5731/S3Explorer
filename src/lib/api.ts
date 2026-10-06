@@ -340,17 +340,21 @@ export const onBatchProgress = (cb: (b: Batch) => void) => call("onBatchProgress
 /**
  * Is `path` (from an OS drop, which gives paths only) a local folder? There is no file-system
  * plugin, so this asks `preview_batch` to plan an upload of it: the backend answers `InvalidInput`
- * for anything that is not a directory. Resolves with the preview when it is a folder, `null` when
- * it is not, and rejects with any other error (a folder that could not be read, for example).
+ * with exactly "<path> is not a folder" for anything that is not a directory. Resolves with the
+ * preview when it is a folder, `null` only for that answer, and rejects with any other error,
+ * including other `InvalidInput`s (a bad prefix, for example), which must not be read as "a file".
  */
 export async function probeFolder(request: BatchPlanRequest): Promise<BatchPreview | null> {
   try {
     return await previewBatch(request);
   } catch (e) {
-    if ((e as AppError).code === "InvalidInput") return null;
+    if (isNotAFolder(e as AppError)) return null;
     throw e;
   }
 }
+/** The backend's "<path> is not a folder" answer to an upload preview of a plain file. */
+export const isNotAFolder = (e: AppError | null | undefined): boolean =>
+  e?.code === "InvalidInput" && typeof e.message === "string" && e.message.endsWith(" is not a folder");
 /** Every version of exactly `key`, newest first (at most 1,000; `truncated` beyond that). */
 export const listObjectVersions = (bucket: string, key: string) => call("listObjectVersions", bucket, key);
 /** Download one version (the normal parallel download, pinned to `versionId`). Returns the transfer id. */

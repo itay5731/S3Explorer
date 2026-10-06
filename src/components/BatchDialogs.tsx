@@ -16,7 +16,8 @@ import { defaultUploadPrefix } from "../store/folders";
 import { isDenied, permissionText, toastFailure } from "../store/toasts";
 import { ConflictChoice, ModalShell } from "./Modals";
 
-type PreviewState = { status: "loading" } | { status: "ok"; preview: BatchPreview } | { status: "error"; error: AppError };
+/** `at`: when the preview arrived (ms since epoch), so a destructive Start can insist on a fresh one. */
+type PreviewState = { status: "loading" } | { status: "ok"; preview: BatchPreview; at: number } | { status: "error"; error: AppError };
 const LOADING: PreviewState = { status: "loading" };
 
 /**
@@ -32,6 +33,8 @@ function useBatchPreviews(
   const [tagged, setTagged] = useState<{ requests: BatchPlanRequest[]; attempt: number; states: PreviewState[] } | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [seedUsed, setSeedUsed] = useState(false);
+  // The seed was made just before the dialog opened.
+  const [seedAt] = useState(() => Date.now());
   const seeded =
     !seedUsed && !!seed && !!requests && requests.length === 1 && attempt === 0 && sameRequest(requests[0], seed.request);
   // The seed answers the first request only: once the request changes, always ask again.
@@ -47,7 +50,7 @@ function useBatchPreviews(
       requests.forEach((r, i) => {
         api
           .previewBatch(r)
-          .then((preview) => ({ status: "ok", preview }) as const)
+          .then((preview) => ({ status: "ok", preview, at: Date.now() }) as const)
           .catch((error: AppError) => ({ status: "error", error }) as const)
           .then((st) => {
             if (cancelled) return;
@@ -66,7 +69,7 @@ function useBatchPreviews(
     };
   }, [requests, attempt, delayMs, seeded]);
   if (!requests) return [null, () => {}];
-  if (seeded) return [[{ status: "ok", preview: seed!.preview }], () => {
+  if (seeded) return [[{ status: "ok", preview: seed!.preview, at: seedAt }], () => {
     setSeedUsed(true);
     setAttempt((n) => n + 1);
   }];
@@ -79,6 +82,27 @@ function useBatchPreviews(
 
 const sameRequest = (a: BatchPlanRequest, b: BatchPlanRequest) =>
   a.kind === b.kind && a.bucket === b.bucket && a.prefix === b.prefix && a.localPath === b.localPath;
+
+/**
+ * Start re-plans on the backend, so its numbers can differ from the preview. With Overwrite (the
+ * destructive choice) the preview must be at most this old at Start; otherwise it is made again
+ * and the user chooses again, so what was shown is what is sent.
+ */
+const OVERWRITE_PREVIEW_MAX_AGE_MS = 60_000;
+
+const REPLAN_NOTE = "Counts are re-checked when the transfer starts; files added since may be included.";
+
+function StaleNotice() {
+  return (
+    <div className="callout warn" role="alert">
+      <AlertTriangle size={14} />
+      <span>
+        <strong>The preview was more than a minute old, so it was made again.</strong> Check the numbers and choose again before
+        overwriting.
+      </span>
+    </div>
+  );
+}
 
 const limitText = `A folder transfer can include at most ${BATCH_LIMITS.maxFiles.toLocaleString()} files and ${formatBytes(BATCH_LIMITS.maxBytes, 0)}.`;
 
@@ -133,7 +157,9 @@ function PlanError({ error, retry, upload }: { error: AppError; retry: () => voi
           <strong>
             {isDenied(error)
               ? `${permissionText(upload ? "upload files" : "download files")}.`
-              : upload
+              : error.code === "InvalidInput"
+                ? `This folder can’t be ${upload ? "uploaded" : "downloaded"} as shown.`
+                : upload
                 ? "Couldn’t read this folder."
                 : "Couldn’t list this folder."}
           </strong>{" "}
@@ -174,6 +200,7 @@ export function UploadFolderModal({
   const [policy, setPolicy] = useState<ConflictPolicy | null>(null);
   const [busy, setBusy] = useState(false);
   const [startError, setStartError] = useState<AppError | null>(null);
+  const [stale, setStale] = useState(false);
   const titleId = useId();
   const inputId = useId();
   const close = () => openModal(null);
@@ -205,15 +232,23 @@ export function UploadFolderModal({
   useEffect(() => {
     setPolicy(null); // a different destination has different conflicts: choose again
     setStartError(null);
+    setStale(false);
   }, [dest]);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canStart) return;
-    setBusy(true);
-    setStartError(null);
     // Exactly the previewed request; "skip" unless the user chose to overwrite.
     const request: BatchPlanRequest = { ...requests[0], onConflict: needChoice && policy ? policy : "skip" };
+    if (request.onConflict === "overwrite" && state.status === "ok" && Date.now() - state.at > OVERWRITE_PREVIEW_MAX_AGE_MS) {
+      setPolicy(null);
+      setStale(true);
+      retry();
+      return;
+    }
+    setStale(false);
+    setBusy(true);
+    setStartError(null);
     try {
       await startBatch(request);
       setTransfersOpen(true);
@@ -287,6 +322,8 @@ export function UploadFolderModal({
             </span>
           </div>
         )}
+        {state.status !== "error" && <p className="hint">{REPLAN_NOTE}</p>}
+        {stale && <StaleNotice />}
         {tooBig && (
           <div className="callout danger">
             <AlertTriangle size={14} />
@@ -354,6 +391,7 @@ export function DownloadFoldersModal({ bucket, folders, dir: initialDir }: { buc
   const [policy, setPolicy] = useState<ConflictPolicy | null>(null);
   const [busy, setBusy] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const titleId = useId();
   const close = () => openModal(null);
 
@@ -399,6 +437,7 @@ export function DownloadFoldersModal({ bucket, folders, dir: initialDir }: { buc
   useEffect(() => {
     setPolicy(null);
     setStartError(null);
+    setStale(false);
   }, [dir]);
 
   const changeDir = async () => {
@@ -412,9 +451,17 @@ export function DownloadFoldersModal({ bucket, folders, dir: initialDir }: { buc
 
   const start = async () => {
     if (!canStart) return;
+    const onConflict: ConflictPolicy = needChoice && policy ? policy : "skip";
+    const oldest = Math.min(...all.map((st) => (st.status === "ok" ? st.at : 0)));
+    if (onConflict === "overwrite" && Date.now() - oldest > OVERWRITE_PREVIEW_MAX_AGE_MS) {
+      setPolicy(null);
+      setStale(true);
+      retry();
+      return;
+    }
+    setStale(false);
     setBusy(true);
     setStartError(null);
-    const onConflict: ConflictPolicy = needChoice && policy ? policy : "skip";
     let started = 0;
     const failed: string[] = [];
     // One batch per folder, started in the order shown.
@@ -522,6 +569,8 @@ export function DownloadFoldersModal({ bucket, folders, dir: initialDir }: { buc
           </span>
         </div>
       ) : null}
+      {errors === 0 && <p className="hint">{REPLAN_NOTE}</p>}
+      {stale && <StaleNotice />}
       {truncated && (
         <div className="callout danger">
           <AlertTriangle size={14} />

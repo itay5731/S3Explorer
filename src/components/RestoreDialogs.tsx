@@ -106,6 +106,10 @@ function RestoreOptions({
             step={1}
             value={daysText}
             onChange={(e) => setDaysText(e.target.value)}
+            // A restore is billed: Enter in the field must not submit the form. Only the Restore button sends it.
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.preventDefault();
+            }}
             disabled={busy}
             aria-invalid={showDaysError && !!dErr}
           />
@@ -198,10 +202,11 @@ export function RestoreModal({ bucket, objectKey, storageClass }: { bucket: stri
           </div>
         )}
         <div className="modal-actions">
-          <button type="button" className="btn" onClick={close} disabled={busy}>
+          {/* Cancel has the initial focus: a restore is billed, so Enter must not send one. */}
+          <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus>
             Cancel
           </button>
-          <button type="submit" className="btn btn-primary" disabled={busy || (touched && !!dErr)} data-autofocus>
+          <button type="submit" className="btn btn-primary" disabled={busy || (touched && !!dErr)}>
             {busy && <Loader2 size={14} className="spin" />} Restore
           </button>
         </div>

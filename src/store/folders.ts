@@ -63,7 +63,9 @@ export async function handleOsDrop(paths: string[]) {
           const preview = await api.probeFolder({ kind: "upload", bucket, prefix: defaultUploadPrefix(prefix, path), localPath: path, onConflict: "skip" });
           return preview ? { path, kind: "folder" as const, preview } : { path, kind: "file" as const };
         } catch (e) {
-          // Not "not a folder": a folder that could not be planned. The dialog shows why.
+          // Anything but the exact "<path> is not a folder" answer, including other InvalidInputs
+          // (a bad prefix): treated as a folder that could not be planned, never uploaded as a
+          // file. The dialog previews again and shows why.
           return { path, kind: "folder" as const, error: e as AppError };
         }
       }),

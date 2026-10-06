@@ -42,6 +42,7 @@ import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
 import { validateLifecycleConfig } from "./lifecycleCheck";
 import { sameConfiguration } from "./lifecycle";
+import { sanitizeFileName } from "./format";
 
 // ---- deterministic randomness ----------------------------------------------
 
@@ -1131,14 +1132,7 @@ const lastSegment = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop()
 const joinLocal = (dir: string, rel: string) => dir.replace(/[\\/]+$/, "") + "\\" + rel.split("/").join("\\");
 
 /** The same per-segment rule as single downloads (format.ts sanitizeFileName); "" becomes "_". */
-function sanitizeSegment(name: string): string {
-  // eslint-disable-next-line no-control-regex
-  let n = name.replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, "_");
-  n = n.replace(/[. ]+$/, "");
-  if (n === "" || n === "." || n === "..") n = "_";
-  if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i.test(n)) n = "_" + n;
-  return n;
-}
+const sanitizeSegment = sanitizeFileName;
 
 interface PlanFile {
   rel: string;
@@ -1180,8 +1174,11 @@ function planBatch(req: BatchPlanRequest): BatchPlan {
   let truncated = false;
   let unreadable = 0;
   if (req.kind === "upload") {
+    // Test hook: a dropped folder named "badprefix" gets an InvalidInput that is not "not a folder".
+    if (/^badprefix$/i.test(lastSegment(req.localPath))) throw invalid('The destination prefix must be empty or end with "/"');
     const tree = fakeFolderTree(lastSegment(req.localPath));
-    if (tree === null) throw invalid(`“${req.localPath}” is not a folder.`);
+    // Exactly the backend's text: the UI tells dropped files from folders by it.
+    if (tree === null) throw invalid(`${req.localPath} is not a folder`);
     if (tree === "broken") throw fail("Io", `Could not read the folder “${req.localPath}\\private”: Access is denied. (os error 5)`);
     const sorted = [...tree].sort((x, y) => (x.rel < y.rel ? -1 : x.rel > y.rel ? 1 : 0));
     const unreadableFiles: PlanFile[] = [];
@@ -2318,7 +2315,7 @@ export const mockBackend: Backend = {
     // Same checks as planning; the plan itself is redone in the batch's planning phase.
     validateBatchRequest(request);
     requireBucket(request.bucket);
-    if (request.kind === "upload" && fakeFolderTree(lastSegment(request.localPath)) === null) throw invalid(`“${request.localPath}” is not a folder.`);
+    if (request.kind === "upload" && fakeFolderTree(lastSegment(request.localPath)) === null) throw invalid(`${request.localPath} is not a folder`);
     if (request.kind === "upload" && /^huge$/i.test(lastSegment(request.localPath))) {
       throw invalid(
         `This folder has more than ${BATCH_LIMITS.maxFiles.toLocaleString()} files (60,000 found). A folder transfer can include at most ${BATCH_LIMITS.maxFiles.toLocaleString()} files and 1 TiB.`,
