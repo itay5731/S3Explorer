@@ -576,6 +576,30 @@ input[type="checkbox"] {
     linear-gradient(var(--backdrop-line) 1px, transparent 1px) 0 0 / var(--cell) var(--cell),
     linear-gradient(90deg, var(--backdrop-line) 1px, transparent 1px) 0 0 / var(--cell) var(--cell);
 }
+/* The backdrop ignores the pointer, except its servers: five quick clicks on one start the hidden
+   game (DefendGame), whose canvas then covers the window. */
+.backdrop .server {
+  pointer-events: auto;
+}
+/* While the game is on, the start screen's own content and the ambient pulses step aside; the
+   grid and the servers stay. */
+.playing-game .connect-home,
+.playing-game .connect-card,
+.playing-game .screen-corner {
+  visibility: hidden;
+}
+.playing-game .backdrop-pulse,
+.playing-game .tile-aura {
+  display: none;
+}
+.defend-game {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+}
 .server-ring {
   fill: none;
   stroke: var(--pulse-color, var(--accent));
