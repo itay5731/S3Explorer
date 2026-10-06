@@ -4,6 +4,7 @@
 //! `aws_sdk_s3::Client` and a progress sink ([`transfers::ProgressSink`], [`jobs::JobSink`]);
 //! the Tauri glue is in `commands`.
 
+pub mod archive;
 pub mod batches;
 pub mod buckets;
 pub mod commands;
@@ -22,6 +23,7 @@ pub mod tags;
 pub(crate) mod testutil;
 pub mod transfers;
 pub mod updates;
+pub mod versions;
 mod windows_shell;
 
 use std::sync::Arc;
@@ -148,6 +150,11 @@ pub fn run() {
             commands::lifecycle::validate_lifecycle,
             commands::lifecycle::put_lifecycle,
             commands::lifecycle::get_bucket_versioning,
+            commands::versions::list_object_versions,
+            commands::versions::download_object_version,
+            commands::versions::restore_object_version,
+            commands::versions::delete_object_version,
+            commands::versions::restore_object,
         ])
         .run(context)
         .expect("error while running tauri application");

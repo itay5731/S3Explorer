@@ -82,6 +82,7 @@ async fn delete_prefix(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) 
         items: vec![JobItem { from: prefix.into(), to: None, is_prefix: true }],
         on_conflict: ConflictPolicy::Skip,
         tags: None,
+        restore: None,
     };
     let id = jobs.start(request, client.clone(), None)?;
     let job = jobs.wait(&id).await.ok_or("missing job")?;

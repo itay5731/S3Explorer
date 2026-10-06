@@ -39,6 +39,15 @@ const WHOLE_PART_MAX: u64 = 16 * MIB;
 /// next batch fills), so such a part holds at most 2 batches in memory.
 const WRITE_BATCH: usize = 1024 * 1024;
 
+/// The object a download reads: the current version, or `version_id` (sent on HeadObject and
+/// on every GET).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Source<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Option<&'a str>,
+}
+
 /// Temp file next to `dest`, unique per transfer (`{dest}.{first 8 of id}.part`), so two
 /// downloads can never share one partially written file.
 fn part_path(dest: &Path, id: &str) -> PathBuf {
@@ -349,8 +358,7 @@ pub(super) async fn run(
     entry: &Arc<TransferEntry>,
     cfg: PartSettings,
     id: &str,
-    bucket: &str,
-    key: &str,
+    src: Source<'_>,
     dest: &Path,
     no_replace: bool,
 ) -> AppResult<()> {
@@ -365,7 +373,18 @@ pub(super) async fn run(
     // Child token: cancelled by the user (parent) or when a sibling part fails.
     let token = entry.cancel.child_token();
 
-    let head = cancellable(&token, client.head_object().bucket(bucket).key(key).send()).await??;
+    let head = client.head_object().bucket(src.bucket).key(src.key).set_version_id(src.version_id.map(str::to_string));
+    let head = match cancellable(&token, head.send()).await? {
+        Ok(h) => h,
+        Err(e) => {
+            let e = AppError::from(e);
+            return Err(match src.version_id {
+                // HeadObject has no body, so S3 cannot say "NoSuchVersion" here.
+                Some(v) if e.code == ErrorCode::NoSuchKey => crate::versions::no_such_version(src.key, v),
+                _ => e,
+            });
+        }
+    };
     let size = head.content_length().unwrap_or(0).max(0) as u64;
     let etag = head.e_tag().map(str::to_string);
 
@@ -383,9 +402,9 @@ pub(super) async fn run(
     let result = if !p.multipart {
         let _in_flight = entry.part_started();
         let span = Span { start: 0, len: size, whole: true };
-        fetch_part(client, entry, bucket, key, etag.as_deref(), file.clone(), span, &token).await
+        fetch_part(client, entry, src, etag.as_deref(), file.clone(), span, &token).await
     } else {
-        ranged(client, entry, bucket, key, etag, size, p.part_size, p.parts, cfg.max_parts, file.clone(), &token).await
+        ranged(client, entry, src, etag, size, p.part_size, p.parts, cfg.max_parts, file.clone(), &token).await
     };
     // Both paths: every byte reaches the disk before the file gets its final name, so a crash
     // right after "completed" never leaves a short or zero-filled file under that name.
@@ -437,8 +456,7 @@ pub(super) async fn run(
 async fn ranged(
     client: &Client,
     entry: &Arc<TransferEntry>,
-    bucket: &str,
-    key: &str,
+    src: Source<'_>,
     etag: Option<String>,
     size: u64,
     part_size: u64,
@@ -485,11 +503,13 @@ async fn ranged(
         let start = i * part_size;
         let span = Span { start, len: part_size.min(size - start), whole: false };
         let (client, entry, file, token) = (client.clone(), entry.clone(), file.clone(), token.clone());
-        let (bucket, key, etag) = (bucket.to_string(), key.to_string(), etag.clone());
+        let (bucket, key, etag) = (src.bucket.to_string(), src.key.to_string(), etag.clone());
+        let version_id = src.version_id.map(str::to_string);
         set.spawn(async move {
             let _permit = permit;
             let _in_flight = entry.part_started();
-            fetch_part(&client, &entry, &bucket, &key, etag.as_deref(), file, span, &token).await?;
+            let src = Source { bucket: &bucket, key: &key, version_id: version_id.as_deref() };
+            fetch_part(&client, &entry, src, etag.as_deref(), file, span, &token).await?;
             entry.part_done();
             Ok(())
         });
@@ -517,8 +537,7 @@ async fn ranged(
 async fn fetch_part(
     client: &Client,
     entry: &TransferEntry,
-    bucket: &str,
-    key: &str,
+    src: Source<'_>,
     etag: Option<&str>,
     file: Arc<std::fs::File>,
     span: Span,
@@ -529,7 +548,7 @@ async fn fetch_part(
     let end = span.start + span.len;
     loop {
         let before = w.next;
-        let e = match attempt(client, entry, bucket, key, etag, span, &mut w, token).await {
+        let e = match attempt(client, entry, src, etag, span, &mut w, token).await {
             Ok(()) => return w.flush().await,
             Err(e) => e,
         };
@@ -575,8 +594,7 @@ impl Drop for RemoveOnDrop {
 async fn attempt(
     client: &Client,
     entry: &TransferEntry,
-    bucket: &str,
-    key: &str,
+    src: Source<'_>,
     etag: Option<&str>,
     span: Span,
     w: &mut PartWriter,
@@ -591,8 +609,9 @@ async fn attempt(
         token,
         client
             .get_object()
-            .bucket(bucket)
-            .key(key)
+            .bucket(src.bucket)
+            .key(src.key)
+            .set_version_id(src.version_id.map(str::to_string))
             .set_range(span.range_header(done))
             .set_if_match(etag.map(str::to_string))
             .send(),

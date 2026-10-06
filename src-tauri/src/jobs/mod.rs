@@ -1,5 +1,5 @@
-//! Background object operations ("jobs"): delete, copy, move (and rename = move), and bulk tag
-//! edits (`tag`).
+//! Background object operations ("jobs"): delete, copy, move (and rename = move), bulk tag
+//! edits (`tag`) and bulk restores of archived objects (`restore`).
 //!
 //! A job runs in two strict phases: **listing** (expand prefixes, look up single objects, detect
 //! destination conflicts and collisions) and only then **working** (the first change to any
@@ -8,7 +8,7 @@
 //! running and always on status or phase changes; the first event is `queued`, the last
 //! carries `finishedAt`, and the run slot is released only after that last event.
 
-mod engine;
+pub(crate) mod engine;
 pub mod plan;
 pub mod validate;
 
@@ -284,8 +284,8 @@ impl JobManager {
         {
             let mut j = entry.lock();
             j.total_items = (exp.work.len() + exp.missing.len()) as u64;
-            // A tag job moves no data: doneBytes / totalBytes stay 0.
-            j.total_bytes = if req.kind == JobKind::Tag { 0 } else { exp.bytes() };
+            // Tag and restore jobs move no data: doneBytes / totalBytes stay 0.
+            j.total_bytes = if matches!(req.kind, JobKind::Tag | JobKind::Restore) { 0 } else { exp.bytes() };
         }
         let same_bucket = req.dest_bucket.as_deref() == Some(req.src_bucket.as_str());
         plan::check_collisions(&exp.work, same_bucket).map_err(|m| AppError::new(crate::error::ErrorCode::InvalidInput, m))?;
@@ -312,6 +312,7 @@ impl JobManager {
             JobKind::Copy | JobKind::Move => engine::run_transfer(&ctx, entry, &exp.work, &existing).await,
             JobKind::Delete => engine::run_delete(&ctx, entry, &exp.work).await,
             JobKind::Tag => return engine::run_tag(&ctx, entry, &exp.work).await,
+            JobKind::Restore => return engine::run_restore(&ctx, entry, &exp.work).await,
         }
         Ok(())
     }
@@ -344,6 +345,19 @@ impl JobManager {
 
     pub fn get(&self, id: &str) -> Option<Job> {
         self.entries.get(id).map(|e| e.snapshot())
+    }
+
+    /// Cancels every queued or running job (cooperatively) and returns tokens that fire once
+    /// each of them reached its final state (after its final event).
+    pub fn cancel_active(&self) -> Vec<CancellationToken> {
+        self.entries
+            .iter()
+            .filter(|e| e.status().is_active())
+            .map(|e| {
+                e.cancel.cancel();
+                e.finished.clone()
+            })
+            .collect()
     }
 
     /// True while any job is queued or running (the updater refuses to install then).
@@ -459,6 +473,7 @@ mod tests {
             items,
             on_conflict: ConflictPolicy::Overwrite,
             tags: None,
+            restore: None,
         }
     }
 
@@ -477,6 +492,116 @@ mod tests {
 
     fn tag_request(items: Vec<JobItem>, op: crate::models::TagOperation) -> JobRequest {
         JobRequest { dest_bucket: None, tags: Some(op), ..request(JobKind::Tag, items) }
+    }
+
+    fn restore_request(items: Vec<JobItem>, tier: crate::models::RestoreTier) -> JobRequest {
+        JobRequest {
+            dest_bucket: None,
+            restore: Some(crate::models::RestoreRequest { tier, days: 5 }),
+            ..request(JobKind::Restore, items)
+        }
+    }
+
+    /// Listing of `p/` with storage classes; HEAD answers per key; RestoreObject is accepted.
+    async fn archive_server() -> FakeS3 {
+        FakeS3::start(|r| {
+            let key = r.path.trim_start_matches("/b/").to_string();
+            let head = |sc: &str, restore: Option<&str>| {
+                let mut hs = vec![h("Content-Length", "5"), h("ETag", "\"e\"")];
+                if !sc.is_empty() {
+                    hs.push(h("x-amz-storage-class", sc));
+                }
+                if let Some(x) = restore {
+                    hs.push(h("x-amz-restore", x));
+                }
+                Reply::with_headers(200, hs)
+            };
+            match r.method.as_str() {
+                "GET" if r.has_query("list-type") => {
+                    let mut x = String::from(r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>b</Name><IsTruncated>false</IsTruncated>"#);
+                    for (k, sc) in [("p/std", "STANDARD"), ("p/g", "GLACIER"), ("p/busy", "GLACIER"), ("p/done", "GLACIER"), ("p/deep", "DEEP_ARCHIVE"), ("p/it", "INTELLIGENT_TIERING")] {
+                        x.push_str(&format!("<Contents><Key>{k}</Key><Size>5</Size><ETag>\"e\"</ETag><StorageClass>{sc}</StorageClass></Contents>"));
+                    }
+                    x.push_str("</ListBucketResult>");
+                    Reply::xml(200, &x)
+                }
+                "HEAD" => match key.as_str() {
+                    "p/std" => head("", None),
+                    "p/busy" => head("GLACIER", Some(r#"ongoing-request="true""#)),
+                    "p/done" => head("GLACIER", Some(r#"ongoing-request="false", expiry-date="Fri, 01 Jan 2100 00:00:00 GMT""#)),
+                    "p/deep" => head("DEEP_ARCHIVE", None),
+                    "p/it" => head("INTELLIGENT_TIERING", None),
+                    "p/g" => head("GLACIER", None),
+                    _ => Reply::status(404),
+                },
+                "POST" if r.has_query("restore") => Reply::status(202),
+                _ => Reply::status(500),
+            }
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_job_restores_only_what_needs_it() {
+        use crate::models::RestoreTier;
+        let s3 = archive_server().await;
+        let items = vec![JobItem { from: "p/".into(), to: None, is_prefix: true }, obj("gone", None)];
+        let (j, _) = run(restore_request(items, RestoreTier::Standard), &s3.client()).await;
+        assert_eq!(j.status, JobStatus::Failed, "the missing object fails: {j:?}");
+        assert_eq!((j.total_items, j.done_items, j.skipped_items, j.failed_items), (7, 2, 4, 1), "{j:?}");
+        assert_eq!((j.total_bytes, j.done_bytes), (0, 0), "a restore job reports no bytes");
+        assert_eq!(j.label, "Restore 2 items");
+        assert_eq!((j.errors[0].key.as_str(), j.errors[0].message.as_str()), ("gone", plan::OBJECT_MISSING));
+        let posts: Vec<String> = s3.requests().into_iter().filter(|r| r.method == "POST").map(|r| r.path).collect();
+        let mut posts = posts;
+        posts.sort();
+        assert_eq!(posts, ["/b/p/deep", "/b/p/g"], "only archived objects without a restore");
+        assert_eq!(s3.count(|r| r.method == "HEAD" && r.path == "/b/p/std"), 0, "STANDARD in the listing needs no HeadObject");
+        let post = s3.requests().into_iter().find(|r| r.method == "POST").expect("post");
+        let body = String::from_utf8_lossy(&post.body).to_string();
+        assert!(body.contains("<Days>5</Days>") && body.contains("<Tier>Standard</Tier>"), "{body}");
+
+        // Expedited: Deep Archive is a per-object failure, Glacier is restored.
+        let s3 = archive_server().await;
+        let items = vec![obj("p/deep", None), obj("p/g", None)];
+        let (j, _) = run(restore_request(items, RestoreTier::Expedited), &s3.client()).await;
+        assert_eq!((j.done_items, j.skipped_items, j.failed_items), (1, 0, 1), "{j:?}");
+        assert_eq!((j.errors[0].key.as_str(), j.errors[0].message.as_str()), ("p/deep", crate::archive::EXPEDITED_DEEP_ARCHIVE));
+        assert_eq!(s3.count(|r| r.method == "POST"), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn copying_or_moving_an_archived_object_says_restore_it_first() {
+        let s3 = FakeS3::start(|r| match r.method.as_str() {
+            "HEAD" if r.path == "/b/cold" => {
+                Reply::with_headers(200, vec![h("Content-Length", "5"), h("ETag", "\"e\""), h("x-amz-storage-class", "GLACIER")])
+            }
+            "HEAD" => Reply::status(404),
+            "PUT" => Reply::xml(403, "<Error><Code>InvalidObjectState</Code><Message>The operation is not valid for the object's storage class</Message></Error>"),
+            _ => Reply::status(500),
+        })
+        .await;
+        for kind in [JobKind::Copy, JobKind::Move] {
+            let (j, _) = run(request(kind, vec![obj("cold", Some("warm"))]), &s3.client()).await;
+            assert_eq!(j.failed_items, 1, "{j:?}");
+            assert_eq!(j.errors[0].message, crate::error::ARCHIVED);
+        }
+        assert_eq!(s3.count(|r| r.method == "POST" || r.method == "DELETE"), 0, "a move never deletes an uncopied source");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_job_stops_when_the_server_has_no_restore() {
+        let s3 = FakeS3::start(|r| match r.method.as_str() {
+            "HEAD" => Reply::with_headers(200, vec![h("Content-Length", "5"), h("x-amz-storage-class", "GLACIER")]),
+            _ => Reply::xml(405, "<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message></Error>"),
+        })
+        .await;
+        let items: Vec<JobItem> = (0..40).map(|i| obj(&format!("k{i}"), None)).collect();
+        let (j, _) = run(restore_request(items, crate::models::RestoreTier::Bulk), &s3.client()).await;
+        assert_eq!(j.status, JobStatus::Failed);
+        let err = j.error.clone().unwrap_or_default();
+        assert!(err.starts_with("Stopped: This server does not support restoring archived objects"), "{err}");
+        assert!(s3.count(|r| r.method == "POST") < 40, "stops sending the refused request");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -894,6 +1019,7 @@ mod tests {
             items: vec![crate::models::JobItem { from: "x/".into(), to: Some("x/y/".into()), is_prefix: true }],
             on_conflict: ConflictPolicy::Skip,
             tags: None,
+            restore: None,
         };
         let e = m.start(bad.clone(), client.clone(), Some(client.clone())).expect_err("into itself");
         assert_eq!(e.code, crate::error::ErrorCode::InvalidInput);

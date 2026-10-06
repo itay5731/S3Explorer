@@ -37,6 +37,10 @@ pub struct AppError {
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Every refusal to read an archived (not restored) object, whatever the operation (download,
+/// copy, move, rename, restore of an archived version). The UI uses the same words.
+pub const ARCHIVED: &str = "InvalidObjectState: The object is archived; restore it first.";
+
 /// Start of the message of [`AppError::saved_but_unread`]; the UI must reload, never say "nothing changed".
 pub const SAVED_BUT_UNREAD: &str = "Saved, but reading back failed";
 
@@ -129,7 +133,8 @@ fn code_from_service(code: Option<&str>, status: u16) -> ErrorCode {
         | Some("InvalidBucketName")
         | Some("KeyTooLongError")
         | Some("InvalidRange")
-        | Some("InvalidTag") => {
+        | Some("InvalidTag")
+        | Some("InvalidObjectState") => {
             ErrorCode::InvalidInput
         }
         Some(c) if is_not_supported_code(c) => ErrorCode::NotSupported,
@@ -155,6 +160,7 @@ where
                 let inner = se.err();
                 let code = code_from_service(inner.code(), status);
                 let message = match (inner.code(), inner.message()) {
+                    (Some("InvalidObjectState"), _) => ARCHIVED.to_string(),
                     (Some(c), Some(m)) => format!("{c}: {m}"),
                     (Some("NotFound"), None) => "Not found: the object does not exist".to_string(),
                     (Some(c), None) => match status {
@@ -229,6 +235,7 @@ mod tests {
         assert_eq!(code_from_service(Some("NoSuchBucket"), 404), ErrorCode::NoSuchBucket);
         assert_eq!(code_from_service(Some("AccessDenied"), 403), ErrorCode::AccessDenied);
         assert_eq!(code_from_service(Some("InvalidTag"), 400), ErrorCode::InvalidInput);
+        assert_eq!(code_from_service(Some("InvalidObjectState"), 403), ErrorCode::InvalidInput, "not AccessDenied");
         assert_eq!(code_from_service(Some("SomethingElse"), 400), ErrorCode::Unknown);
     }
 

@@ -48,6 +48,9 @@ pub struct Planned {
     pub storage_class: Option<String>,
     /// Index of the request item that produced it.
     pub item: usize,
+    /// Copy this version of `src` instead of the current one (`restore_object_version`; jobs
+    /// always work on current versions and leave it `None`).
+    pub version_id: Option<String>,
 }
 
 /// The destination of `key` reached through `item` (`from + rest -> to + rest` for prefixes).
@@ -87,14 +90,22 @@ impl Expansion {
                 return;
             }
             let dest = match kind {
-                JobKind::Delete | JobKind::Tag => None,
+                JobKind::Delete | JobKind::Tag | JobKind::Restore => None,
                 _ => match map_dest(item, &l.key) {
                     Some(d) => Some(d),
                     None => return, // not under this item: never touch it
                 },
             };
             me.seen.insert(l.key.clone());
-            me.work.push(Planned { src: l.key, dest, size: l.size, etag: l.etag, storage_class: l.storage_class, item: idx });
+            me.work.push(Planned {
+                src: l.key,
+                dest,
+                size: l.size,
+                etag: l.etag,
+                storage_class: l.storage_class,
+                item: idx,
+                version_id: None,
+            });
         };
         match listing {
             ItemListing::Prefix(keys) => {
@@ -113,7 +124,7 @@ impl Expansion {
             ItemListing::Object(Some(l)) if l.key == item.from => push(l, self),
             ItemListing::Object(_) => {
                 if !self.seen.contains(&item.from) && self.seen_missing.insert((false, item.from.clone())) {
-                    let message = if kind == JobKind::Tag { OBJECT_MISSING } else { SOURCE_MISSING };
+                    let message = if matches!(kind, JobKind::Tag | JobKind::Restore) { OBJECT_MISSING } else { SOURCE_MISSING };
                     self.missing.push(JobError { key: item.from.clone(), message: message.into() });
                 }
             }
@@ -166,6 +177,24 @@ pub fn encode_copy_source(bucket: &str, key: &str) -> String {
     encode_into(&mut out, bucket);
     out.push('/');
     encode_into(&mut out, key);
+    out
+}
+
+/// The `x-amz-copy-source` value for one version of `bucket/key`: [`encode_copy_source`] plus
+/// `?versionId=` and the id, percent-encoded like a query value (`/` included). `None` is the
+/// current version (no query).
+pub fn encode_copy_source_version(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+    let mut out = encode_copy_source(bucket, key);
+    if let Some(v) = version_id {
+        out.push_str("?versionId=");
+        for &b in v.as_bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
     out
 }
 
@@ -247,6 +276,7 @@ pub fn label(req: &JobRequest) -> String {
     let verb = match req.kind {
         JobKind::Delete => return format!("Delete {what}"),
         JobKind::Tag => return format!("Tag {what}"),
+        JobKind::Restore => return format!("Restore {what}"),
         JobKind::Copy => "Copy",
         JobKind::Move => "Move",
     };
@@ -345,6 +375,7 @@ mod tests {
             etag: None,
             storage_class: None,
             item: 0,
+            version_id: None,
         };
         assert!(check_collisions(&[p("a", "x"), p("b", "y")], true).is_ok());
         let e = check_collisions(&[p("a", "x"), p("b", "x")], false).expect_err("dup dest");
@@ -354,6 +385,17 @@ mod tests {
         assert!(e.contains("also a source"), "{e}");
         // Byte-for-byte keys: these are all different.
         assert!(check_collisions(&[p("1", "x"), p("2", "X"), p("3", "x "), p("4", "x/"), p("5", "x//")], true).is_ok());
+    }
+
+    #[test]
+    fn copy_source_with_version_id() {
+        let e = encode_copy_source_version;
+        assert_eq!(e("bkt", "a/b.txt", None), "bkt/a/b.txt");
+        assert_eq!(e("bkt", "a/b.txt", Some("3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY")), "bkt/a/b.txt?versionId=3HL4kqtJlcpXroDTDmJ.rmSpXd3dIbrHY");
+        assert_eq!(e("bkt", "a/b.txt", Some("null")), "bkt/a/b.txt?versionId=null");
+        // The key is encoded first: a "?" in the key can never become the version query.
+        assert_eq!(e("bkt", "q?versionId=x", Some("v1")), "bkt/q%3FversionId%3Dx?versionId=v1");
+        assert_eq!(e("bkt", "a b+c", Some("v/1+2=")), "bkt/a%20b%2Bc?versionId=v%2F1%2B2%3D");
     }
 
     #[test]
@@ -444,6 +486,7 @@ mod tests {
             items,
             on_conflict: ConflictPolicy::Skip,
             tags: None,
+            restore: None,
         }
     }
 
@@ -458,6 +501,10 @@ mod tests {
         assert_eq!(label(&req(JobKind::Tag, "b", None, vec![item("p/d/", None, true)])), "Tag d");
         let two = vec![item("a", None, false), item("b/", None, true)];
         assert_eq!(label(&req(JobKind::Tag, "b", None, two)), "Tag 2 items");
+        assert_eq!(label(&req(JobKind::Restore, "b", None, vec![item("p/x.txt", None, false)])), "Restore x.txt");
+        assert_eq!(label(&req(JobKind::Restore, "b", None, vec![item("p/d/", None, true)])), "Restore d");
+        let three = vec![item("a", None, false), item("b/", None, true), item("c", None, false)];
+        assert_eq!(label(&req(JobKind::Restore, "b", None, three)), "Restore 3 items");
         assert_eq!(
             label(&req(JobKind::Move, "b", Some("b"), vec![item("p/old.txt", Some("p/new.txt"), false)])),
             "Rename old.txt to new.txt"

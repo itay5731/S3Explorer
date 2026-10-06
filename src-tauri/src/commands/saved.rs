@@ -1,5 +1,6 @@
 use tauri::State;
 
+use crate::buckets::AddedBucketStore;
 use crate::error::AppResult;
 use crate::models::{ConnectionInfo, SaveConnectionInput, SavedConnection};
 use crate::saved::{self, ConnectionStore};
@@ -16,8 +17,12 @@ pub async fn save_connection(store: State<'_, ConnectionStore>, input: SaveConne
 }
 
 #[tauri::command]
-pub async fn delete_saved_connection(store: State<'_, ConnectionStore>, id: String) -> AppResult<()> {
-    store.delete(&id).await
+pub async fn delete_saved_connection(
+    store: State<'_, ConnectionStore>,
+    added: State<'_, AddedBucketStore>,
+    id: String,
+) -> AppResult<()> {
+    saved::delete_saved_connection(&store, &added, &id).await
 }
 
 #[tauri::command]

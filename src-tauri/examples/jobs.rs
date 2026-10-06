@@ -235,7 +235,7 @@ fn pre(from: &str, to: Option<&str>) -> JobItem {
     JobItem { from: from.into(), to: to.map(Into::into), is_prefix: true }
 }
 fn req(kind: JobKind, dest: Option<&str>, items: Vec<JobItem>, on_conflict: ConflictPolicy) -> JobRequest {
-    JobRequest { kind, src_bucket: A.into(), dest_bucket: dest.map(Into::into), items, on_conflict, tags: None }
+    JobRequest { kind, src_bucket: A.into(), dest_bucket: dest.map(Into::into), items, on_conflict, tags: None, restore: None }
 }
 
 /// `before` with `remove` keys dropped and `add` merged in.
@@ -403,6 +403,7 @@ async fn b_copy(t: &T) -> Res<()> {
             items: vec![pre("c/src/", Some("x/src/")), obj("c/obj.json", Some("x/obj.json"))],
             on_conflict: ConflictPolicy::Skip,
             tags: None,
+            restore: None,
         })
         .await?;
     println!("  cross bucket: {:?} {}/{} label {:?}", j.status, j.done_items, j.total_items, j.label);
@@ -456,6 +457,7 @@ async fn c_move(t: &T) -> Res<()> {
             items: vec![pre("m/dst/", Some("moved/"))],
             on_conflict: ConflictPolicy::Skip,
             tags: None,
+            restore: None,
         })
         .await?;
     check(j.status == JobStatus::Completed && j.done_items == under(&before_a, "m/dst/").count() as u64, "cross-bucket move completed")?;
@@ -850,6 +852,7 @@ async fn k_multipart(t: &T, big_mib: u64) -> Res<()> {
             items: vec![obj("k2/big file+1.bin", Some("big/moved.bin"))],
             on_conflict: ConflictPolicy::Skip,
             tags: None,
+            restore: None,
         })
         .await?;
     check(j.status == JobStatus::Completed, "multipart move across buckets completed")?;

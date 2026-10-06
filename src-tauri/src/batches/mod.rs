@@ -406,6 +406,19 @@ impl BatchManager {
         self.entries.get(id).map(|e| lock(&e.transfer_ids).clone()).unwrap_or_default()
     }
 
+    /// Cancels every active batch (and so its transfers) and returns tokens that fire once each
+    /// batch reached its final state (after its final event).
+    pub fn cancel_active(&self) -> Vec<CancellationToken> {
+        self.entries
+            .iter()
+            .filter(|e| e.status().is_active())
+            .map(|e| {
+                e.cancel.cancel();
+                e.finished.clone()
+            })
+            .collect()
+    }
+
     /// True while any batch is planning, queued or running (the updater refuses to install then).
     pub fn has_active(&self) -> bool {
         self.entries.iter().any(|e| e.status().is_active())

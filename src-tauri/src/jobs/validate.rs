@@ -8,6 +8,8 @@
 //! - delete/tag: `destBucket` or any `to` present; copy/move: `destBucket` or any `to` missing;
 //! - tag: `tags` missing or invalid (see [`crate::tags::validate_operation`]); other kinds: `tags`
 //!   present;
+//! - restore: `restore` missing or invalid (days 1..=365, see [`crate::archive::validate_request`]);
+//!   other kinds: `restore` present; `destBucket` and every `to` must be null as for delete/tag;
 //! - an empty `from`; a prefix item whose `from` (or, for copy/move, `to`) does not end in `/`
 //!   or is `""` / `"/"`; an object destination that is empty or ends in `/`;
 //! - same bucket: a destination equal to its source, or a prefix copied/moved into itself or a
@@ -110,6 +112,7 @@ pub fn validate(req: &JobRequest) -> AppResult<()> {
         JobKind::Copy => "copy",
         JobKind::Move => "move",
         JobKind::Tag => "tag",
+        JobKind::Restore => "restore",
     };
     let transfer = matches!(req.kind, JobKind::Copy | JobKind::Move);
     let dest_bucket = match (&req.dest_bucket, transfer) {
@@ -124,6 +127,14 @@ pub fn validate(req: &JobRequest) -> AppResult<()> {
         (None, JobKind::Tag) => return Err(AppError::invalid("tags is required for tag")),
         (Some(op), JobKind::Tag) => crate::tags::validate_operation(op)?,
         (Some(_), _) => return Err(AppError::invalid(format!("tags must be absent for {verb} (it is only used by tag)"))),
+        (None, _) => {}
+    }
+    match (&req.restore, req.kind) {
+        (None, JobKind::Restore) => return Err(AppError::invalid("restore is required for restore")),
+        (Some(r), JobKind::Restore) => crate::archive::validate_request(r)?,
+        (Some(_), _) => {
+            return Err(AppError::invalid(format!("restore must be absent for {verb} (it is only used by restore)")))
+        }
         (None, _) => {}
     }
     let same_bucket = dest_bucket == Some(req.src_bucket.as_str());
@@ -229,6 +240,7 @@ mod tests {
             items,
             on_conflict: ConflictPolicy::Skip,
             tags: None,
+            restore: None,
         }
     }
     fn ok(r: &JobRequest) {
@@ -486,5 +498,33 @@ mod tests {
         let t = std::time::Instant::now();
         ok(&mv(items));
         assert!(t.elapsed().as_secs() < 2);
+    }
+
+    #[test]
+    fn restore_kind() {
+        use crate::models::{RestoreRequest, RestoreTier};
+        let rq = |days| Some(RestoreRequest { tier: RestoreTier::Standard, days });
+        let restore = |items: Vec<JobItem>, r: Option<RestoreRequest>| JobRequest { restore: r, ..req(JobKind::Restore, None, items) };
+        ok(&restore(vec![obj("a", None), pre("p/", None)], rq(7)));
+        ok(&restore(vec![obj("a", None)], rq(1)));
+        ok(&restore(vec![obj("a", None)], rq(365)));
+        bad(&restore(vec![obj("a", None)], None), "restore is required for restore");
+        bad(&restore(vec![obj("a", None)], rq(0)), "restore.days must be a whole number from 1 to 365");
+        bad(&restore(vec![obj("a", None)], rq(366)), "restore.days");
+        bad(&JobRequest { dest_bucket: Some("b".into()), ..restore(vec![obj("a", None)], rq(7)) }, "destBucket must be null for restore");
+        bad(&restore(vec![obj("a", Some("b"))], rq(7)), "items[0].to must be null for restore");
+        bad(&restore(vec![pre("p", None)], rq(7)), "must be a folder prefix");
+        let tag_op = crate::models::TagOperation { mode: crate::models::TagMode::Replace, set: vec![], remove: vec![] };
+        bad(&JobRequest { tags: Some(tag_op), ..restore(vec![obj("a", None)], rq(7)) }, "tags must be absent for restore");
+        // restore on any other kind is rejected
+        bad(&JobRequest { restore: rq(7), ..req(JobKind::Delete, None, vec![obj("a", None)]) }, "restore must be absent for delete");
+        bad(&JobRequest { restore: rq(7), ..copy(vec![obj("a", Some("b"))]) }, "restore must be absent for copy");
+        // JSON shape from the frontend
+        let r: JobRequest = serde_json::from_str(
+            r#"{"kind":"restore","srcBucket":"b","destBucket":null,"items":[{"from":"k","to":null,"isPrefix":false}],"onConflict":"skip","restore":{"tier":"Bulk","days":3}}"#,
+        )
+        .expect("parse");
+        ok(&r);
+        assert_eq!(r.restore, Some(RestoreRequest { tier: RestoreTier::Bulk, days: 3 }));
     }
 }

@@ -12,3 +12,4 @@ pub mod settings;
 pub mod tags;
 pub mod transfers;
 pub mod updates;
+pub mod versions;

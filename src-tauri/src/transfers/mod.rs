@@ -160,7 +160,8 @@ impl TransferEntry {
 enum Job {
     /// `no_replace`: fail instead of replacing a file that already exists at `dest` (batch
     /// downloads under `onConflict: skip`); the single-file command replaces it.
-    Download { dest: PathBuf, no_replace: bool },
+    /// `version_id`: download that version instead of the current one (`download_object_version`).
+    Download { dest: PathBuf, no_replace: bool, version_id: Option<String> },
     Upload { src: PathBuf },
 }
 
@@ -286,7 +287,23 @@ impl TransferManager {
     /// Rejects (`InvalidInput`) a relative destination, one containing `..`, and one that an
     /// active (queued/running) download already targets.
     pub fn start_download(self: &Arc<Self>, client: Client, bucket: &str, key: &str, dest: PathBuf) -> AppResult<String> {
-        self.queue_download(client, bucket, key, dest, false, None)
+        self.queue_download(client, bucket, key, dest, false, None, None)
+    }
+
+    /// Queues a download of one version of `bucket/key` (every request carries `versionId`).
+    /// Otherwise as [`Self::start_download`].
+    pub fn start_version_download(
+        self: &Arc<Self>,
+        client: Client,
+        bucket: &str,
+        key: &str,
+        version_id: &str,
+        dest: PathBuf,
+    ) -> AppResult<String> {
+        if version_id.is_empty() {
+            return Err(AppError::invalid("versionId is required"));
+        }
+        self.queue_download(client, bucket, key, dest, false, Some(version_id.to_string()), None)
     }
 
     /// Queues one file of a folder download. With `no_replace` the transfer fails (and leaves
@@ -301,9 +318,10 @@ impl TransferManager {
         no_replace: bool,
         link: BatchLink,
     ) -> AppResult<String> {
-        self.queue_download(client, bucket, key, dest, no_replace, Some(link))
+        self.queue_download(client, bucket, key, dest, no_replace, None, Some(link))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_download(
         self: &Arc<Self>,
         client: Client,
@@ -311,6 +329,7 @@ impl TransferManager {
         key: &str,
         dest: PathBuf,
         no_replace: bool,
+        version_id: Option<String>,
         link: Option<BatchLink>,
     ) -> AppResult<String> {
         validate_download_dest(&dest)?;
@@ -322,7 +341,7 @@ impl TransferManager {
             )));
         }
         // Still under the lock: the entry exists before another start can check this destination.
-        Ok(self.start(client, TransferKind::Download, bucket, key, local, Job::Download { dest, no_replace }, link))
+        Ok(self.start(client, TransferKind::Download, bucket, key, local, Job::Download { dest, no_replace, version_id }, link))
     }
 
     /// Queues an upload of `src` to `bucket/key`. Must be called within a Tokio runtime.
@@ -418,11 +437,12 @@ impl TransferManager {
                 let fault = self.tuning.fault.clone();
                 let body = async {
                     match job {
-                        Job::Download { dest, no_replace } => {
+                        Job::Download { dest, no_replace, version_id } => {
                             if let Some(f) = &fault {
                                 f("download");
                             }
-                            download::run(&client, &entry, cfg, &id, &bucket, &key, &dest, no_replace).await
+                            let src = download::Source { bucket: &bucket, key: &key, version_id: version_id.as_deref() };
+                            download::run(&client, &entry, cfg, &id, src, &dest, no_replace).await
                         }
                         Job::Upload { src } => {
                             if let Some(f) = &fault {
@@ -492,6 +512,19 @@ impl TransferManager {
         }
         self.entries.remove(id);
         Ok(())
+    }
+
+    /// Cancels every queued or running transfer (cooperatively) and returns tokens that fire
+    /// once each of them reached its final state (after its final event).
+    pub fn cancel_active(&self) -> Vec<CancellationToken> {
+        self.entries
+            .iter()
+            .filter(|e| e.status().is_active())
+            .map(|e| {
+                e.cancel.cancel();
+                e.finished.clone()
+            })
+            .collect()
     }
 
     /// True while any transfer is queued or running (the updater refuses to install then).
@@ -760,6 +793,34 @@ mod tests {
 
     fn gets(s3: &FakeS3) -> usize {
         s3.count(|r| r.method == "GET")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_download_sends_the_version_on_every_request() {
+        let dir = ScratchDir::new("dl-version");
+        let size = 9 * MIB + 3;
+        let s3 = object_server(size, |_, _| None, false).await;
+        let settings = TransferSettings { part_size_mib: Some(1), ..TransferSettings::default() };
+        let tm = manager(settings, TransferTuning::default());
+        let dest = dir.0.join("v.bin");
+        let id = tm.start_version_download(s3.client(), "b", "k", "3HL4kq.v/1", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_eq!(std::fs::read(&dest).expect("read"), expected(size));
+        let reqs = s3.requests();
+        assert!(gets(&s3) >= 10, "ranged parts");
+        for r in &reqs {
+            assert!(r.query.contains("versionId=3HL4kq.v%2F1"), "{} {} without the version: {}", r.method, r.path, r.query);
+        }
+        assert!(reqs.iter().filter(|r| r.method == "GET").all(|r| r.header("if-match") == Some("\"v1\"")), "still pinned by If-Match");
+        assert!(tm.start_version_download(s3.client(), "b", "k", "", dir.0.join("x")).is_err(), "empty version id");
+
+        // A version that does not exist: HeadObject's bare 404 names the version.
+        let s3 = FakeS3::start(|_| Reply::status(404)).await;
+        let id = tm.start_version_download(s3.client(), "b", "k", "gone", dir.0.join("g.bin")).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Failed);
+        assert_eq!(t.error.as_deref(), Some("Version gone of k does not exist."));
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -21,6 +21,7 @@ use crate::models::{
     now_iso, ConnectionConfig, ConnectionInfo, SaveConnectionInput, SavedConnection, SavedConnectionKind,
     SAVED_CONNECTION_NAME_MAX,
 };
+use crate::buckets::AddedBucketStore;
 use crate::settings::write_json_atomic;
 use crate::state::{AppState, Connection};
 
@@ -423,6 +424,19 @@ impl ConnectionStore {
     }
 }
 
+/// `delete_saved_connection`: deletes the saved connection (metadata and keychain entry), then
+/// the buckets added while connected through it (`added-buckets.json`, keyed by its id). If the
+/// second step fails, the connection stays deleted and the error says so.
+pub async fn delete_saved_connection(store: &ConnectionStore, added: &AddedBucketStore, id: &str) -> AppResult<()> {
+    store.delete(id).await?;
+    added.remove_connection(id).await.map_err(|e| {
+        AppError::new(
+            e.code,
+            format!("The saved connection was deleted, but its added buckets could not be removed: {}", e.message),
+        )
+    })
+}
+
 /// `connect_saved`: loads the secret, connects through the same path as `connect`
 /// ([`Connection::open`]), labels the connection with the saved name, and updates `lastUsedAt`
 /// only when the connection succeeded.
@@ -706,6 +720,29 @@ mod tests {
         k.fail_on(FailOn::default());
         assert_eq!(s.list().await.expect("list").len(), 1);
         assert!(k.peek(&c.id).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_saved_connection_forgets_its_added_buckets() {
+        use crate::models::AddedBucket;
+        let dir = temp_dir("delete-added");
+        let (s, k) = store(&dir);
+        let added = AddedBucketStore::load(dir.join(crate::buckets::ADDED_BUCKETS_FILE));
+        let a = s.save(static_input(None, "A", SECRET)).await.expect("a");
+        let b = s.save(profile_input(None, "B")).await.expect("b");
+        let bucket = |n: &str| AddedBucket { name: n.into(), region: None, added_at: String::new() };
+        added.insert(&a.id, bucket("shared-1")).await.expect("insert");
+        added.insert(&a.id, bucket("shared-2")).await.expect("insert");
+        added.insert(&b.id, bucket("kept")).await.expect("insert");
+        added.insert("profile:dev@aws", bucket("unsaved")).await.expect("insert");
+        delete_saved_connection(&s, &added, &a.id).await.expect("delete");
+        assert!(k.peek(&a.id).is_none());
+        let reloaded = AddedBucketStore::load(dir.join(crate::buckets::ADDED_BUCKETS_FILE));
+        assert!(reloaded.list(&a.id).await.is_empty(), "its buckets are gone from the file");
+        assert_eq!(reloaded.list(&b.id).await.len(), 1, "other connections keep theirs");
+        assert_eq!(reloaded.list("profile:dev@aws").await.len(), 1);
+        delete_saved_connection(&s, &added, "unknown-id").await.expect("no-op");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

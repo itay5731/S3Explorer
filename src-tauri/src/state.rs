@@ -20,6 +20,9 @@ use crate::transfers::{ProgressSink, TransferManager};
 
 const FALLBACK_REGION: &str = "us-east-1";
 
+/// How long `disconnect { cancelActive: true }` waits for cancelled work to finish.
+pub const DISCONNECT_WAIT: Duration = Duration::from_secs(10);
+
 /// A live connection: base client plus a per-bucket cache of region-specific clients.
 pub struct Connection {
     pub info: ConnectionInfo,
@@ -237,6 +240,29 @@ impl AppState {
         self.settings.update(settings, |s| self.transfers.apply_settings(s)).await
     }
 
+    /// Cancels every queued or running transfer, batch and job (cooperatively) and waits up to
+    /// `limit` for all of them to reach their final state, final events included. Returns how
+    /// many were still active when the wait ended (0 when everything finished in time).
+    pub async fn cancel_active_and_wait(&self, limit: Duration) -> usize {
+        // Batches first: their cancel also stops them from starting more transfers.
+        let mut pending = self.batches.cancel_active();
+        pending.extend(self.jobs.cancel_active());
+        pending.extend(self.transfers.cancel_active());
+        let all = futures::future::join_all(pending.iter().map(|t| t.cancelled()));
+        let _ = tokio::time::timeout(limit, all).await;
+        pending.iter().filter(|t| !t.is_cancelled()).count()
+    }
+
+    /// `disconnect`: with `cancel_active`, first cancels all work and waits (up to `limit`) for
+    /// its final events; then drops the connection. Without it, running work keeps its own
+    /// clients and finishes in the background. Returns what [`Self::cancel_active_and_wait`] said
+    /// (0 without `cancel_active`).
+    pub async fn disconnect(&self, cancel_active: bool, limit: Duration) -> usize {
+        let unfinished = if cancel_active { self.cancel_active_and_wait(limit).await } else { 0 };
+        self.set_connection(None).await;
+        unfinished
+    }
+
     pub async fn set_connection(&self, conn: Option<Arc<Connection>>) {
         *self.connection.write().await = conn;
     }
@@ -284,5 +310,129 @@ mod tests {
         let arn = "arn:aws:s3:sa-east-1:123456789012:accesspoint/ap";
         assert_eq!(discover_region(&fake.client(), arn).await.as_deref(), Some("sa-east-1"));
         assert_eq!(fake.requests().len(), 0);
+    }
+
+    #[derive(Default)]
+    struct Finals {
+        transfers: std::sync::Mutex<Vec<crate::models::Transfer>>,
+        jobs: std::sync::Mutex<Vec<crate::models::Job>>,
+        batches: std::sync::Mutex<Vec<crate::models::Batch>>,
+    }
+
+    /// An AppState whose sinks record every event, connected to `fake`.
+    async fn connected_state(fake: &FakeS3) -> (AppState, Arc<Finals>) {
+        let rec = Arc::new(Finals::default());
+        let (a, b, c) = (rec.clone(), rec.clone(), rec.clone());
+        let sink: Arc<dyn ProgressSink> = Arc::new(move |t: &crate::models::Transfer| a.transfers.lock().expect("lock").push(t.clone()));
+        let job_sink: Arc<dyn JobSink> = Arc::new(move |j: &crate::models::Job| b.jobs.lock().expect("lock").push(j.clone()));
+        let batch_sink: Arc<dyn BatchSink> = Arc::new(move |x: &crate::models::Batch| c.batches.lock().expect("lock").push(x.clone()));
+        let state = AppState::new(sink, job_sink, batch_sink, SettingsStore::in_memory(Default::default()));
+        let conn = Connection::open(ConnectionConfig::Static {
+            access_key_id: "test".into(),
+            secret_access_key: "test".into(),
+            session_token: None,
+            region: "us-east-1".into(),
+            endpoint: Some(fake.endpoint.clone()),
+            force_path_style: Some(true),
+        })
+        .await
+        .expect("connect");
+        state.set_connection(Some(Arc::new(conn))).await;
+        (state, rec)
+    }
+
+    const NO_BUCKETS: &str = "<ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_with_cancel_active_waits_for_every_final_event() {
+        use crate::models::{BatchKind, BatchPlanRequest, BatchStatus, ConflictPolicy, JobItem, JobKind, JobRequest, JobStatus, TransferStatus};
+        let fake = FakeS3::start(|r| match r.method.as_str() {
+            "GET" if r.path == "/" => Reply::xml(200, NO_BUCKETS),
+            "GET" if r.has_query("list-type") && r.query.contains("prefix=dl%2F") => Reply::xml(
+                200,
+                "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>dl/a</Key><Size>5</Size></Contents><Contents><Key>dl/b</Key><Size>5</Size></Contents><Contents><Key>dl/c</Key><Size>5</Size></Contents></ListBucketResult>",
+            ),
+            // Everything else (the job's listing, every HEAD) never answers.
+            _ => Reply::Hang,
+        })
+        .await;
+        let (state, rec) = connected_state(&fake).await;
+        let client = state.client_for_bucket("b").await.expect("client");
+        let dir = crate::testutil::ScratchDir::new("disconnect");
+        let t = state.transfers.start_download(client.clone(), "b", "single", dir.0.join("single")).expect("download");
+        let batch = state
+            .batches
+            .start(
+                BatchPlanRequest {
+                    kind: BatchKind::Download,
+                    bucket: "b".into(),
+                    prefix: "dl/".into(),
+                    local_path: dir.0.join("batch").to_string_lossy().into_owned(),
+                    on_conflict: ConflictPolicy::Overwrite,
+                },
+                client.clone(),
+            )
+            .expect("batch");
+        let job = state
+            .jobs
+            .start(
+                JobRequest {
+                    kind: JobKind::Delete,
+                    src_bucket: "b".into(),
+                    dest_bucket: None,
+                    items: vec![JobItem { from: "x/".into(), to: None, is_prefix: true }],
+                    on_conflict: ConflictPolicy::Skip,
+                    tags: None,
+                    restore: None,
+                },
+                client,
+                None,
+            )
+            .expect("job");
+        // Let the batch start its transfers and everything reach its hanging request.
+        for _ in 0..100 {
+            if state.batches.transfer_ids(&batch).len() == 3 && fake.count(|r| r.method == "HEAD") >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.batches.transfer_ids(&batch).len(), 3, "the batch started its transfers");
+        assert!(state.transfers.has_active() && state.jobs.has_active() && state.batches.has_active());
+
+        let started = std::time::Instant::now();
+        let unfinished = state.disconnect(true, Duration::from_secs(10)).await;
+        assert_eq!(unfinished, 0);
+        assert!(started.elapsed() < Duration::from_secs(5), "cooperative cancel is quick: {:?}", started.elapsed());
+        assert!(state.connection_info().await.is_none(), "the connection is gone");
+        assert!(!state.transfers.has_active() && !state.jobs.has_active() && !state.batches.has_active());
+        // Every final event was emitted before disconnect returned.
+        let finals = |status| rec.transfers.lock().expect("lock").iter().filter(|x| x.finished_at.is_some() && x.status == status).count();
+        assert_eq!(finals(TransferStatus::Cancelled), 4, "single + 3 batch files");
+        assert_eq!(state.transfers.get(&t).map(|x| x.status), Some(TransferStatus::Cancelled));
+        let jobs = rec.jobs.lock().expect("lock").clone();
+        assert!(jobs.iter().any(|j| j.id == job && j.finished_at.is_some() && j.status == JobStatus::Cancelled));
+        let batches = rec.batches.lock().expect("lock").clone();
+        assert!(batches.iter().any(|b| b.id == batch && b.finished_at.is_some() && b.status == BatchStatus::Cancelled));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disconnect_without_cancel_lets_work_finish() {
+        use crate::models::TransferStatus;
+        let fake = FakeS3::start(|r| match r.method.as_str() {
+            "GET" if r.path == "/" => Reply::xml(200, NO_BUCKETS),
+            "HEAD" => Reply::with_headers(200, vec![h("Content-Length", "5"), h("ETag", "\"e\"")]),
+            "GET" => Reply::Full { status: 200, headers: vec![h("ETag", "\"e\"")], body: b"hello".to_vec() },
+            _ => Reply::status(500),
+        })
+        .await;
+        let (state, _) = connected_state(&fake).await;
+        let client = state.client_for_bucket("b").await.expect("client");
+        let dir = crate::testutil::ScratchDir::new("disconnect-keep");
+        let t = state.transfers.start_download(client, "b", "k", dir.0.join("k")).expect("download");
+        assert_eq!(state.disconnect(false, Duration::from_secs(10)).await, 0);
+        assert!(state.connection_info().await.is_none());
+        let done = tokio::time::timeout(Duration::from_secs(10), state.transfers.wait(&t)).await.expect("finished").expect("known");
+        assert_eq!(done.status, TransferStatus::Completed, "{:?}", done.error);
+        assert_eq!(std::fs::read(dir.0.join("k")).expect("file"), b"hello");
     }
 }

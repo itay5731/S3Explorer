@@ -5,7 +5,7 @@ use tauri::State;
 use crate::error::AppResult;
 use crate::models::{ConnectionConfig, ConnectionInfo, ProfileInfo};
 use crate::profiles;
-use crate::state::{AppState, Connection};
+use crate::state::{AppState, Connection, DISCONNECT_WAIT};
 
 #[tauri::command]
 pub async fn list_profiles() -> AppResult<Vec<ProfileInfo>> {
@@ -20,9 +20,11 @@ pub async fn connect(state: State<'_, AppState>, config: ConnectionConfig) -> Ap
     Ok(info)
 }
 
+/// `cancelActive: true` cancels every transfer, batch and job and waits (bounded) for their
+/// final events first; `false` (or absent) lets them finish in the background.
 #[tauri::command]
-pub async fn disconnect(state: State<'_, AppState>) -> AppResult<()> {
-    state.set_connection(None).await;
+pub async fn disconnect(state: State<'_, AppState>, cancel_active: Option<bool>) -> AppResult<()> {
+    state.disconnect(cancel_active.unwrap_or(false), DISCONNECT_WAIT).await;
     Ok(())
 }
 

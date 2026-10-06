@@ -172,6 +172,10 @@ pub struct ObjectMeta {
     pub content_type: Option<String>,
     pub metadata: HashMap<String, String>,
     pub version_id: Option<String>,
+    /// v0.5.0: restore state from `x-amz-restore`; `None` when the header is absent.
+    pub restore: Option<RestoreStatus>,
+    /// v0.5.0: true when the object must be restored before it can be read.
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -594,6 +598,8 @@ pub enum JobKind {
     Move,
     /// Bulk tag editing (`JobRequest.tags`).
     Tag,
+    /// Bulk restore of archived objects (`JobRequest.restore`).
+    Restore,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -651,6 +657,9 @@ pub struct JobRequest {
     /// Required for `kind: "tag"`, rejected for the other kinds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<TagOperation>,
+    /// Required for `kind: "restore"`, rejected for the other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<RestoreRequest>,
 }
 
 // ---- v0.4.0: tags and buckets added by name -------------------------------------------------
@@ -1013,6 +1022,74 @@ pub fn last_segment(path: &str) -> String {
     // Strip exactly one trailing '/' (a folder prefix); "a//" is the folder named "" inside "a/".
     let trimmed = path.strip_suffix('/').unwrap_or(path);
     trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+}
+
+// ---- v0.5.0: object versions and archived objects ----
+
+/// Most versions `list_object_versions` returns (`truncated: true` beyond that).
+pub const VERSION_LIST_MAX: usize = 1000;
+
+/// One version (or delete marker) of a key (`ObjectVersion` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectVersion {
+    /// `"null"` for objects written before versioning was enabled.
+    pub version_id: String,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
+    /// 0 for delete markers.
+    pub size: u64,
+    pub last_modified: Option<String>,
+    pub etag: Option<String>,
+    pub storage_class: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionListing {
+    /// Newest first, at most [`VERSION_LIST_MAX`].
+    pub versions: Vec<ObjectVersion>,
+    pub truncated: bool,
+}
+
+/// Retrieval tier of a restore. Serialized exactly as S3 names them: `Bulk`, `Standard`, `Expedited`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RestoreTier {
+    Bulk,
+    Standard,
+    Expedited,
+}
+
+impl RestoreTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RestoreTier::Bulk => "Bulk",
+            RestoreTier::Standard => "Standard",
+            RestoreTier::Expedited => "Expedited",
+        }
+    }
+}
+
+/// `RestoreRequest` in `types.ts`. `days` is signed so an out-of-range value is an
+/// `InvalidInput` with a message, not a deserialization failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreRequest {
+    pub tier: RestoreTier,
+    /// How long the restored copy stays readable, [`RESTORE_DAYS_MIN`]..=[`RESTORE_DAYS_MAX`].
+    pub days: i64,
+}
+
+pub const RESTORE_DAYS_MIN: i64 = 1;
+pub const RESTORE_DAYS_MAX: i64 = 365;
+
+/// Restore state from the `x-amz-restore` header (`ObjectMeta.restore` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreStatus {
+    pub in_progress: bool,
+    /// ISO-8601 when the restored copy expires (only once the restore finished).
+    pub expires_at: Option<String>,
 }
 
 #[cfg(test)]

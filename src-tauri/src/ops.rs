@@ -131,6 +131,7 @@ pub async fn head_object(client: &Client, bucket: &str, key: &str) -> AppResult<
         return Err(AppError::invalid("Object key is required"));
     }
     let h = client.head_object().bucket(bucket).key(key).send().await?;
+    let archive = crate::archive::ArchiveInfo::from_head(&h);
     Ok(ObjectMeta {
         key: key.to_string(),
         name: last_segment(key),
@@ -141,6 +142,8 @@ pub async fn head_object(client: &Client, bucket: &str, key: &str) -> AppResult<
         content_type: h.content_type().map(str::to_string),
         metadata: h.metadata().cloned().unwrap_or_default(),
         version_id: h.version_id().map(str::to_string),
+        archived: archive.archived(chrono::Utc::now()),
+        restore: archive.restore,
     })
 }
 

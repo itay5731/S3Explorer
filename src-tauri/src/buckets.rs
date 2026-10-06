@@ -253,6 +253,21 @@ impl AddedBucketStore {
     }
 }
 
+impl AddedBucketStore {
+    /// Forgets every bucket added for `identity` (a deleted saved connection). Unknown identity is
+    /// a no-op. On a write failure nothing changes in memory either. Never touches S3.
+    pub async fn remove_connection(&self, identity: &str) -> AppResult<()> {
+        let mut items = self.items.lock().await;
+        if !items.contains_key(identity) {
+            return Ok(());
+        }
+        let mut next = items.clone();
+        next.remove(identity);
+        *items = self.write(next).await?;
+        Ok(())
+    }
+}
+
 /// `add_bucket`: parse, return an existing entry as is, otherwise verify and store.
 /// `client` must already be the bucket's regional client; `region` is what was resolved for it
 /// (`None` with a custom endpoint).
@@ -388,6 +403,12 @@ mod tests {
         let s3 = AddedBucketStore::load(path.clone());
         assert_eq!(names(s3.list("c1").await), ["alpha"]);
         assert_eq!(names(s3.list("c2").await), ["other"]);
+        // A deleted saved connection takes all of its buckets along, and only its own.
+        s3.remove_connection("c1").await.expect("remove connection");
+        s3.remove_connection("nobody").await.expect("no-op");
+        let s4 = AddedBucketStore::load(path.clone());
+        assert!(s4.list("c1").await.is_empty());
+        assert_eq!(names(s4.list("c2").await), ["other"]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

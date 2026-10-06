@@ -15,7 +15,7 @@ use aws_sdk_s3::Client;
 use futures::stream::{self, FuturesUnordered, StreamExt, TryStreamExt};
 use tokio_util::sync::CancellationToken;
 
-use super::plan::{encode_copy_source, plan_copy_parts, Expansion, ItemListing, Listed, Planned};
+use super::plan::{encode_copy_source_version, plan_copy_parts, Expansion, ItemListing, Listed, Planned};
 use super::{JobEntry, JobTuning};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{ConflictPolicy, JobError, JobKind, JobRequest};
@@ -535,13 +535,6 @@ struct Caps {
     delete_etag: AtomicBool,
 }
 
-fn archived_message(p: &Planned) -> String {
-    format!(
-        "InvalidObjectState: The object is archived ({}) and must be restored before it can be copied.",
-        p.storage_class.as_deref().unwrap_or("archive storage class")
-    )
-}
-
 const SOURCE_CHANGED: &str =
     "PreconditionFailed: The source object changed after it was listed, so it was not copied. Run the operation again to copy the current version.";
 const SOURCE_GONE: &str = "NoSuchKey: The source object no longer exists.";
@@ -559,13 +552,13 @@ async fn precondition_outcome(ctx: &Ctx<'_>, p: &Planned, sent_if_none_match: bo
     Outcome::Failed(SOURCE_CHANGED.into())
 }
 
-fn service_failure<E>(p: &Planned, e: SdkError<E, HttpResponse>) -> String
+fn service_failure<E>(e: SdkError<E, HttpResponse>) -> String
 where
     E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
 {
     let (status, code) = err_info(&e);
     match code.as_deref() {
-        Some("InvalidObjectState") => archived_message(p),
+        Some("InvalidObjectState") => crate::error::ARCHIVED.into(),
         Some("NoSuchKey") => SOURCE_GONE.into(),
         _ if status == Some(404) && code.is_none() => SOURCE_GONE.into(),
         _ => AppError::from(e).message,
@@ -585,7 +578,7 @@ async fn copy_simple(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str) ->
             .copy_object()
             .bucket(ctx.dest_bucket())
             .key(dest_key)
-            .copy_source(encode_copy_source(&ctx.req.src_bucket, &p.src))
+            .copy_source(encode_copy_source_version(&ctx.req.src_bucket, &p.src, p.version_id.as_deref()))
             .metadata_directive(MetadataDirective::Copy)
             .set_copy_source_if_match(p.etag.clone())
             .set_storage_class(p.storage_class.as_deref().map(StorageClass::from));
@@ -606,9 +599,9 @@ async fn copy_simple(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str) ->
                 if status == Some(412) || code.as_deref() == Some("PreconditionFailed") {
                     precondition_outcome(ctx, p, use_inm).await
                 } else if is_marker(p) && (code.as_deref() == Some("NoSuchKey") || status == Some(404)) {
-                    copy_marker(ctx, caps, p, dest_key).await.unwrap_or_else(|| Outcome::Failed(service_failure(p, e)))
+                    copy_marker(ctx, caps, p, dest_key).await.unwrap_or_else(|| Outcome::Failed(service_failure(e)))
                 } else {
-                    Outcome::Failed(service_failure(p, e))
+                    Outcome::Failed(service_failure(e))
                 }
             }
         };
@@ -626,7 +619,16 @@ fn is_marker(p: &Planned) -> bool {
 /// metadata instead. `None` = the marker really is gone (report the original error).
 async fn copy_marker(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str) -> Option<Outcome> {
     let dest = ctx.dest_client().ok()?;
-    let h = ctx.src.head_object().bucket(&ctx.req.src_bucket).key(&p.src).set_if_match(p.etag.clone()).send().await.ok()?;
+    let h = ctx
+        .src
+        .head_object()
+        .bucket(&ctx.req.src_bucket)
+        .key(&p.src)
+        .set_version_id(p.version_id.clone())
+        .set_if_match(p.etag.clone())
+        .send()
+        .await
+        .ok()?;
     if h.content_length().unwrap_or(-1) != 0 {
         return None;
     }
@@ -696,14 +698,21 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
     if ctx.cancel.is_cancelled() {
         return Outcome::Cancelled;
     }
-    let h = match ctx.src.head_object().bucket(src_bucket).key(&p.src).set_if_match(p.etag.clone()).send().await {
+    let head = ctx
+        .src
+        .head_object()
+        .bucket(src_bucket)
+        .key(&p.src)
+        .set_version_id(p.version_id.clone())
+        .set_if_match(p.etag.clone());
+    let h = match head.send().await {
         Ok(h) => h,
         Err(e) => {
             let (status, code) = err_info(&e);
             if status == Some(412) || code.as_deref() == Some("PreconditionFailed") {
                 return Outcome::Failed(SOURCE_CHANGED.into());
             }
-            return Outcome::Failed(service_failure(p, e));
+            return Outcome::Failed(service_failure(e));
         }
     };
     if h.content_length().unwrap_or(-1) != p.size as i64 {
@@ -718,7 +727,7 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
     };
     // Tags are not carried over by UploadPartCopy; copy them explicitly (best effort: servers
     // without tagging support still get the data copied).
-    let tags: Vec<(String, String)> = match ctx.src.get_object_tagging().bucket(src_bucket).key(&p.src).send().await {
+    let tags: Vec<(String, String)> = match ctx.src.get_object_tagging().bucket(src_bucket).key(&p.src).set_version_id(p.version_id.clone()).send().await {
         Ok(t) => t.tag_set().iter().map(|t| (t.key().to_string(), t.value().to_string())).collect(),
         Err(_) => Vec::new(),
     };
@@ -750,7 +759,7 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
     };
     // Aborts the upload on every failure path, and also if this future is dropped or panics.
     let mut guard = AbortOnDrop::new(dest, dest_bucket, dest_key, &upload_id);
-    let source = encode_copy_source(src_bucket, &p.src);
+    let source = encode_copy_source_version(src_bucket, &p.src, p.version_id.as_deref());
     let (source, etag, upload_id, ranges) = (&source, &etag, &upload_id, &ranges);
     let parts: Result<Vec<CompletedPart>, Outcome> = stream::iter(0..ranges.len())
         .map(move |i| {
@@ -780,7 +789,7 @@ async fn copy_multipart(ctx: &Ctx<'_>, caps: &Caps, p: &Planned, dest_key: &str)
                         if status == Some(412) || code.as_deref() == Some("PreconditionFailed") {
                             Err(Outcome::Failed(SOURCE_CHANGED.into()))
                         } else {
-                            Err(Outcome::Failed(format!("Part {n}: {}", service_failure(p, e))))
+                            Err(Outcome::Failed(format!("Part {n}: {}", service_failure(e))))
                         }
                     }
                 }
@@ -1016,6 +1025,91 @@ pub(crate) async fn run_transfer(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planne
     }
 }
 
+/// Copies one version of `p.src` onto `p.dest` in `bucket` (the version is `p.version_id`):
+/// `CopyObject` with `MetadataDirective: COPY` (metadata, content type and tags of that
+/// version), or a multipart copy above `multipart_threshold`. Not cancellable. The error message
+/// starts with the S3 code where there is one.
+pub(crate) async fn copy_version(client: &Client, bucket: &str, p: &Planned, multipart_threshold: u64) -> Result<(), String> {
+    let req = JobRequest {
+        kind: JobKind::Copy,
+        src_bucket: bucket.to_string(),
+        dest_bucket: Some(bucket.to_string()),
+        items: Vec::new(),
+        // Overwrite: the destination is the current version of the same key, which exists.
+        on_conflict: ConflictPolicy::Overwrite,
+        tags: None,
+        restore: None,
+    };
+    let cancel = CancellationToken::new();
+    let tuning = JobTuning { multipart_threshold, ..JobTuning::default() };
+    let ctx = Ctx { req: &req, src: client, dest: Some(client), cancel: &cancel, tuning: &tuning };
+    let caps = Caps { if_none_match: AtomicBool::new(false), delete_etag: AtomicBool::new(false) };
+    match copy_one(&ctx, &caps, p, &HashSet::new()).await {
+        Outcome::Copied => Ok(()),
+        Outcome::Failed(m) => Err(m),
+        Outcome::Skipped | Outcome::Cancelled => Err("The copy did not run.".into()),
+    }
+}
+
+// ---- working phase: restore --------------------------------------------------------------------
+
+/// Bulk restore of archived objects: per object, the listing's storage class rules out objects
+/// that cannot be archived (no request), otherwise `HeadObject` decides (see
+/// [`crate::archive::job_step`]): not archived, already restoring or restored → skipped;
+/// Expedited on Deep Archive → per-object failure; else `RestoreObject`. Up to
+/// [`OBJECT_CONCURRENCY`] objects in flight; cancel stops new work. A server without
+/// `RestoreObject` stops the job with a job-level `NotSupported` error (like tag jobs).
+pub(crate) async fn run_restore(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planned]) -> AppResult<()> {
+    use crate::archive::{self, JobStep};
+    let req = ctx.req.restore.as_ref().ok_or_else(|| AppError::invalid("restore is required for restore"))?;
+    let stop = ctx.cancel.child_token();
+    let bucket = ctx.req.src_bucket.as_str();
+    let results = stream::iter(0..work.len())
+        .take_until(stop.clone().cancelled_owned())
+        .map(move |i| async move {
+            let p = &work[i];
+            // A storage class from the listing that can never be archived needs no HeadObject
+            // (only GLACIER / DEEP_ARCHIVE / INTELLIGENT_TIERING can need a restore; an unknown
+            // class is looked up).
+            let sc = p.storage_class.as_deref();
+            if sc.is_some() && !archive::is_archive_class(sc) && sc != Some(archive::INTELLIGENT_TIERING) {
+                return (p, Ok(false));
+            }
+            let info = match archive::head_info(ctx.src, bucket, &p.src).await {
+                Ok(i) => i,
+                Err(e) => return (p, Err(e)),
+            };
+            let r = match archive::job_step(req, &info, chrono::Utc::now()) {
+                JobStep::Skip => Ok(false),
+                JobStep::Fail(m) => Err(AppError::invalid(m)),
+                JobStep::Restore => archive::send_restore(ctx.src, bucket, &p.src, req, &info).await.map(|()| true),
+            };
+            (p, r)
+        })
+        .buffer_unordered(OBJECT_CONCURRENCY);
+    tokio::pin!(results);
+    let mut unsupported: Option<AppError> = None;
+    while let Some((p, r)) = results.next().await {
+        match r {
+            Ok(true) => entry.done(0),
+            Ok(false) => entry.skipped(),
+            // Started by someone else between HeadObject and RestoreObject: nothing to do.
+            Err(e) if e.code == ErrorCode::Conflict => entry.skipped(),
+            Err(e) => {
+                if e.code == ErrorCode::NotSupported && unsupported.is_none() {
+                    unsupported = Some(AppError::new(ErrorCode::NotSupported, format!("Stopped: {}", e.message)));
+                    stop.cancel();
+                }
+                entry.fail(&p.src, e.message);
+            }
+        }
+    }
+    match unsupported {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 // ---- working phase: tag ------------------------------------------------------------------------
 
 /// Job-level error when the server does not implement object tagging (the job stops instead of
@@ -1096,6 +1190,7 @@ mod tests {
             etag: etag.map(Into::into),
             storage_class: None,
             item: 0,
+            version_id: None,
         }
     }
 

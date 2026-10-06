@@ -173,6 +173,7 @@ fn tag_req(items: Vec<JobItem>, op: TagOperation) -> JobRequest {
         items,
         on_conflict: ConflictPolicy::Skip,
         tags: Some(op),
+        restore: None,
     }
 }
 
@@ -575,6 +576,7 @@ async fn rejections(c: &Client, rec: &Arc<Recorder>) -> Res<()> {
         items: vec![pre("bulk/")],
         on_conflict: ConflictPolicy::Skip,
         tags: Some(op.clone()),
+        restore: None,
     };
     expect_err(mgr.start(del.clone(), c.clone(), None), ErrorCode::InvalidInput, "a delete job with tags set")?;
     expect_err(jobs::preview(&del, c, None).await, ErrorCode::InvalidInput, "preview of a delete job with tags set")?;
