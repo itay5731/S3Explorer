@@ -1027,3 +1027,21 @@ asks when anything is active: "N operations are still running." with **Cancel th
 `s3:ListBucketVersions` (list versions), `s3:GetObjectVersion` (download or restore a version;
 `CopyObject` of a version reads it), `s3:DeleteObjectVersion` (permanent delete), `s3:RestoreObject`
 (restore archived objects). Folder transfers need nothing beyond single transfers.
+
+**Batch details settled after the v0.5.0 review and end-to-end run:**
+
+- `preview_batch` accepts an optional `previewId: string`; a newer preview with the same id cancels the older one,
+  which fails with `Cancelled`. The frontend sends `<dialog id>:<n>`. Closing a dialog does not cancel a running preview.
+- A folder download never writes through a symlink or junction below its root: planning fails a file whose path
+  crosses one ("Not downloaded: <path> is a link to another location"), a final component that is itself a link is a
+  per-file failure (never replaced), and at run time the canonical parent must lie inside the canonical root. Only
+  name-surrogate reparse points (symlinks, junctions) count; cloud-file placeholder folders are ordinary folders.
+- A batch upload refuses a local file that became a symlink after planning.
+- Upload conflict checks list only the planned key range (`StartAfter` below the smallest key, stop past the largest),
+  capped at 200,000 keys, with a `HeadObject` per planned file beyond that.
+- Local-name collisions fold case per character like NTFS (so `ΣΣ`, `σσ` and `σς` collide) and NFC-normalize on
+  macOS. Reserved names also include `CONIN$`, `CONOUT$` and `COM`/`LPT` followed by a superscript 1–3; trailing
+  spaces are trimmed from the stem before the check. Over-long names get a shortened temp name.
+- Queued transfer tasks are boxed so a 50,000-file batch does not hold 50,000 full-size futures.
+- Transfer-manager locks are never held across another lock; a stress test guards the ordering (a disconnect
+  deadlock was found this way).

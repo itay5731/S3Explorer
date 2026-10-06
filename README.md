@@ -2,7 +2,7 @@
 
 # S3 Explorer
 
-A fast desktop file manager for Amazon S3 and S3-compatible storage, with a proper editor for lifecycle rules and tags. One small native executable, no Electron, no subscription.
+A fast desktop file manager for Amazon S3 and S3-compatible storage, with whole-folder transfers, object versions, archive restores, and a proper editor for lifecycle rules and tags. One small native executable, no Electron, no subscription.
 
 ![A bucket open, with a copy and a download running in the Activity panel](docs/screenshots/explorer.png)
 
@@ -19,8 +19,11 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
 - **Download in parallel parts.** Large objects are split into byte ranges and fetched over several connections at once.
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
+- **Whole folders in and out.** Upload a folder (or drop one from your desktop) and download folders into a directory. You see how many files, how much data and what already exists before anything moves; existing files are skipped unless you choose Overwrite; file names are made safe for your disk and a transfer never writes outside the folder you chose.
 - **Delete, rename, copy and move** objects and folders, within a bucket or between buckets, from the right-click menu, the toolbar, the keyboard (`Delete`, `F2`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`) or by **dragging** them onto a folder, the path bar or a bucket (hold Ctrl to copy). Every delete, move or overwrite shows you the exact keys and how much is affected before it happens, unless you turn the copy/move confirmation off for the cases where nothing is in the way.
 - **Create folders.**
+- **Versions.** On a versioned bucket, see every version of an object, download one, restore one as the current version, remove a delete marker to bring an object back, or permanently delete a version behind its own confirmation.
+- **Restore archived objects** from Glacier and Deep Archive, one at a time or many as a background job, with the retrieval tier and how long the restored copy stays. Archived objects show their restore state, and actions that need the data are disabled until it is back.
 - **Tags** on objects and buckets: view, edit, and change them on many objects at once.
 - **Lifecycle rules** with the full S3 model: filters by prefix, tags and size; moves to colder storage; expiration; noncurrent-version actions; cleanup of incomplete uploads. Every rule is summarised in plain language and every rule that deletes data is marked before you save.
 - **Activity panel** for transfers and file operations: live speed, parts, time remaining, cancel, a list of anything that failed, and "show in folder".
@@ -31,18 +34,21 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Light, dark or system theme**, four accent colours, and size and text-weight sliders.
 - **Updates from inside the app.** Check for a new version, read its patch notes, install it. Only updates signed by this project are installed.
 
+![Uploading a folder: the preview, the destination, and what already exists](docs/screenshots/folders.png)
+
 ![Lifecycle rules, each summarised in plain language, with the ones that delete data marked](docs/screenshots/lifecycle.png)
 
 | | |
 |---|---|
 | ![Saving lifecycle rules: what changed, and every rule that deletes data in red](docs/screenshots/lifecycle-confirm.png) | ![Editing an object's tags](docs/screenshots/tags.png) |
+| ![Every version of an object, with a delete marker](docs/screenshots/versions.png) | ![Restoring an archived object](docs/screenshots/restore.png) |
 | ![Saved connections on the start screen](docs/screenshots/connections.png) | ![The explorer in the light theme](docs/screenshots/light.png) |
 
 ### What it does not do (yet)
 
-Creating or deleting buckets, browsing or restoring old versions, restoring archived objects, presigned URLs, permissions, sync, and uploading or downloading whole folders. It is scoped small on purpose.
+Creating or deleting buckets, presigned URLs, permissions, sync, turning versioning on or off, object lock, and dragging objects out of the app to the desktop. It is scoped small on purpose.
 
-## How move, rename, delete and lifecycle stay safe
+## How move, rename, delete, lifecycle and folder transfers stay safe
 
 S3 has no move or rename. The app copies, then deletes the original, and it is careful about the order:
 
@@ -60,6 +66,14 @@ Lifecycle rules are more dangerous than a delete, because S3 applies them on its
 - Before saving you see what was added, removed and changed, and every rule that deletes data in red, including rules with a past date, which delete every matching object at the next run.
 - A configuration that uses something this version doesn't understand is shown read-only rather than rewritten with a piece missing.
 - Tags set by AWS itself are kept, never edited or dropped.
+
+Folder transfers and versions got the same treatment:
+
+- A folder download writes only inside the directory you chose: every path segment is sanitized, two keys that would land on the same file fail the second one, and a path that crosses a symlink or junction is refused.
+- Nothing existing is replaced unless you chose Overwrite, and an Overwrite choice older than a minute is re-checked before it starts.
+- Permanently deleting a version always sends the exact version shown and refuses an empty id, so it can never turn into a delete of the current object.
+- Restoring a version copies that version onto the key; it never deletes anything.
+- Disconnecting while work runs asks whether to cancel it, and cancelling waits for every transfer to finish cleanly.
 
 ## How downloads are split
 
@@ -107,6 +121,11 @@ S3 Explorer only does what your credentials allow. It needs no permissions outsi
 | View and edit object tags | `GetObjectTagging`, `PutObjectTagging`, `DeleteObjectTagging` | `s3:GetObjectTagging`, `s3:PutObjectTagging`, `s3:DeleteObjectTagging` on the objects |
 | View and edit bucket tags | `GetBucketTagging`, `PutBucketTagging`, `DeleteBucketTagging` | `s3:GetBucketTagging`, `s3:PutBucketTagging` on the bucket |
 | View and edit lifecycle rules | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle`, `GetBucketVersioning` | `s3:GetLifecycleConfiguration`, `s3:PutLifecycleConfiguration`, `s3:GetBucketVersioning` on the bucket |
+| Upload or download a folder | The same calls as single uploads and downloads, plus `ListObjectsV2` to check what exists | Nothing beyond the rows above |
+| See and download versions | `ListObjectVersions`, `HeadObject` and `GetObject` with a version id | `s3:ListBucketVersions` on the bucket, `s3:GetObjectVersion` on the objects |
+| Restore a version as current | `CopyObject` (or multipart copy) from a version | `s3:GetObjectVersion` and `s3:PutObject` on the objects (plus the tagging permissions to carry tags) |
+| Permanently delete a version | `DeleteObject` with a version id | `s3:DeleteObjectVersion` on the objects |
+| Restore archived objects | `HeadObject`, `RestoreObject` | `s3:RestoreObject` on the objects |
 
 Two things that surprise people:
 
@@ -136,7 +155,8 @@ Replace `my-bucket` with your bucket name. Add more buckets by adding their ARNs
         "s3:PutBucketTagging",
         "s3:GetLifecycleConfiguration",
         "s3:PutLifecycleConfiguration",
-        "s3:GetBucketVersioning"
+        "s3:GetBucketVersioning",
+        "s3:ListBucketVersions"
       ],
       "Resource": "arn:aws:s3:::my-bucket"
     },
@@ -150,7 +170,10 @@ Replace `my-bucket` with your bucket name. Add more buckets by adding their ARNs
         "s3:AbortMultipartUpload",
         "s3:GetObjectTagging",
         "s3:PutObjectTagging",
-        "s3:DeleteObjectTagging"
+        "s3:DeleteObjectTagging",
+        "s3:GetObjectVersion",
+        "s3:DeleteObjectVersion",
+        "s3:RestoreObject"
       ],
       "Resource": "arn:aws:s3:::my-bucket/*"
     }
@@ -190,6 +213,8 @@ Browse and download, nothing else. Upload, new folder, delete, rename, copy, mov
 - **Tagged objects.** Copying keeps an object's tags, which needs `s3:GetObjectTagging` on the source and `s3:PutObjectTagging` on the destination. The tagging permissions are in the full policy above; drop them if you never use tags.
 - **Shared buckets.** The owner of a bucket in another account grants you access with a bucket policy on their side; you need nothing in your own account beyond the rows above. Lifecycle rules and bucket tags on someone else's bucket are usually not granted, and the app says so.
 - **Lifecycle rules** are a bucket-level setting with real consequences. Give `s3:PutLifecycleConfiguration` only to people who should be able to schedule deletion of the bucket's contents.
+- **Versioned buckets.** Seeing and restoring versions needs `s3:ListBucketVersions` and `s3:GetObjectVersion`. `s3:DeleteObjectVersion` is the one permission in this app that allows an unrecoverable action; leave it out if you only want versions to be a safety net.
+- **Archived objects.** Restoring needs `s3:RestoreObject`, and AWS bills each restore.
 - **KMS-encrypted buckets (SSE-KMS).** Downloads need `kms:Decrypt` and uploads and copies need `kms:GenerateDataKey` on the bucket's KMS key. S3 calls KMS on your behalf; the app itself does not.
 - **Versioned buckets.** Deleting adds a delete marker and older versions stay. The app never deletes specific versions, so it does not need `s3:DeleteObjectVersion`.
 - **Archived objects (Glacier, Deep Archive).** They can be listed but not downloaded or copied until restored. The app does not restore objects.
@@ -199,7 +224,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.4.1`:
+Honest status, as of `v0.5.0`:
 
 | | |
 |---|---|
@@ -209,7 +234,8 @@ Honest status, as of `v0.4.1`:
 | Independent AI code review of the delete, move and download code, with every finding fixed | yes |
 | Builds and packages in CI for Windows, macOS and Linux | yes |
 | Used against real AWS S3 by the author (browsing, transfers, and the v0.3.0 features) | yes |
-| Shared buckets, tags and lifecycle rules tested against real AWS S3 | **not yet** |
+| Shared buckets, tags, lifecycle rules, folder transfers and versions tested against real AWS S3 | **not yet** |
+| Restoring from Glacier tested against a server that supports it (the local test server does not) | **unit tests only** |
 | Lifecycle storage-class transitions tested against any server (the local test server refuses them) | **unit tests only** |
 | In-app update installed for real on any platform | **not yet** |
 | macOS and Linux builds actually run by a human | **not yet** |
@@ -249,6 +275,8 @@ cargo run --example smoke   # transfers, end to end against a local S3-compatibl
 cargo run --example jobs    # delete, copy and move, with before/after snapshots of the bucket
 cargo run --example tags    # tags and bulk tag jobs
 cargo run --example lifecycle  # lifecycle rules: round trips, conflicts, server refusals
+cargo run --example batches    # folder transfers: round trips, skip/overwrite, collisions, cancel
+cargo run --example versions   # versions and restores against a versioned bucket
 ```
 
 `npm run build` type-checks and bundles the frontend.

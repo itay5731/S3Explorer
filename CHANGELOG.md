@@ -5,6 +5,8 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-06
+
 Whole folders, and your files' history. This version moves folders in and out in one go, shows and restores object versions, brings archived objects back, and lets you stop running work when you disconnect.
 
 ### New
@@ -20,7 +22,13 @@ Whole folders, and your files' history. This version moves folders in and out in
 
 - Desktop notifications decide by the window's real focus, so a notification is not suppressed just because the page thought it was focused.
 - Deleting a saved connection also forgets the buckets you had added to it.
-- Queued files in a large folder transfer start in order without the queue slowing down as it grows.
+- Queued files in a large folder transfer start in order without the queue slowing down as it grows, and a 5,000-file transfer keeps the window responsive.
+
+### Fixed
+
+- A folder download could write through a shortcut, junction or symlink inside the destination folder, landing files somewhere else. Such paths are now refused per file.
+- Cancelling work on disconnect could freeze the whole app. A lock-ordering bug in the transfer manager is fixed and guarded by a stress test.
+- Uploading a folder to the top of a very large bucket no longer lists the entire bucket to check for conflicts.
 
 ### Good to know
 
