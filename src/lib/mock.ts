@@ -1584,6 +1584,8 @@ export const mockBackend: Backend = {
       contentType: o.contentType,
       metadata: { ...o.metadata },
       versionId: o.versionId,
+      restore: null,
+      archived: false,
     };
   },
 

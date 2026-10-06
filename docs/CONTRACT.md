@@ -854,3 +854,176 @@ every size inside the exe's icon resource, the installer's shortcut icon, and Wi
 `s3:GetObjectTagging`, `s3:PutObjectTagging`, `s3:DeleteObjectTagging` (object tags),
 `s3:GetLifecycleConfiguration`, `s3:PutLifecycleConfiguration` (lifecycle; `Put` also covers deletion),
 `s3:GetBucketVersioning`. Adding a shared bucket needs only `s3:ListBucket` on it.
+
+## v0.5.0 additions — folders, versions, archives
+
+Everything in this section is new in v0.5.0. Where it changes an earlier section, this section wins.
+Decisions taken by default (the user approved the plan without changing them): a folder download
+skips local files that already exist unless Overwrite is chosen in the confirmation; permanent
+deletion of a single object version is included, behind its own confirmation.
+
+### Folder transfers (batches)
+
+A folder upload or download is a **batch**: many transfers started together and shown as one entry.
+Each file inside is an ordinary transfer (same parts, resume, limits, cancel). The batch adds
+planning, a preview, one progress bar and one place for failures.
+
+```ts
+type BatchKind = "upload" | "download";
+type BatchStatus = "planning" | "queued" | "running" | "completed" | "failed" | "cancelled";
+
+interface BatchPlanRequest {
+  kind: BatchKind;
+  bucket: string;
+  prefix: string;              // upload: destination prefix ("" or ending in "/"); download: source prefix (ending in "/")
+  localPath: string;           // upload: the folder to walk; download: the directory to write into
+  onConflict: ConflictPolicy;  // "skip" | "overwrite": applies to files that already exist at the destination
+}
+
+interface BatchPreview {
+  files: number;               // files that would be transferred
+  bytes: number;
+  conflicts: number;           // destination files/objects that already exist
+  skippedUnreadable: number;   // upload only: local files that could not be read (listed in `notes`)
+  truncated: boolean;          // true when planning stopped at the limit; counts are lower bounds
+  notes: string[];             // human-readable, first 50 (unreadable paths, symlinks skipped, long paths)
+}
+
+interface Batch {
+  id: string;
+  kind: BatchKind;
+  bucket: string;
+  prefix: string;
+  localPath: string;
+  label: string;               // "Upload photos/ (1,204 files)" / "Download logs/ to D:\dl"
+  totalFiles: number;
+  doneFiles: number;
+  skippedFiles: number;
+  failedFiles: number;
+  totalBytes: number;
+  doneBytes: number;
+  bytesPerSec: number;
+  status: BatchStatus;
+  error: string | null;
+  errors: { path: string; message: string }[];   // first 50 per-file failures (path = key for download, local path for upload)
+  startedAt: string;
+  finishedAt: string | null;
+}
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `preview_batch` | `{ request: BatchPlanRequest }` | `BatchPreview` — walks the local folder (upload) or lists the prefix (download), checks what exists at the destination, changes nothing. |
+| `start_batch` | `{ request }` | `string` (batch id). Plans again (the preview may be stale), then feeds transfers to the normal transfer queue. |
+| `cancel_batch` | `{ id }` | `void` — cancels the batch's queued and running transfers; finished files stay. |
+| `remove_batch` | `{ id }` | `void` — `InvalidInput` while planning/queued/running. |
+| `list_batches` | – | `Batch[]` |
+
+Event `batch:progress`, payload `Batch`, throttled to 100 ms, always on status change; first event
+`planning`, last carries `finishedAt`. The per-file transfers still emit `transfer:progress` and
+carry a new optional field `batchId: string | null` so the UI can fold them under their batch.
+
+Semantics:
+
+- **Limits:** at most 50,000 files and 1 TiB per batch (`InvalidInput` beyond that, with the count);
+  planning stops at the limit with `truncated: true` in the preview so the UI can say so.
+- **Upload mapping:** local `folder/sub/file.txt` → key `prefix + "sub/file.txt"` with `/` separators;
+  empty sub-folders are not created as markers; symbolic links and reparse points are skipped and
+  noted; hidden/system files are included; the folder's own name is NOT prepended (the UI offers
+  `prefix + folderName + "/"` as the default destination, so the user sees the final prefix).
+- **Download mapping:** key `prefix + "a/b/c.txt"` → `localPath/a/b/c.txt`, every segment sanitized
+  with the same rule as single downloads (`\ / : * ? " < > |`, control chars, `.`/`..`, trailing
+  dots and spaces, reserved names); two keys that sanitize to the same local path are a per-file
+  failure for the second one, never a silent overwrite. The folder marker object is skipped.
+  A key segment that is empty (`a//b`) becomes `_`.
+- **Conflicts:** `skip` leaves the existing destination untouched and counts it in `skippedFiles`;
+  `overwrite` replaces it. Nothing is ever overwritten with `skip`; the single-file
+  `start_download` keeps its existing overwrite behavior.
+- **Transfers inside a batch** use the user's part size / parallel parts settings and the global
+  `maxConcurrentTransfers` limit; a batch does not get more slots than single transfers would.
+  Within a batch, files start in path order.
+- **Counters:** `doneFiles + skippedFiles + failedFiles == totalFiles` at the end unless cancelled;
+  status `completed` only when `failedFiles == 0`; `failed` when any file failed (the others are
+  still transferred); `cancelled` on cancel.
+- **Planning errors** (folder unreadable, prefix listing fails) fail the batch before any transfer.
+- The OS drop of a **directory** onto the window opens the upload-folder flow (preview + confirm)
+  instead of being rejected.
+
+### Object versions
+
+For buckets with versioning Enabled or Suspended.
+
+```ts
+interface ObjectVersion {
+  versionId: string;           // "null" is a legitimate id for objects written before versioning
+  isLatest: boolean;
+  isDeleteMarker: boolean;
+  size: number;                // 0 for delete markers
+  lastModified: string | null;
+  etag: string | null;
+  storageClass: string | null;
+}
+interface VersionListing { versions: ObjectVersion[]; truncated: boolean }   // newest first, at most 1,000
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_object_versions` | `{ bucket, key }` | `VersionListing` — `ListObjectVersions` with `prefix = key`, filtered to exact key matches, newest first. On a bucket that never had versioning: one entry with `versionId: "null"`. |
+| `download_object_version` | `{ bucket, key, versionId, destPath }` | `string` (transfer id) — the normal parallel download with `versionId` on every request; `If-Match` still applies. |
+| `restore_object_version` | `{ bucket, key, versionId }` | `ObjectEntry` (the new current version) — `CopyObject` of that version onto the same key (`x-amz-copy-source` with `?versionId=`), preserving metadata, content type, storage class and tags of that version. Objects over 5 GiB use multipart copy. `InvalidInput` if the version is a delete marker or already the latest. |
+| `delete_object_version` | `{ bucket, key, versionId }` | `void` — **permanent**: `DeleteObject` with `versionId`. Also how a delete marker is removed (which "undeletes" the object). Requires `s3:DeleteObjectVersion`. |
+
+- Restoring is non-destructive: the old current version becomes a noncurrent version.
+- The UI shows versions only when the bucket's versioning state is Enabled or Suspended (already
+  fetched for lifecycle); it offers "Permanently delete this version" only behind a confirmation
+  that says it cannot be undone and names the version id and date. Deleting the current version of
+  a plain object stays a normal delete.
+
+### Restoring archived objects
+
+Objects in `GLACIER`, `DEEP_ARCHIVE` (and `INTELLIGENT_TIERING`'s archive tiers) cannot be read until
+restored. `ObjectMeta` gains:
+
+```ts
+restore: { inProgress: boolean; expiresAt: string | null } | null;   // from the x-amz-restore header; null when not applicable
+archived: boolean;                                                  // true when a restore is required to read the object
+```
+
+```ts
+type RestoreTier = "Bulk" | "Standard" | "Expedited";
+interface RestoreRequest { tier: RestoreTier; days: number }        // days 1..=365: how long the restored copy stays readable
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `restore_object` | `{ bucket, key, request }` | `void` — `RestoreObject`. Already in progress → `Conflict` ("already being restored"). Not archived → `InvalidInput`. `Expedited` on `DEEP_ARCHIVE` → `InvalidInput` (S3 does not offer it). |
+
+Bulk restore is a job: `JobKind` gains `"restore"` and `JobRequest` gains `restore?: RestoreRequest`
+(required for that kind, rejected for others; `destBucket` and every `to` null). Per object:
+`HeadObject` to decide (not archived → skipped, in progress → skipped with a note), then
+`RestoreObject`; failures per object. Counters and events as for other jobs.
+
+- The UI shows restore status in the details panel, offers Restore on archived selections with the
+  tier, the days, a plain note on cost and typical waiting time per tier (Expedited minutes, Standard
+  hours, Bulk up to a day or more for Deep Archive), and disables download/copy/move for archived
+  objects that are not restored, with the reason.
+
+### Disconnect stops work
+
+`disconnect` gains an argument: `{ cancelActive: boolean }`. With `true`, every queued or running
+transfer, batch and job is cancelled before the connection is dropped (cooperative; the final
+events are emitted). With `false` (today's behavior) they finish in the background. The frontend
+asks when anything is active: "N operations are still running." with **Cancel them and disconnect**,
+**Let them finish**, and **Stay connected**.
+
+### Smaller changes
+
+- `notifyOnFinish` uses the OS window focus (`isFocused()`), not the document's.
+- `delete_saved_connection` also removes that connection's added buckets.
+- `Transfer.batchId` (see above).
+
+### IAM permissions added in this version
+
+`s3:ListBucketVersions` (list versions), `s3:GetObjectVersion` (download or restore a version;
+`CopyObject` of a version reads it), `s3:DeleteObjectVersion` (permanent delete), `s3:RestoreObject`
+(restore archived objects). Folder transfers need nothing beyond single transfers.

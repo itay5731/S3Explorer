@@ -258,6 +258,7 @@ const PERMISSION_ACTION: Record<JobRequest["kind"], string> = {
   copy: "copy files",
   move: "move files",
   tag: "change tags",
+  restore: "restore archived files",
 };
 
 /** Start a confirmed job. Returns the job id, or null after showing the error. */

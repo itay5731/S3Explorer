@@ -46,6 +46,10 @@ export interface ObjectMeta extends ObjectEntry {
   contentType: string | null;
   metadata: Record<string, string>;
   versionId: string | null;
+  /** v0.5.0: restore state from x-amz-restore; null when not applicable. */
+  restore: { inProgress: boolean; expiresAt: string | null } | null;
+  /** v0.5.0: true when the object must be restored before it can be read. */
+  archived: boolean;
 }
 
 export type TransferKind = "download" | "upload";
@@ -54,6 +58,8 @@ export type TransferStatus = "queued" | "running" | "completed" | "failed" | "ca
 export interface Transfer {
   id: string;
   kind: TransferKind;
+  /** v0.5.0: set when the transfer belongs to a folder batch. */
+  batchId?: string | null;
   bucket: string;
   key: string;
   localPath: string;
@@ -172,7 +178,7 @@ export const SAVED_CONNECTION_NAME_MAX = 64;
 
 // Object operations (jobs)
 
-export type JobKind = "delete" | "copy" | "move" | "tag";
+export type JobKind = "delete" | "copy" | "move" | "tag" | "restore";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type ConflictPolicy = "overwrite" | "skip";
 
@@ -190,6 +196,8 @@ export interface JobRequest {
   onConflict: ConflictPolicy;
   /** Required when kind is "tag"; must be absent otherwise. */
   tags?: TagOperation;
+  /** Required when kind is "restore"; must be absent otherwise. */
+  restore?: RestoreRequest;
 }
 
 export interface JobPreview {
@@ -328,3 +336,70 @@ export const LIFECYCLE_LIMITS = {
 } as const;
 
 export type BucketVersioning = "Enabled" | "Suspended" | "Off";
+
+// ---- v0.5.0: folders, versions, archives (see "v0.5.0 additions" in docs/CONTRACT.md) ----
+
+// Folder transfers (batches)
+export type BatchKind = "upload" | "download";
+export type BatchStatus = "planning" | "queued" | "running" | "completed" | "failed" | "cancelled";
+
+export interface BatchPlanRequest {
+  kind: BatchKind;
+  bucket: string;
+  prefix: string;
+  localPath: string;
+  onConflict: ConflictPolicy;
+}
+
+export interface BatchPreview {
+  files: number;
+  bytes: number;
+  conflicts: number;
+  skippedUnreadable: number;
+  truncated: boolean;
+  notes: string[];
+}
+
+export interface Batch {
+  id: string;
+  kind: BatchKind;
+  bucket: string;
+  prefix: string;
+  localPath: string;
+  label: string;
+  totalFiles: number;
+  doneFiles: number;
+  skippedFiles: number;
+  failedFiles: number;
+  totalBytes: number;
+  doneBytes: number;
+  bytesPerSec: number;
+  status: BatchStatus;
+  error: string | null;
+  errors: { path: string; message: string }[];
+  startedAt: string;
+  finishedAt: string | null;
+}
+
+export const BATCH_PROGRESS_EVENT = "batch:progress";
+export const BATCH_LIMITS = { maxFiles: 50_000, maxBytes: 1024 ** 4 } as const;
+
+// Object versions
+export interface ObjectVersion {
+  versionId: string;
+  isLatest: boolean;
+  isDeleteMarker: boolean;
+  size: number;
+  lastModified: string | null;
+  etag: string | null;
+  storageClass: string | null;
+}
+
+export interface VersionListing { versions: ObjectVersion[]; truncated: boolean }
+
+// Archived objects
+export type RestoreTier = "Bulk" | "Standard" | "Expedited";
+export interface RestoreRequest { tier: RestoreTier; days: number }
+export const RESTORE_DAYS = { min: 1, max: 365, default: 7 } as const;
+/** Storage classes whose objects need a restore before they can be read. */
+export const ARCHIVE_STORAGE_CLASSES = ["GLACIER", "DEEP_ARCHIVE"] as const;

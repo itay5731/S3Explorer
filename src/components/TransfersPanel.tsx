@@ -17,6 +17,7 @@ import {
   Clock,
   Ban,
   Tags,
+  ArchiveRestore,
 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
@@ -139,8 +140,8 @@ const TransferRow = memo(function TransferRow({ id }: { id: string }) {
   );
 });
 
-const JOB_ICON: Record<JobKind, typeof Copy> = { delete: Trash2, copy: Copy, move: FolderInput, tag: Tags };
-const JOB_KIND_LABEL: Record<JobKind, string> = { delete: "Delete", copy: "Copy", move: "Move", tag: "Tag" };
+const JOB_ICON: Record<JobKind, typeof Copy> = { delete: Trash2, copy: Copy, move: FolderInput, tag: Tags, restore: ArchiveRestore };
+const JOB_KIND_LABEL: Record<JobKind, string> = { delete: "Delete", copy: "Copy", move: "Move", tag: "Tag", restore: "Restore" };
 
 async function cancelJob(id: string) {
   try {
