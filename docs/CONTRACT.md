@@ -256,8 +256,8 @@ interface AppSettings {
 notifyOnFinish: boolean;   // default true
 ```
 
-- `update_settings` requires all six fields and rejects a non-boolean `notifyOnFinish` with
-  `InvalidInput`. A `settings.json` without the field loads with it at its default.
+- `update_settings` requires every field of `AppSettings` (see the current list in `src/lib/types.ts`) and
+  rejects a non-boolean `notifyOnFinish` with `InvalidInput`. A `settings.json` without the field loads with it at its default.
 - With `notifyOnFinish` true the frontend shows an OS notification when a background job finishes
   and when the last active transfer finishes, but only while the app window is not focused. In-app
   toasts are unchanged.
@@ -274,7 +274,7 @@ textSize: number;     // percent, integer 80 to 150, default 100
 textWeight: number;   // font weight of ordinary text, integer 300 to 600, default 400
 ```
 
-- `update_settings` requires all eight fields and rejects a non-integer or out-of-range value with
+- `update_settings` requires every field of `AppSettings` and rejects a non-integer or out-of-range value with
   `InvalidInput` naming the field. A `settings.json` without the fields, or with a bad value in
   one of them, loads that field at its default.
 - **Size** scales the whole interface, not only the letters: the frontend sets the webview's zoom to
@@ -293,9 +293,10 @@ type AccentColor = "yellow" | "green" | "blue" | "red";
 accent: AccentColor;   // default "yellow"
 ```
 
-- `update_settings` requires all nine fields and rejects an unknown `accent` with `InvalidInput`.
+- `update_settings` requires every field of `AppSettings` and rejects an unknown `accent` with `InvalidInput`.
   A `settings.json` without the field, or with an unknown value, loads it as `"yellow"`.
-- The frontend applies it by setting `data-accent` on `<html>` (no attribute for yellow). Buttons,
+- The frontend applies it by setting `data-accent` on `<html>` (always set once settings are loaded; the
+  pre-paint script in `public/theme-init.js` sets it only for green, blue and red, since yellow is the CSS default). Buttons,
   selection, focus rings, the start screen's pulses and the logo inside the app follow it; the app
   icon in the taskbar does not.
 - It previews live in the Settings dialog like the theme, and is mirrored in `localStorage` so the
@@ -601,3 +602,204 @@ interface UpdateProgress { phase: UpdatePhase; downloadedBytes: number; totalByt
 
 Sizes and speeds are computed in binary units and must be labelled that way: `KiB`, `MiB`, `GiB`,
 `MiB/s`.
+
+### Window title (added after v0.3.0)
+
+The frontend sets the window title to the connection label while connected and "S3 Explorer" otherwise,
+through `getCurrentWindow().setTitle()` (capability `core:window:allow-set-title`). No command.
+
+**`AppSettings` as of the redesign** (every field required by `update_settings`; a missing or invalid field
+in `settings.json` loads at its default): `partSizeMib`, `maxConcurrentParts`, `maxConcurrentTransfers`,
+`theme`, `checkUpdatesOnStartup`, `notifyOnFinish`, `textSize`, `textWeight`, `accent`. v0.4.0 adds
+`confirmCopyMove` below.
+
+## v0.4.0 additions — the buckets update
+
+Everything in this section is new in v0.4.0. Where it changes an earlier section, this section wins.
+New `ErrorCode` values: `"Conflict"` (the server-side state changed since it was read) and
+`"NotSupported"` (the server does not implement this S3 feature; MinIO, R2, SeaweedFS and others
+implement lifecycle and tagging only partly).
+
+### Shared buckets (buckets added by name)
+
+A bucket shared from another AWS account (or another account on an S3-compatible service with the
+same sharing model) does not appear in `ListBuckets`. The user adds it by name and the app remembers
+it for that connection.
+
+```ts
+interface AddedBucket {
+  name: string;
+  region: string | null;        // discovered with HeadBucket; null when the endpoint is custom
+  addedAt: string;              // ISO-8601
+}
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_added_buckets` | – | `AddedBucket[]` for the current connection, sorted by name. |
+| `add_bucket` | `{ input }` | `AddedBucket`. `input` may be a bare bucket name, an `s3://name/...` URI (the path is ignored), or a bucket ARN `arn:aws:s3:::name`; access point ARNs and aliases are accepted as-is as the bucket value. Verifies with `HeadBucket` (resolving and caching the region, as browsing already does) and then one `ListObjectsV2` with `max-keys=1`. Not found → `NoSuchBucket`; no permission → `AccessDenied` with a message saying the bucket exists but these credentials cannot list it; both leave nothing stored. Already added → returns the existing entry. |
+| `remove_added_bucket` | `{ name }` | `void`. Forgets the bucket locally. **Never touches the bucket or its contents.** Unknown name is a no-op. |
+
+- **Storage:** `added-buckets.json` in the app config directory (atomic writes, lenient load), keyed by
+  connection identity: a saved connection's id; otherwise `profile:<name>@<endpoint or aws>` or
+  `static:<accessKeyId>@<endpoint or aws>`. A connection with no entry has an empty list.
+- Added buckets behave like listed buckets everywhere (browse, transfers, jobs, tags, lifecycle). The
+  UI shows them in their own sidebar group ("Shared with me") with a remove action, and `list_buckets`
+  results that happen to include an added bucket show it once, in the normal list.
+- Bucket-level features (lifecycle, bucket tags) on a shared bucket are usually denied: the UI shows
+  "You don't have permission for this on this bucket" rather than a generic error, and never retries
+  in a loop.
+
+### Tags (buckets and objects)
+
+```ts
+interface Tag { key: string; value: string }
+```
+
+Limits, enforced by the backend (`InvalidInput` naming the problem) and mirrored live in the UI:
+a bucket holds at most 50 tags, an object at most 10; `key` 1..=128 and `value` 0..=256 Unicode
+characters; keys unique and case-sensitive; keys may not start with `aws:` (reserved). Allowed
+characters are letters, numbers, spaces and `+ - = . _ : / @`.
+
+| Command | Args | Returns |
+|---|---|---|
+| `get_bucket_tags` | `{ bucket }` | `Tag[]` — `[]` when the bucket has no tag set. |
+| `put_bucket_tags` | `{ bucket, tags, expected }` | `Tag[]` (the stored set). **Replaces the whole set.** `expected` is the set the UI loaded; if the bucket's current tags differ from it the command fails with `Conflict` and changes nothing (the message includes nothing sensitive; the UI reloads and shows the current set). An empty `tags` deletes the tag set (`DeleteBucketTagging`). |
+| `get_object_tags` | `{ bucket, key }` | `Tag[]` |
+| `put_object_tags` | `{ bucket, key, tags, expected }` | `Tag[]` — same replace / `expected` / empty-deletes semantics for one object. |
+
+**Bulk tag editing** is a job (see "Object operations"): `JobKind` gains `"tag"`, and `JobRequest`
+gains an optional `tags` field that is required for that kind and rejected for the others:
+
+```ts
+type JobKind = "delete" | "copy" | "move" | "tag";
+interface TagOperation {
+  mode: "merge" | "replace";
+  set: Tag[];        // keys to add or update (replace: the complete new set)
+  remove: string[];  // merge only: keys to remove
+}
+// JobRequest: { kind: "tag", srcBucket, destBucket: null, items, onConflict: "skip" (ignored), tags: TagOperation }
+```
+
+- `merge` reads each object's tags, applies `set` and `remove`, and writes the result; an object whose
+  result would exceed 10 tags is a per-object failure ("would have N tags; the limit is 10") and is left
+  unchanged. `replace` writes `set` as the complete tag set of every object (an empty `set` removes all tags).
+- Per object: `GetObjectTagging` (merge only) then `PutObjectTagging` (or `DeleteObjectTagging` when
+  the result is empty). Counters, phases, cancel and errors as for other jobs; `doneBytes`/`totalBytes`
+  stay 0. Up to 16 objects in flight.
+- `preview_job` for `kind: "tag"` counts objects and bytes as usual; `conflicts` is 0.
+- Objects with tags show them in the details panel (read on selection with `get_object_tags`).
+
+### Lifecycle configuration
+
+The full S3 lifecycle rule model, edited as a whole. S3 stores lifecycle as one document:
+`PutBucketLifecycleConfiguration` **replaces every rule**. The app therefore always loads the full
+configuration, edits it, and writes the full result back, and it refuses to write over a configuration
+that changed since it was loaded.
+
+```ts
+type RuleStatus = "Enabled" | "Disabled";
+type TransitionStorageClass =
+  | "STANDARD_IA" | "ONEZONE_IA" | "INTELLIGENT_TIERING" | "GLACIER_IR" | "GLACIER" | "DEEP_ARCHIVE";
+
+interface LifecycleFilter {
+  prefix: string | null;                 // null = no prefix condition
+  tags: Tag[];                           // all must match
+  objectSizeGreaterThan: number | null;  // bytes
+  objectSizeLessThan: number | null;     // bytes
+}
+// An empty filter (null, [], null, null) applies the rule to the whole bucket.
+// Serialization to S3: one condition → Prefix / Tag / ObjectSizeGreaterThan / ObjectSizeLessThan directly;
+// several → And { Prefix, Tags, ObjectSizeGreaterThan, ObjectSizeLessThan }; none → Filter {} .
+// A legacy rule with a top-level Prefix (no Filter) is read as filter.prefix and written back as a Filter.
+
+interface Transition { days: number | null; date: string | null; storageClass: TransitionStorageClass }
+interface Expiration { days: number | null; date: string | null; expiredObjectDeleteMarker: boolean }
+interface NoncurrentTransition { noncurrentDays: number; newerNoncurrentVersions: number | null; storageClass: TransitionStorageClass }
+interface NoncurrentExpiration { noncurrentDays: number; newerNoncurrentVersions: number | null }
+
+interface LifecycleRule {
+  id: string;                                   // 1..=255 chars, unique within the configuration
+  status: RuleStatus;
+  filter: LifecycleFilter;
+  transitions: Transition[];
+  expiration: Expiration | null;
+  noncurrentVersionTransitions: NoncurrentTransition[];
+  noncurrentVersionExpiration: NoncurrentExpiration | null;
+  abortIncompleteMultipartUpload: { daysAfterInitiation: number } | null;
+}
+
+interface LifecycleConfiguration { rules: LifecycleRule[] }   // at most 1,000 rules
+
+interface LifecycleIssue { ruleIndex: number | null; field: string | null; message: string }
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `get_lifecycle` | `{ bucket }` | `LifecycleConfiguration \| null` — `null` when the bucket has no configuration. A server that does not implement lifecycle → `NotSupported`. |
+| `validate_lifecycle` | `{ config }` | `LifecycleIssue[]` — pure, local, no network; `[]` means valid. The UI calls it live while editing (debounced) and the backend runs the same function before writing. |
+| `put_lifecycle` | `{ bucket, config, expected }` | `LifecycleConfiguration \| null` (what is now stored). Validates (any issue → `InvalidInput` with the issues in the message, nothing written). Re-reads the current configuration and compares it with `expected` (the one the UI loaded, or `null`); a difference → `Conflict`, nothing written. `config.rules` empty → `DeleteBucketLifecycle`. |
+| `get_bucket_versioning` | `{ bucket }` | `"Enabled" \| "Suspended" \| "Off"` — shown in the editor because noncurrent-version actions only matter with versioning. |
+
+**Validation rules (`validate_lifecycle`, every one unit-tested):** 1..=1,000 rules; ids 1..=255,
+unique; every rule has at least one action; per action exactly one of `days` / `date` (`days` ≥ 1,
+integer; `date` an ISO-8601 date at midnight UTC); transitions within a rule have distinct storage
+classes and move only "colder" (STANDARD_IA / ONEZONE_IA / INTELLIGENT_TIERING → GLACIER_IR → GLACIER →
+DEEP_ARCHIVE, never back); a transition to STANDARD_IA, ONEZONE_IA or INTELLIGENT_TIERING needs
+`days` ≥ 30; a transition to GLACIER_IR/GLACIER/DEEP_ARCHIVE after one of those must be at least 30 days
+later; expiration must come after every transition (days greater, or date later); `expiredObjectDeleteMarker`
+cannot be combined with `days`/`date` in the same expiration, and (like `abortIncompleteMultipartUpload`)
+cannot be used in a rule whose filter has tags or object-size conditions; `objectSizeGreaterThan` <
+`objectSizeLessThan` when both set; filter tags follow the tag limits; a rule with no filter conditions is
+allowed (whole bucket) and the editor must say so in words. Noncurrent `noncurrentDays` ≥ 1 and
+`newerNoncurrentVersions` 1..=100. Days and sizes are integers.
+
+**UI requirements (the hard part):** rules listed with a one-line plain-language summary each
+("Objects under logs/ with tag env=prod move to Glacier after 90 days and are deleted after 365 days");
+a rule editor form covering every field above with inline validation from `validate_lifecycle`; enable/
+disable, duplicate, delete and reorder rules; the bucket's versioning state shown, with noncurrent actions
+explained; a read-only "as JSON" view of the whole configuration; and before saving, a confirmation that
+lists what changed (rules added, removed, changed) and, in red, every rule that **deletes data** (any
+expiration or noncurrent expiration), because a lifecycle rule can delete a whole bucket's contents
+silently a day later. Saving when nothing changed is a no-op. A `Conflict` reloads the configuration and
+tells the user someone else changed it.
+
+### Confirmations for copy and move (setting)
+
+`AppSettings` gains `confirmCopyMove: boolean` (default `true`); `update_settings` requires it like the
+other fields and a `settings.json` without it loads `true`.
+
+- `true`: paste (and drag-and-drop) shows the Copy/Move confirmation as today.
+- `false`: when the preview finds **no conflicts**, the copy or move starts immediately after the preview
+  and a toast says what started; when the preview finds conflicts, the dialog is shown exactly as today,
+  because choosing Skip or Overwrite can never be skipped. Previews and validation still run every time.
+- **The delete confirmation is never affected by any setting.**
+
+### Drag and drop to move or copy (frontend only)
+
+Rows (objects and folders, the whole current selection, or the dragged row if it is not selected) can
+be dragged and dropped onto: a folder row in the table, a segment of the path bar (move to that parent),
+or a bucket in the sidebar (move to that bucket's root, including added buckets). A drop builds the same
+`JobRequest` as paste (`to = targetPrefix + name`, folders with a trailing `/`), runs `preview_job`, and
+follows the confirmation setting above. **Holding Ctrl (Option on macOS) copies instead of moving**, and the
+mode is shown while dragging: a badge following the pointer reads "Move N items" / "Copy N items" with a
+distinct icon, the drop effect/cursor changes, and it updates live as the key is pressed or released.
+Dropping onto the current folder, onto one of the dragged items, or into a descendant of a dragged folder
+is refused with a message (the backend rejects these too). A drag starts only after a small pointer
+movement; Esc cancels. This is internal HTML5/pointer dragging and must not break the existing OS file
+drop (upload); verify on the real executable, where Tauri's native drag-drop handling can swallow HTML5
+drop events on Windows.
+
+### Taskbar / Start menu icon (bug)
+
+Reported after v0.3.0 on an installed copy launched like a user: the window shows the app icon but the
+taskbar and Start menu show the default Tauri icon. The redesign has since replaced the icon again
+(white bucket on a yellow tile). Fix for v0.4.0 and verify on the installed release artifact, checking
+every size inside the exe's icon resource, the installer's shortcut icon, and Windows' icon cache.
+
+### IAM permissions added in this version
+
+`s3:GetBucketTagging`, `s3:PutBucketTagging` (bucket tags; `PutBucketTagging` also covers deletion),
+`s3:GetObjectTagging`, `s3:PutObjectTagging`, `s3:DeleteObjectTagging` (object tags),
+`s3:GetLifecycleConfiguration`, `s3:PutLifecycleConfiguration` (lifecycle; `Put` also covers deletion),
+`s3:GetBucketVersioning`. Adding a shared bucket needs only `s3:ListBucket` on it.

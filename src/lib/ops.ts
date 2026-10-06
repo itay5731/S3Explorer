@@ -55,6 +55,7 @@ export const KIND_VERB: Record<JobKind, { present: string; past: string; noun: s
   delete: { present: "Delete", past: "Deleted", noun: "deletion" },
   copy: { present: "Copy", past: "Copied", noun: "copy" },
   move: { present: "Move", past: "Moved", noun: "move" },
+  tag: { present: "Tag", past: "Tagged", noun: "tag edit" },
 };
 
 export const isJobActive = (j: Job) => j.status === "queued" || j.status === "running";

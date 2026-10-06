@@ -2,7 +2,7 @@
 
 export type ErrorCode =
   | "NotConnected" | "Auth" | "NoSuchBucket" | "NoSuchKey" | "AccessDenied"
-  | "Network" | "Io" | "Cancelled" | "InvalidInput" | "Keychain" | "Unknown";
+  | "Network" | "Io" | "Cancelled" | "InvalidInput" | "Keychain" | "Conflict" | "NotSupported" | "Unknown";
 
 export interface AppError { code: ErrorCode; message: string }
 
@@ -169,7 +169,7 @@ export const SAVED_CONNECTION_NAME_MAX = 64;
 
 // Object operations (jobs)
 
-export type JobKind = "delete" | "copy" | "move";
+export type JobKind = "delete" | "copy" | "move" | "tag";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 export type ConflictPolicy = "overwrite" | "skip";
 
@@ -185,6 +185,8 @@ export interface JobRequest {
   destBucket: string | null;
   items: JobItem[];
   onConflict: ConflictPolicy;
+  /** Required when kind is "tag"; must be absent otherwise. */
+  tags?: TagOperation;
 }
 
 export interface JobPreview {
@@ -238,3 +240,85 @@ export const UPDATE_PROGRESS_EVENT = "update:progress";
 
 /** Downloads buffer at most this much per in-flight part; larger parts are streamed to disk. */
 export const DOWNLOAD_BUFFER_CAP_MIB = 16;
+
+// ---- v0.4.0: the buckets update (see "v0.4.0 additions" in docs/CONTRACT.md) ----
+
+// Shared buckets added by name
+export interface AddedBucket {
+  name: string;
+  region: string | null;
+  addedAt: string;
+}
+
+// Tags
+export interface Tag { key: string; value: string }
+
+export const TAG_LIMITS = {
+  bucketMaxTags: 50,
+  objectMaxTags: 10,
+  keyMaxChars: 128,
+  valueMaxChars: 256,
+  reservedKeyPrefix: "aws:",
+  /** Letters, numbers, spaces and + - = . _ : / @ */
+  allowedChars: /^[\p{L}\p{N} +\-=._:/@]*$/u,
+} as const;
+
+export interface TagOperation {
+  mode: "merge" | "replace";
+  set: Tag[];
+  remove: string[];
+}
+
+// Lifecycle
+export type RuleStatus = "Enabled" | "Disabled";
+export type TransitionStorageClass =
+  | "STANDARD_IA" | "ONEZONE_IA" | "INTELLIGENT_TIERING" | "GLACIER_IR" | "GLACIER" | "DEEP_ARCHIVE";
+
+/** Coldness order for transition validation: a later class is colder. Same-rank classes may not follow each other. */
+export const STORAGE_CLASS_RANK: Record<TransitionStorageClass, number> = {
+  STANDARD_IA: 1,
+  ONEZONE_IA: 1,
+  INTELLIGENT_TIERING: 1,
+  GLACIER_IR: 2,
+  GLACIER: 3,
+  DEEP_ARCHIVE: 4,
+};
+
+export interface LifecycleFilter {
+  prefix: string | null;
+  tags: Tag[];
+  objectSizeGreaterThan: number | null;
+  objectSizeLessThan: number | null;
+}
+
+export interface Transition { days: number | null; date: string | null; storageClass: TransitionStorageClass }
+export interface Expiration { days: number | null; date: string | null; expiredObjectDeleteMarker: boolean }
+export interface NoncurrentTransition { noncurrentDays: number; newerNoncurrentVersions: number | null; storageClass: TransitionStorageClass }
+export interface NoncurrentExpiration { noncurrentDays: number; newerNoncurrentVersions: number | null }
+
+export interface LifecycleRule {
+  id: string;
+  status: RuleStatus;
+  filter: LifecycleFilter;
+  transitions: Transition[];
+  expiration: Expiration | null;
+  noncurrentVersionTransitions: NoncurrentTransition[];
+  noncurrentVersionExpiration: NoncurrentExpiration | null;
+  abortIncompleteMultipartUpload: { daysAfterInitiation: number } | null;
+}
+
+export interface LifecycleConfiguration { rules: LifecycleRule[] }
+
+export interface LifecycleIssue { ruleIndex: number | null; field: string | null; message: string }
+
+export const LIFECYCLE_LIMITS = {
+  maxRules: 1000,
+  ruleIdMaxChars: 255,
+  /** Minimum days before a transition to STANDARD_IA / ONEZONE_IA / INTELLIGENT_TIERING. */
+  minDaysToInfrequentAccess: 30,
+  /** Minimum gap in days between an infrequent-access transition and a later archive transition. */
+  minDaysBetweenTiers: 30,
+  newerNoncurrentVersions: { min: 1, max: 100 },
+} as const;
+
+export type BucketVersioning = "Enabled" | "Suspended" | "Off";

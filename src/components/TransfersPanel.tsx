@@ -16,6 +16,7 @@ import {
   XCircle,
   Clock,
   Ban,
+  Tags,
 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
@@ -138,8 +139,8 @@ const TransferRow = memo(function TransferRow({ id }: { id: string }) {
   );
 });
 
-const JOB_ICON: Record<JobKind, typeof Copy> = { delete: Trash2, copy: Copy, move: FolderInput };
-const JOB_KIND_LABEL: Record<JobKind, string> = { delete: "Delete", copy: "Copy", move: "Move" };
+const JOB_ICON: Record<JobKind, typeof Copy> = { delete: Trash2, copy: Copy, move: FolderInput, tag: Tags };
+const JOB_KIND_LABEL: Record<JobKind, string> = { delete: "Delete", copy: "Copy", move: "Move", tag: "Tag" };
 
 async function cancelJob(id: string) {
   try {
