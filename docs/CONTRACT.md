@@ -767,6 +767,31 @@ expiration or noncurrent expiration), because a lifecycle rule can delete a whol
 silently a day later. Saving when nothing changed is a no-op. A `Conflict` reloads the configuration and
 tells the user someone else changed it.
 
+**Lifecycle details settled during implementation:**
+
+- `LifecycleIssue.field` values: `id`, `status`, `filter.prefix`, `filter.tags`, `filter.tags[i].key`,
+  `filter.objectSizeGreaterThan`, `filter.objectSizeLessThan`, `transitions[i].days`, `transitions[i].date`,
+  `transitions[i].storageClass`, `expiration.days`, `expiration.date`, `expiration.expiredObjectDeleteMarker`,
+  `noncurrentVersionTransitions[i].noncurrentDays`, `noncurrentVersionTransitions[i].newerNoncurrentVersions`,
+  `noncurrentVersionTransitions[i].storageClass`, `noncurrentVersionExpiration.noncurrentDays`,
+  `noncurrentVersionExpiration.newerNoncurrentVersions`, `abortIncompleteMultipartUpload.daysAfterInitiation`.
+  A rule-level issue ("this rule does nothing") has `ruleIndex` set and `field` null; a duplicate id is reported
+  on the later rule with `field` null; the rule-count issue has both null. Tag value problems are reported on
+  `filter.tags[i].key`.
+- Extra validation beyond the list above: a filter prefix is at most 1,024 bytes; a filter has at most 10 tags
+  (an object never has more); `objectSizeGreaterThan` ≥ 0 and `objectSizeLessThan` ≥ 1; noncurrent transitions
+  have distinct classes and get colder over time, and a noncurrent expiration comes after all of them.
+- `prefix: ""` can come back from the server (legacy rules) and means the whole bucket; it is kept as-is and
+  compares equal to `null`. `expiredObjectDeleteMarker: false` is written as absent.
+- `put_lifecycle` passes the server's `TransitionDefaultMinimumObjectSize` back unchanged, writes nothing when
+  the result equals what is stored, and after writing reads back: if the server stored something different it
+  restores the previous configuration and returns `NotSupported` naming what was dropped (the UI must reload).
+  A configuration containing a storage class, status or shape this version does not understand is refused
+  (`Unknown`, message says so) and can neither be shown nor written, so nothing is ever dropped.
+- Dates are returned as `YYYY-MM-DDT00:00:00Z`; `YYYY-MM-DD` is accepted as input.
+- The frontend sends `expected` = the configuration it loaded (or the server snapshot re-read after a
+  `Conflict`), order-sensitive.
+
 ### Confirmations for copy and move (setting)
 
 `AppSettings` gains `confirmCopyMove: boolean` (default `true`); `update_settings` requires it like the
