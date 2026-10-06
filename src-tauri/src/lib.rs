@@ -21,6 +21,7 @@ pub mod tags;
 pub(crate) mod testutil;
 pub mod transfers;
 pub mod updates;
+mod windows_shell;
 
 use std::sync::Arc;
 
@@ -56,6 +57,9 @@ impl JobSink for TauriJobSink {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let context = tauri::generate_context!();
+    // Before any window exists, so the taskbar ties every window to the installed shortcuts.
+    windows_shell::set_app_user_model_id(&context.config().identifier);
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -63,6 +67,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // The config windows exist by now; give them the taskbar icon of this executable.
+            windows_shell::set_taskbar_icons(app);
             let sink: Arc<dyn ProgressSink> = Arc::new(TauriSink(app.handle().clone()));
             let job_sink: Arc<dyn JobSink> = Arc::new(TauriJobSink(app.handle().clone()));
             // Never fail startup over settings or saved connections: no config dir means in-memory.
@@ -126,6 +132,6 @@ pub fn run() {
             commands::lifecycle::put_lifecycle,
             commands::lifecycle::get_bucket_versioning,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }
