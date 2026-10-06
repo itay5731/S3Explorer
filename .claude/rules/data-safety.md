@@ -33,3 +33,9 @@ exist because each one was a real bug found in review.
   state at confirm time, and never include items the user cannot currently see.
 - **Tests for destructive code assert what survived**, by diffing a full snapshot of the bucket, and every fix
   gets a test that fails without it.
+- **Check every level of a local path, not only the last.** A destination folder can contain a junction or
+  symlink pointing anywhere; writing through it leaves the chosen root. Walk every ancestor below the root for
+  reparse points at planning time and verify the canonical parent still starts with the canonical root before
+  writing. Links are per-file failures, never replaced.
+- **Bound every listing and walk by what is actually needed** (key range, cap), and make previews cancellable;
+  an unbounded listing of a huge bucket is a memory and time hazard the user cannot stop.
