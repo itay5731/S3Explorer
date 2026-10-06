@@ -37,7 +37,7 @@ import {
   type SavedConnection,
 } from "../lib/types";
 import { formatExact, formatRelative, nameTone } from "../lib/format";
-import { readPref, setConnected, writePref } from "../store/app";
+import { forgetSavedConnection, readPref, setConnected, writePref } from "../store/app";
 import { toast } from "../store/toasts";
 import { Logo } from "./Logo";
 import { SettingsButton } from "./SettingsDialog";
@@ -347,6 +347,8 @@ function DeleteSavedModal({ conn, onClose, onDeleted }: { conn: SavedConnection;
     setError(null);
     try {
       await api.deleteSavedConnection(conn.id);
+      // The backend forgets the connection's added buckets too; drop them from the UI if it is in use.
+      forgetSavedConnection(conn.id);
       toast.success(`Deleted “${conn.name}”`);
       onDeleted();
     } catch (e) {
@@ -645,7 +647,7 @@ export function ConnectScreen() {
     else setBusyId(c.id);
     try {
       const info = await api.connectSaved(c.id);
-      setConnected(info);
+      setConnected(info, c.id);
     } catch (e) {
       const err = e as AppError;
       setConnecting(false);

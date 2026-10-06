@@ -1,4 +1,4 @@
-import { Fragment, useRef, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -18,11 +18,13 @@ import {
   Upload,
   X,
   Archive,
+  ArchiveRestore,
   ArrowUp,
 } from "lucide-react";
 import { navigate, openModal, refresh, setDetailsOpen, setFilter, useApp } from "../store/app";
 import { clearClipboard, useClipboard } from "../store/clipboard";
-import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
+import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
+import { ARCHIVED_REASON, isArchiveClass, useArchiveBlocked } from "../store/archive";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { PopupMenu } from "./PopupMenu";
@@ -99,6 +101,14 @@ export function Toolbar() {
   const selCount = sel.folders + sel.objects;
   const clip = useClipboard((s) => s.clip);
   const disabled = !bucket;
+  // One archived object that isn't restored can't be downloaded, copied, moved or renamed.
+  const blocked = useArchiveBlocked(bucket, sel.object);
+  const why = (title: string) => (blocked ? ARCHIVED_REASON : title);
+  // Restore is offered only when the selection holds archived objects (folders: context menu).
+  const archivedCount = useMemo(
+    () => (sel.objects ? getSelected().objects.filter((o) => isArchiveClass(o.storageClass)).length : 0),
+    [sel],
+  );
 
   return (
     <div className="toolbar">
@@ -110,7 +120,7 @@ export function Toolbar() {
         </button>
         <button
           className="btn"
-          disabled={disabled || sel.objects + sel.folders === 0}
+          disabled={disabled || sel.objects + sel.folders === 0 || blocked}
           onClick={() => {
             // Objects selected: download those (as before). Only folders: download the folders.
             const { objects, folders } = getSelected();
@@ -118,7 +128,9 @@ export function Toolbar() {
             else void requestDownloadFolders(folders);
           }}
           title={
-            sel.objects > 1
+            blocked
+              ? ARCHIVED_REASON
+              : sel.objects > 1
               ? `Download ${sel.objects} objects`
               : sel.objects === 0 && sel.folders > 1
                 ? `Download ${sel.folders} folders`
@@ -131,10 +143,22 @@ export function Toolbar() {
           <span className="btn-label secondary">Download</span>
         </button>
         <span className="tool-sep" />
-        <button className="icon-btn lg" disabled={disabled || selCount === 0} onClick={() => copySelection("copy")} title="Copy (Ctrl+C)" aria-label="Copy">
+        <button
+          className="icon-btn lg"
+          disabled={disabled || selCount === 0 || blocked}
+          onClick={() => void copySelection("copy")}
+          title={why("Copy (Ctrl+C)")}
+          aria-label="Copy"
+        >
           <Copy size={15} />
         </button>
-        <button className="icon-btn lg" disabled={disabled || selCount === 0} onClick={() => copySelection("cut")} title="Cut (Ctrl+X)" aria-label="Cut">
+        <button
+          className="icon-btn lg"
+          disabled={disabled || selCount === 0 || blocked}
+          onClick={() => void copySelection("cut")}
+          title={why("Cut (Ctrl+X)")}
+          aria-label="Cut"
+        >
           <Scissors size={15} />
         </button>
         <button
@@ -146,9 +170,26 @@ export function Toolbar() {
         >
           <ClipboardPaste size={15} />
         </button>
-        <button className="icon-btn lg" disabled={disabled || selCount !== 1} onClick={() => requestRename()} title="Rename (F2)" aria-label="Rename">
+        <button
+          className="icon-btn lg"
+          disabled={disabled || selCount !== 1 || blocked}
+          onClick={() => void requestRename()}
+          title={why("Rename (F2)")}
+          aria-label="Rename"
+        >
           <PencilLine size={15} />
         </button>
+        {archivedCount > 0 && (
+          <button
+            className="icon-btn lg"
+            disabled={disabled}
+            onClick={() => requestRestoreArchived()}
+            title={archivedCount === 1 && selCount === 1 ? "Restore from the archive…" : `Restore archived objects (${archivedCount.toLocaleString()})…`}
+            aria-label="Restore archived"
+          >
+            <ArchiveRestore size={15} />
+          </button>
+        )}
         <button
           className="btn btn-danger-ghost"
           disabled={disabled || selCount === 0}

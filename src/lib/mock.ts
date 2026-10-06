@@ -27,14 +27,16 @@ import type {
   ObjectMeta,
   ProfileInfo,
   RecentListing,
+  RestoreRequest,
   SaveConnectionInput,
   SavedConnection,
   Tag,
   Transfer,
   UpdateInfo,
   UpdateProgress,
+  VersionListing,
 } from "./types";
-import { BATCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { BATCH_LIMITS, RESTORE_DAYS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
 import { planParts, validateAppSettings } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
@@ -87,6 +89,7 @@ interface MockObject {
 }
 
 interface MockBucket {
+  name: string;
   creationDate: string;
   objects: Map<string, MockObject>;
   sorted: string[] | null; // cache, invalidated on mutation
@@ -115,7 +118,7 @@ function contentTypeFor(key: string): string {
 const buckets = new Map<string, MockBucket>();
 
 function createMockBucket(name: string, created: string, opts: { hidden?: boolean; readOnly?: boolean } = {}): MockBucket {
-  const b: MockBucket = { creationDate: created, objects: new Map(), sorted: null, ...opts };
+  const b: MockBucket = { name, creationDate: created, objects: new Map(), sorted: null, ...opts };
   buckets.set(name, b);
   return b;
 }
@@ -127,18 +130,34 @@ function put(
   opts: { ageDays?: number; storageClass?: string; metadata?: Record<string, string>; tags?: Tag[] } = {},
 ) {
   const age = opts.ageDays ?? rand() * 400;
-  b.objects.set(key, {
+  const obj: MockObject = {
     size,
-    lastModified: new Date(NOW - age * DAY - rand() * DAY).toISOString(),
+    // Written after seeding (an upload, a new folder, a test hook): now.
+    lastModified: seeded ? new Date().toISOString() : new Date(NOW - age * DAY - rand() * DAY).toISOString(),
     etag: `${hex(32)}${size > 16 * MB ? "-" + Math.ceil(size / (8 * MB)) : ""}`,
     storageClass: opts.storageClass ?? "STANDARD",
     contentType: key.endsWith("/") ? "application/x-directory" : contentTypeFor(key),
     metadata: opts.metadata ?? {},
     versionId: rand() > 0.6 ? hex(32) : null,
     ...(opts.tags ? { tags: opts.tags } : {}),
-  });
+  };
+  recordWrite(b, key, obj);
+  b.objects.set(key, obj);
   b.sorted = null;
 }
+
+/** False while seed() runs: seeding is not a write (no versions are recorded). */
+let seeded = false;
+
+/** Restore state of archived objects (x-amz-restore), by bucket + key. `readyAt` = when an in-progress restore finishes. */
+interface MockRestore {
+  inProgress: boolean;
+  expiresAt: string | null;
+  readyAt: number | null;
+  days: number;
+}
+const restoreStates = new Map<string, MockRestore>();
+const objId = (bucket: string, key: string) => `${bucket}\u0000${key}`;
 
 const tagList = (o: Record<string, string>): Tag[] => Object.entries(o).map(([key, value]) => ({ key, value }));
 
@@ -284,8 +303,26 @@ function seed() {
   // A bucket on a server that doesn't implement tagging (MinIO-style): tags return NotSupported.
   const legacy = createMockBucket("legacy-minio-backups", "2018-02-01T12:00:00Z");
   for (let i = 0; i < 8; i++) put(legacy, `nightly/backup-${i + 1}.tar.gz`, between(10 * MB, 400 * MB), { ageDays: 8 - i });
+
+  // ---- v0.5.0: archived objects in every restore state (acme-prod-assets/archive/) ----
+  // not restored · restored until a date · restore in progress (never finishes by itself) ·
+  // "fail-restore" (RestoreObject denied) · a plain object (skipped by a restore job).
+  put(assets, "archive/old-logs-2018.tar", 120 * MB, { ageDays: 1400, storageClass: "GLACIER" });
+  put(assets, "archive/restored-report.pdf", 2_400_000, { ageDays: 800, storageClass: "GLACIER" });
+  put(assets, "archive/restoring-dump.sql.gz", 3 * GB, { ageDays: 900, storageClass: "DEEP_ARCHIVE" });
+  put(assets, "archive/fail-restore-ledger.csv", 80_000, { ageDays: 700, storageClass: "GLACIER" });
+  put(assets, "archive/deep/scan-0001.tiff", 90 * MB, { ageDays: 1500, storageClass: "DEEP_ARCHIVE" });
+  put(assets, "archive/README.txt", 1_200, { ageDays: 30 });
+  restoreStates.set(objId("acme-prod-assets", "archive/restored-report.pdf"), {
+    inProgress: false,
+    expiresAt: new Date(NOW + 5 * DAY).toISOString(),
+    readyAt: null,
+    days: 7,
+  });
+  restoreStates.set(objId("acme-prod-assets", "archive/restoring-dump.sql.gz"), { inProgress: true, expiresAt: null, readyAt: null, days: 7 });
 }
 seed();
+seeded = true;
 
 /** Mock switch for tags: buckets whose name starts with "legacy-" behave like a server without tagging. */
 const tagsUnsupported = (bucket: string) => bucket.startsWith("legacy-");
@@ -525,7 +562,177 @@ const LIFECYCLE_SEEDS: Record<string, LifecycleConfiguration> = {
 };
 
 /** Bucket versioning: one Enabled, one Suspended, the rest Off. */
-const mockVersioning: Record<string, BucketVersioning> = { "data-lake-raw": "Enabled", "backups-archive": "Suspended" };
+const mockVersioning: Record<string, BucketVersioning> = {
+  "acme-prod-assets": "Enabled",
+  "data-lake-raw": "Enabled",
+  "backups-archive": "Suspended",
+};
+
+// ---- object versions -------------------------------------------------------------------------
+// Mirrors "Object versions" in docs/CONTRACT.md. A history per key (newest first) is created on
+// first use from the current object, with 0-2 older versions picked from the key; writes on a
+// versioned bucket add a version, deletes add a delete marker. Seeded on purpose:
+//   acme-prod-assets  docs/pricing.xlsx (3 older versions, the oldest written before versioning: "null"),
+//                     docs/quarterly report Q3 2026.pdf (deleted once and uploaded again: an older delete marker)
+//   data-lake-raw     schemas/events.json (1,200 versions: the listing is truncated at 1,000)
+// Buckets with versioning Off return one "null" version.
+
+interface MockVersion {
+  versionId: string;
+  isDeleteMarker: boolean;
+  lastModified: string;
+  obj: MockObject | null;
+}
+
+const histories = new Map<string, MockVersion[]>();
+const versioningOf = (bucket: string): BucketVersioning => mockVersioning[bucket] ?? "Off";
+const VID_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
+function newVersionId(r: () => number = Math.random): string {
+  let s = "";
+  for (let i = 0; i < 32; i++) s += VID_CHARS[Math.floor(r() * VID_CHARS.length)];
+  return s;
+}
+const VERSION_LIST_MAX = 1000;
+const MANY_VERSIONS = objId("data-lake-raw", "schemas/events.json");
+const MARKER_SEEDED = objId("acme-prod-assets", "docs/quarterly report Q3 2026.pdf");
+const NULL_SEEDED = objId("acme-prod-assets", "docs/pricing.xlsx");
+const SEEDED_OLDER: Record<string, number> = { [NULL_SEEDED]: 3, [MARKER_SEEDED]: 3, [MANY_VERSIONS]: 1199 };
+
+function seedHistory(bucket: string, key: string): MockVersion[] {
+  const o = buckets.get(bucket)?.objects.get(key);
+  if (!o) return [];
+  const id = objId(bucket, key);
+  const r = mulberry32(hashString(id));
+  if (!o.versionId || o.versionId === "null") o.versionId = newVersionId(r);
+  const h: MockVersion[] = [{ versionId: o.versionId, isDeleteMarker: false, lastModified: o.lastModified, obj: o }];
+  const older = SEEDED_OLDER[id] ?? (key.endsWith("/") ? 0 : Math.floor(r() * 3));
+  let t = Date.parse(o.lastModified);
+  for (let i = 0; i < older; i++) {
+    t -= ((1 + r() * 20) * DAY) / (older > 100 ? 20 : 1);
+    const lastModified = new Date(t).toISOString();
+    const versionId = id === NULL_SEEDED && i === older - 1 ? "null" : newVersionId(r);
+    if (id === MARKER_SEEDED && i === 0) {
+      h.push({ versionId, isDeleteMarker: true, lastModified, obj: null });
+      continue;
+    }
+    const size = Math.max(1, Math.round(o.size * (0.55 + r() * 0.5)));
+    const etag = Array.from({ length: 32 }, () => Math.floor(r() * 16).toString(16)).join("");
+    h.push({ versionId, isDeleteMarker: false, lastModified, obj: { ...o, metadata: { ...o.metadata }, size, lastModified, etag, versionId } });
+  }
+  return h;
+}
+
+/** The key's versions, newest first. A bucket that never had versioning: the current object as the one "null" version. */
+function historyOf(bucket: string, key: string): MockVersion[] {
+  const id = objId(bucket, key);
+  if (versioningOf(bucket) === "Off" && !histories.has(id)) {
+    const o = buckets.get(bucket)?.objects.get(key);
+    return o ? [{ versionId: "null", isDeleteMarker: false, lastModified: o.lastModified, obj: o }] : [];
+  }
+  let h = histories.get(id);
+  if (!h) {
+    h = seedHistory(bucket, key);
+    histories.set(id, h);
+  }
+  return h;
+}
+
+function pushVersion(b: MockBucket, key: string, v: Omit<MockVersion, "versionId">): string | null {
+  if (!seeded) return null;
+  const state = versioningOf(b.name);
+  if (state === "Off") return null;
+  const h = historyOf(b.name, key);
+  // Suspended: new writes get the id "null" and replace an earlier "null" version.
+  const versionId = state === "Enabled" ? newVersionId() : "null";
+  if (state === "Suspended") {
+    for (let i = h.length - 1; i >= 0; i--) if (h[i].versionId === "null") h.splice(i, 1);
+  }
+  h.unshift({ versionId, ...v });
+  return versionId;
+}
+
+/** Call before `b.objects.set(key, next)`: on a versioned bucket the write adds a version. */
+function recordWrite(b: MockBucket, key: string, next: MockObject) {
+  if (!seeded) return;
+  // An overwritten object is a new object: a restore of the old one no longer applies.
+  restoreStates.delete(objId(b.name, key));
+  const id = pushVersion(b, key, { isDeleteMarker: false, lastModified: next.lastModified, obj: next });
+  if (id) next.versionId = id;
+}
+
+/** Call before `b.objects.delete(key)`: on a versioned bucket the delete adds a delete marker. */
+function recordDelete(b: MockBucket, key: string) {
+  restoreStates.delete(objId(b.name, key));
+  pushVersion(b, key, { isDeleteMarker: true, lastModified: new Date().toISOString(), obj: null });
+}
+
+const versionCallLog: { cmd: string; bucket: string; key: string; versionId: string | null; destPath?: string; at: string }[] = [];
+function logVersionCall(cmd: string, bucket: string, key: string, versionId: string | null, destPath?: string) {
+  versionCallLog.push({ cmd, bucket, key, versionId, ...(destPath !== undefined ? { destPath } : {}), at: new Date().toISOString() });
+}
+
+function findVersion(bucket: string, key: string, versionId: string): { h: MockVersion[]; i: number } {
+  const h = historyOf(bucket, key);
+  const i = h.findIndex((v) => v.versionId === versionId);
+  if (i < 0) throw fail("NoSuchKey", `The version “${versionId}” of “${key}” does not exist.`);
+  return { h, i };
+}
+
+// ---- archived objects (restore) -----------------------------------------------------------------
+// GLACIER / DEEP_ARCHIVE need a restore before they can be read. A restore finishes a few seconds
+// after it is requested (Expedited 4 s, Standard 8 s, Bulk 12 s). Keys containing "fail-restore"
+// can't be restored (AccessDenied).
+
+const isArchiveClass = (sc: string | null | undefined) => sc === "GLACIER" || sc === "DEEP_ARCHIVE";
+const ARCHIVED_MESSAGE = "InvalidObjectState: The object is archived; restore it first.";
+
+function restoreStateOf(bucket: string, key: string): MockRestore | null {
+  const st = restoreStates.get(objId(bucket, key));
+  if (!st) return null;
+  if (st.inProgress && st.readyAt !== null && Date.now() >= st.readyAt) {
+    st.inProgress = false;
+    st.readyAt = null;
+    st.expiresAt = new Date(Date.now() + st.days * DAY).toISOString();
+  }
+  return st;
+}
+
+/** True when the object can't be read until it is restored. */
+function needsRestore(bucket: string, key: string, o: MockObject): boolean {
+  if (!isArchiveClass(o.storageClass)) return false;
+  const st = restoreStateOf(bucket, key);
+  return !(st && !st.inProgress && st.expiresAt);
+}
+
+function validateRestoreRequest(req: RestoreRequest | undefined | null) {
+  if (!req || typeof req !== "object") throw fail("InvalidInput", "restore is required");
+  if (req.tier !== "Bulk" && req.tier !== "Standard" && req.tier !== "Expedited") throw fail("InvalidInput", "restore.tier must be Bulk, Standard or Expedited");
+  if (!Number.isInteger(req.days) || req.days < RESTORE_DAYS.min || req.days > RESTORE_DAYS.max) {
+    throw fail("InvalidInput", `restore.days must be a whole number from ${RESTORE_DAYS.min} to ${RESTORE_DAYS.max}`);
+  }
+}
+
+/** Start a restore, or say why not (the rules of restore_object). */
+function startRestore(bucket: string, key: string, o: MockObject, req: RestoreRequest): AppError | null {
+  if (!isArchiveClass(o.storageClass)) {
+    return fail("InvalidInput", `The object is not archived (storage class ${o.storageClass}); it can be read as it is.`);
+  }
+  const st = restoreStateOf(bucket, key);
+  if (st?.inProgress) return fail("Conflict", "The object is already being restored.");
+  if (st && st.expiresAt) return fail("InvalidInput", `The object is already restored (until ${st.expiresAt}).`);
+  if (req.tier === "Expedited" && o.storageClass === "DEEP_ARCHIVE") {
+    return fail("InvalidInput", "Expedited retrieval is not available for objects in Glacier Deep Archive. Choose Standard or Bulk.");
+  }
+  const wait = req.tier === "Expedited" ? 4000 : req.tier === "Standard" ? 8000 : 12000;
+  restoreStates.set(objId(bucket, key), { inProgress: true, expiresAt: null, readyAt: Date.now() + wait, days: req.days });
+  return null;
+}
+
+const restoreCallLog: { bucket: string; key: string; request: unknown; at: string }[] = [];
+const disconnectCallLog: { cancelActive: unknown; at: string }[] = [];
+/** Test hook: what the next isWindowFocused() returns (null = document.hasFocus()), or make it fail. */
+const windowFocus: { value: boolean | null; fail: boolean } = { value: null, fail: false };
+
 
 function cloneLc<T>(v: T): T {
   return v === null || v === undefined ? v : (JSON.parse(JSON.stringify(v)) as T);
@@ -1088,8 +1295,8 @@ function batchFailMessage(req: BatchPlanRequest, f: PlanFile): string | undefine
     return bucket?.readOnly ? DENIED_WRITE : undefined;
   }
   if (f.key.includes("fail-download")) return "Network: the server closed the connection (after 3 attempts).";
-  const sc = bucket?.objects.get(f.key)?.storageClass ?? "";
-  return sc === "GLACIER" || sc === "DEEP_ARCHIVE" ? "InvalidObjectState: The object is archived. Restore it before downloading." : undefined;
+  const o = bucket?.objects.get(f.key);
+  return o && needsRestore(req.bucket, f.key, o) ? ARCHIVED_MESSAGE : undefined;
 }
 
 function batchTick() {
@@ -1214,6 +1421,21 @@ function startBatchSim(req: BatchPlanRequest): string {
   return id;
 }
 
+function cancelBatchSim(sim: BatchSim) {
+  for (const tid of sim.active.keys()) {
+    const s = sims.get(tid);
+    if (s && (s.t.status === "running" || s.t.status === "queued")) {
+      s.t.status = "cancelled";
+      s.t.bytesPerSec = 0;
+      s.t.finishedAt = new Date().toISOString();
+      emit(s.t);
+    }
+  }
+  sim.active.clear();
+  sim.pos = sim.files?.length ?? 0;
+  finishBatch(sim, "cancelled");
+}
+
 function logBatchCall(cmd: "preview_batch" | "start_batch" | "cancel_batch", request: unknown) {
   batchCallLog.push({ cmd, request: JSON.parse(JSON.stringify(request)), at: new Date().toISOString() });
 }
@@ -1308,8 +1530,37 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
   },
   removeObject: (bucket: string, key: string) => {
     const b = buckets.get(bucket);
-    if (b && b.objects.delete(key)) b.sorted = null;
+    if (!b || !b.objects.has(key)) return;
+    recordDelete(b, key);
+    b.objects.delete(key);
+    b.sorted = null;
   },
+  versionCalls: versionCallLog,
+  restoreCalls: restoreCallLog,
+  disconnectCalls: disconnectCallLog,
+  /** The key's version history as the mock holds it (newest first). */
+  versions: (bucket: string, key: string) =>
+    historyOf(bucket, key).map((v) => ({ versionId: v.versionId, isDeleteMarker: v.isDeleteMarker, size: v.obj?.size ?? 0, lastModified: v.lastModified })),
+  restoreState: (bucket: string, key: string) => {
+    const st = restoreStateOf(bucket, key);
+    return st ? { ...st } : null;
+  },
+  /** Finish every in-progress restore now. */
+  finishRestores: () => {
+    for (const st of restoreStates.values()) if (st.inProgress) st.readyAt = 0;
+  },
+  /** isWindowFocused(): a fixed answer (null = document.hasFocus()), or fail. */
+  setWindowFocused: (v: boolean | null) => {
+    windowFocus.value = v;
+  },
+  failWindowFocus: (f: boolean) => {
+    windowFocus.fail = f;
+  },
+  activeCounts: () => ({
+    transfers: [...sims.values()].filter((x) => x.t.status === "running" || x.t.status === "queued").length,
+    batches: [...batchSims.values()].filter((x) => isBatchActive(x.b)).length,
+    jobs: [...jobSims.values()].filter((x) => x.job.status === "running" || x.job.status === "queued").length,
+  }),
   slowNextPreview: (ms: number) => {
     previewDelay.next = ms;
   },
@@ -1337,9 +1588,11 @@ const invalid = (message: string) => fail("InvalidInput", message);
 /** Contract validation. Throws InvalidInput (nothing is changed). */
 function validateJobRequest(req: JobRequest) {
   requireConnection();
-  if (!req || (req.kind !== "delete" && req.kind !== "copy" && req.kind !== "move" && req.kind !== "tag")) {
-    throw invalid("kind must be one of delete, copy, move, tag");
+  if (!req || (req.kind !== "delete" && req.kind !== "copy" && req.kind !== "move" && req.kind !== "tag" && req.kind !== "restore")) {
+    throw invalid("kind must be one of delete, copy, move, tag, restore");
   }
+  if (req.kind === "restore") validateRestoreRequest(req.restore);
+  else if (req.restore != null) throw invalid("restore is only allowed for kind restore");
   if (req.kind === "tag") {
     const op = req.tags;
     if (!op) throw invalid("tags is required for kind tag");
@@ -1462,6 +1715,7 @@ function jobLabel(req: JobRequest): string {
   const what = n === 1 ? leafOf(first.from) || first.from : `${n.toLocaleString("en-US")} items`;
   if (req.kind === "delete") return `Delete ${what}`;
   if (req.kind === "tag") return `${req.tags?.mode === "replace" ? "Replace tags of" : "Edit tags of"} ${what}`;
+  if (req.kind === "restore") return `Restore ${what} (${req.restore?.tier}, ${req.restore?.days} days)`;
   if (n === 1 && req.kind === "move" && req.destBucket === req.srcBucket && first.to && parentOf(first.to) === parentOf(first.from)) {
     return `Rename ${what} to ${leafOf(first.to)}`;
   }
@@ -1520,7 +1774,6 @@ function finishJob(sim: JobSim, status: "completed" | "failed" | "cancelled") {
   emitJob(sim.job);
 }
 
-const ARCHIVED: Record<string, string> = { GLACIER: "Glacier Flexible Retrieval", DEEP_ARCHIVE: "Glacier Deep Archive" };
 
 /** List up to `budget` keys. Returns true when every item has been expanded. */
 function listStep(sim: JobSim, budget: number): boolean {
@@ -1535,7 +1788,7 @@ function listStep(sim: JobSim, budget: number): boolean {
     sim.work.push({ src: key, dest: destKeyOf(it, key) });
     sim.job.totalItems++;
     // A tag job moves no data: its byte counters stay 0.
-    if (sim.req.kind !== "tag") sim.job.totalBytes += src.objects.get(key)?.size ?? 0;
+    if (sim.req.kind !== "tag" && sim.req.kind !== "restore") sim.job.totalBytes += src.objects.get(key)?.size ?? 0;
   };
   while (budget > 0) {
     if (sim.listing) {
@@ -1588,10 +1841,29 @@ function workOne(sim: JobSim, w: JobWork) {
       jobError(sim, w.src, DENIED_WRITE);
       return;
     }
+    recordDelete(src, w.src);
     src.objects.delete(w.src);
     src.sorted = null;
     j.doneItems++;
     j.doneBytes += o.size;
+    return;
+  }
+  if (sim.req.kind === "restore") {
+    // HeadObject decides: not archived (or already restored) and in progress are skipped.
+    if (!isArchiveClass(o.storageClass) || restoreStateOf(sim.req.srcBucket, w.src)) {
+      j.skippedItems++;
+      return;
+    }
+    if (src.readOnly || w.src.includes("fail-restore")) {
+      jobError(sim, w.src, "AccessDenied: Access Denied for s3:RestoreObject on this key.");
+      return;
+    }
+    const err = startRestore(sim.req.srcBucket, w.src, o, sim.req.restore!);
+    if (err) {
+      jobError(sim, w.src, `${err.code}: ${err.message}`);
+      return;
+    }
+    j.doneItems++;
     return;
   }
   if (sim.req.kind === "tag") {
@@ -1624,8 +1896,8 @@ function workOne(sim: JobSim, w: JobWork) {
     jobError(sim, w.src, "AccessDenied: Access Denied for s3:GetObject on this key (mock: keys containing “fail-copy” cannot be copied).");
     return;
   }
-  if (ARCHIVED[o.storageClass]) {
-    jobError(sim, w.src, `InvalidObjectState: The object is archived in ${ARCHIVED[o.storageClass]} and must be restored before it can be copied.`);
+  if (needsRestore(sim.req.srcBucket, w.src, o)) {
+    jobError(sim, w.src, ARCHIVED_MESSAGE);
     return;
   }
   const dest = buckets.get(sim.req.destBucket!)!;
@@ -1638,7 +1910,7 @@ function workOne(sim: JobSim, w: JobWork) {
     j.skippedItems++;
     return;
   }
-  dest.objects.set(w.dest!, {
+  const copied: MockObject = {
     ...o,
     metadata: { ...o.metadata },
     // Tags are carried over by a copy.
@@ -1646,7 +1918,9 @@ function workOne(sim: JobSim, w: JobWork) {
     lastModified: new Date().toISOString(),
     etag: hex(32),
     versionId: null,
-  });
+  };
+  recordWrite(dest, w.dest!, copied);
+  dest.objects.set(w.dest!, copied);
   dest.sorted = null;
   // Move: the source is deleted only after its own copy succeeded, object by object.
   if (sim.req.kind === "move") {
@@ -1655,6 +1929,7 @@ function workOne(sim: JobSim, w: JobWork) {
       jobError(sim, w.src, "AccessDenied: The copy exists, but the original remains: deleting it was denied.");
       return;
     }
+    recordDelete(src, w.src);
     src.objects.delete(w.src);
     src.sorted = null;
   }
@@ -1739,8 +2014,22 @@ export const mockBackend: Backend = {
     return { ...connection };
   },
 
-  async disconnect() {
+  async disconnect(cancelActive) {
     await delay(60);
+    disconnectCallLog.push({ cancelActive, at: new Date().toISOString() });
+    if (cancelActive === true) {
+      // Cooperative cancel of everything queued or running; the final events are emitted.
+      for (const sim of batchSims.values()) if (isBatchActive(sim.b)) cancelBatchSim(sim);
+      for (const s of sims.values()) {
+        if (s.t.status === "running" || s.t.status === "queued") {
+          s.t.status = "cancelled";
+          s.t.bytesPerSec = 0;
+          s.t.finishedAt = new Date().toISOString();
+          emit(s.t);
+        }
+      }
+      for (const sim of jobSims.values()) if (sim.job.status === "running" || sim.job.status === "queued") finishJob(sim, "cancelled");
+    }
     connection = null;
     connectionKey = null;
   },
@@ -1989,6 +2278,7 @@ export const mockBackend: Backend = {
     const o = b.objects.get(key);
     if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
     const name = key.split("/").filter(Boolean).pop() ?? key;
+    const st = restoreStateOf(bucket, key);
     return {
       key,
       name,
@@ -1998,9 +2288,9 @@ export const mockBackend: Backend = {
       storageClass: o.storageClass,
       contentType: o.contentType,
       metadata: { ...o.metadata },
-      versionId: o.versionId,
-      restore: null,
-      archived: false,
+      versionId: versioningOf(bucket) === "Off" ? o.versionId : historyOf(bucket, key)[0]?.versionId ?? o.versionId,
+      restore: isArchiveClass(o.storageClass) && st ? { inProgress: st.inProgress, expiresAt: st.expiresAt } : null,
+      archived: needsRestore(bucket, key, o),
     };
   },
 
@@ -2043,18 +2333,7 @@ export const mockBackend: Backend = {
     const sim = batchSims.get(id);
     if (!sim) throw invalid("Unknown batch.");
     if (!isBatchActive(sim.b)) return;
-    for (const tid of sim.active.keys()) {
-      const s = sims.get(tid);
-      if (s && (s.t.status === "running" || s.t.status === "queued")) {
-        s.t.status = "cancelled";
-        s.t.bytesPerSec = 0;
-        s.t.finishedAt = new Date().toISOString();
-        emit(s.t);
-      }
-    }
-    sim.active.clear();
-    sim.pos = sim.files?.length ?? 0;
-    finishBatch(sim, "cancelled");
+    cancelBatchSim(sim);
   },
 
   async removeBatch(id) {
@@ -2078,16 +2357,103 @@ export const mockBackend: Backend = {
     };
   },
 
+  async listObjectVersions(bucket, key): Promise<VersionListing> {
+    await latency();
+    logVersionCall("list_object_versions", bucket, key, null);
+    const b = requireBucket(bucket);
+    if (lifecycleDenied(bucket, b)) throw fail("AccessDenied", "Access Denied: s3:ListBucketVersions is not allowed on a bucket shared with you.");
+    const h = historyOf(bucket, key);
+    return {
+      versions: h.slice(0, VERSION_LIST_MAX).map((v, i) => ({
+        versionId: v.versionId,
+        isLatest: i === 0,
+        isDeleteMarker: v.isDeleteMarker,
+        size: v.obj?.size ?? 0,
+        lastModified: v.lastModified,
+        etag: v.obj?.etag ?? null,
+        storageClass: v.obj?.storageClass ?? null,
+      })),
+      truncated: h.length > VERSION_LIST_MAX,
+    };
+  },
+
+  async downloadObjectVersion(bucket, key, versionId, destPath) {
+    await delay(40);
+    logVersionCall("download_object_version", bucket, key, versionId, destPath);
+    if (!key || key.endsWith("/")) throw fail("InvalidInput", "Key must name an object, not a folder.");
+    requireBucket(bucket);
+    const { h, i } = findVersion(bucket, key, versionId);
+    const v = h[i];
+    if (v.isDeleteMarker || !v.obj) throw fail("InvalidInput", "A delete marker has no content to download.");
+    // Only the current version has a known restore state; an archived older version needs its own restore.
+    const blocked = isArchiveClass(v.obj.storageClass) && (i !== 0 || needsRestore(bucket, key, v.obj));
+    return startSim("download", bucket, key, destPath, v.obj.size, blocked ? ARCHIVED_MESSAGE : undefined);
+  },
+
+  async restoreObjectVersion(bucket, key, versionId): Promise<ObjectEntry> {
+    await delay(300 + rand() * 300);
+    logVersionCall("restore_object_version", bucket, key, versionId);
+    const b = requireBucket(bucket);
+    if (b.readOnly) throw fail("AccessDenied", DENIED_WRITE);
+    const { h, i } = findVersion(bucket, key, versionId);
+    const v = h[i];
+    if (v.isDeleteMarker || !v.obj) throw fail("InvalidInput", "A delete marker can't be restored. To bring the object back, remove the delete marker.");
+    if (i === 0) throw fail("InvalidInput", "This version is already the current version.");
+    const next: MockObject = {
+      ...v.obj,
+      metadata: { ...v.obj.metadata },
+      tags: v.obj.tags ? copyTags(v.obj.tags) : undefined,
+      lastModified: new Date().toISOString(),
+    };
+    recordWrite(b, key, next);
+    b.objects.set(key, next);
+    b.sorted = null;
+    return { key, name: key.slice(key.lastIndexOf("/") + 1), size: next.size, lastModified: next.lastModified, etag: next.etag, storageClass: next.storageClass };
+  },
+
+  async deleteObjectVersion(bucket, key, versionId) {
+    await delay(200 + rand() * 250);
+    logVersionCall("delete_object_version", bucket, key, versionId);
+    const b = requireBucket(bucket);
+    if (b.readOnly) throw fail("AccessDenied", "Access Denied: s3:DeleteObjectVersion is not allowed on this bucket.");
+    const id = objId(bucket, key);
+    if (versioningOf(bucket) === "Off" && !histories.has(id)) {
+      // A bucket that never had versioning: the one "null" version is the object itself.
+      if (versionId !== "null") throw fail("NoSuchKey", `The version “${versionId}” of “${key}” does not exist.`);
+      if (b.objects.delete(key)) b.sorted = null;
+      return;
+    }
+    const { h, i } = findVersion(bucket, key, versionId);
+    h.splice(i, 1);
+    if (i === 0) {
+      // The newest remaining version becomes current; a delete marker on top (or nothing) hides the object.
+      const top = h[0];
+      if (!top || top.isDeleteMarker || !top.obj) b.objects.delete(key);
+      else b.objects.set(key, top.obj);
+      b.sorted = null;
+      restoreStates.delete(id);
+    }
+  },
+
+  async restoreObject(bucket, key, request) {
+    await latency();
+    restoreCallLog.push({ bucket, key, request: JSON.parse(JSON.stringify(request ?? null)), at: new Date().toISOString() });
+    const b = requireBucket(bucket);
+    validateRestoreRequest(request);
+    const o = b.objects.get(key);
+    if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
+    if (b.readOnly || key.includes("fail-restore")) throw fail("AccessDenied", "Access Denied for s3:RestoreObject on this key.");
+    const err = startRestore(bucket, key, o, request);
+    if (err) throw err;
+  },
+
   async startDownload(bucket, key, destPath) {
     await delay(40);
     if (!key || key.endsWith("/")) throw fail("InvalidInput", "Key must name an object, not a folder.");
     const b = requireBucket(bucket);
     const o = b.objects.get(key);
     if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
-    const archived = o.storageClass === "GLACIER" || o.storageClass === "DEEP_ARCHIVE";
-    return startSim("download", bucket, key, destPath, o.size, archived
-      ? "InvalidObjectState: The object is archived. Restore it before downloading."
-      : undefined);
+    return startSim("download", bucket, key, destPath, o.size, needsRestore(bucket, key, o) ? ARCHIVED_MESSAGE : undefined);
   },
 
   async startUpload(bucket, key, srcPath) {
@@ -2262,6 +2628,12 @@ export const mockBackend: Backend = {
     savedConnections = savedConnections.filter((c) => c.id !== id);
     mockKeychain.delete(id);
     persistConnections();
+    // The backend also forgets the buckets added by name for that connection.
+    const all = loadAdded();
+    if (id in all) {
+      delete all[id];
+      saveAdded(all);
+    }
   },
 
   async connectSaved(id) {
@@ -2369,6 +2741,11 @@ export const mockBackend: Backend = {
 
   async setWindowTitle(title) {
     document.title = title;
+  },
+
+  async isWindowFocused() {
+    if (windowFocus.fail) throw fail("Unknown", "Couldn't ask the window manager for the focus (mock).");
+    return windowFocus.value ?? document.hasFocus();
   },
 
   async setZoom(scale) {

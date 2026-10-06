@@ -30,6 +30,7 @@ import { setTransfersOpen, useApp } from "../store/app";
 import { toast } from "../store/toasts";
 import { basename, formatBytes, formatDuration, formatSpeed } from "../lib/format";
 import { isJobActive, jobFraction, plural } from "../lib/ops";
+import { shortVersionId, useVersionDownloads } from "../store/versions";
 
 const STATUS_LABEL: Record<TransferStatus, string> = {
   queued: "Queued",
@@ -84,15 +85,20 @@ async function reveal(t: Pick<Transfer, "localPath">) {
 
 const TransferRow = memo(function TransferRow({ id }: { id: string }) {
   const t = useTransfers((s) => s.byId[id]);
+  const versionId = useVersionDownloads((s) => s.byTransfer[id]);
   if (!t) return null;
-  const name = basename(t.key);
+  // A download of an older version says which one (the Transfer itself carries no label).
+  const name = versionId ? `${basename(t.key)} (version ${shortVersionId(versionId)})` : basename(t.key);
   const pct = t.totalBytes > 0 ? Math.min(100, (t.transferredBytes / t.totalBytes) * 100) : 0;
   // Uploads only advance per completed part: show an indeterminate bar until bytes move.
   const indeterminate = (t.status === "running" && t.transferredBytes === 0) || t.status === "queued";
   const eta = t.status === "running" && t.bytesPerSec > 0 ? (t.totalBytes - t.transferredBytes) / t.bytesPerSec : NaN;
   const DirIcon = t.kind === "download" ? ArrowDownToLine : ArrowUpFromLine;
   const StatusIcon = STATUS_ICON[t.status];
-  const where = t.kind === "download" ? `s3://${t.bucket}/${t.key} → ${t.localPath}` : `${t.localPath} → s3://${t.bucket}/${t.key}`;
+  const where =
+    t.kind === "download"
+      ? `s3://${t.bucket}/${t.key}${versionId ? ` (version ${versionId})` : ""} → ${t.localPath}`
+      : `${t.localPath} → s3://${t.bucket}/${t.key}`;
   return (
     <div className={`xrow status-${t.status}`}>
       <div className={`xdir ${t.kind}`} title={t.kind === "download" ? "Download" : "Upload"}>
@@ -164,8 +170,8 @@ function jobProgressText(j: Job): string {
   if (j.phase === "listing") return `Listing… ${plural(j.totalItems, "object")} found`;
   const processed = j.doneItems + j.skippedItems + j.failedItems;
   const objects = `${processed.toLocaleString()} / ${j.totalItems.toLocaleString()} objects`;
-  // Deletes and tag edits move no data (a tag job's byte counters stay 0).
-  if (j.kind === "delete" || j.kind === "tag") return objects;
+  // Deletes, tag edits and restore requests move no data (their byte counters aren't meaningful).
+  if (j.kind === "delete" || j.kind === "tag" || j.kind === "restore") return objects;
   return `${objects} · ${formatBytes(j.doneBytes)} / ${formatBytes(j.totalBytes)}`;
 }
 
@@ -209,7 +215,14 @@ const JobRow = memo(function JobRow({ id }: { id: string }) {
           <div className="xbytes">{jobProgressText(j)}</div>
         </div>
         <div className="jcounts">
-          {j.skippedItems > 0 && <span className="jcount skipped">{j.skippedItems.toLocaleString()} skipped</span>}
+          {j.skippedItems > 0 && (
+            <span
+              className="jcount skipped"
+              title={j.kind === "restore" ? "Not archived, already restored, or a restore is already in progress" : "Already at the destination: left untouched"}
+            >
+              {j.skippedItems.toLocaleString()} skipped
+            </span>
+          )}
           {j.failedItems > 0 && <span className="jcount failed">{j.failedItems.toLocaleString()} failed</span>}
         </div>
         <div className={`xstatus s-${j.status}`}>

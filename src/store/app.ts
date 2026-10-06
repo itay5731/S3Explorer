@@ -2,12 +2,14 @@
 
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry } from "../lib/types";
+import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry, ObjectVersion } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
 import { clearClipboard } from "./clipboard";
 import { selectActiveBatchCount, useBatches } from "./batches";
 import { selectActiveJobCount, useJobs } from "./jobs";
 import { clearRecent } from "./recent";
+import { clearArchive } from "./archive";
+import { clearVersioning } from "./versions";
 import { selectActiveCount, useTransfers } from "./transfers";
 
 export type SortKey = "name" | "size" | "modified" | "class";
@@ -60,6 +62,12 @@ export type Modal =
   | { kind: "downloadFolders"; bucket: string; folders: FolderEntry[]; dir: string }
   /** Disconnect while transfers or jobs are still running. */
   | { kind: "disconnect"; running: number }
+  /** Restore one archived object (restore_object). */
+  | { kind: "restore"; bucket: string; key: string; storageClass: string | null }
+  /** Restore the archived objects in a selection (a "restore" job). `items` are exact keys/prefixes. */
+  | { kind: "bulkRestore"; bucket: string; prefix: string; items: JobItem[]; deepArchive: boolean; allDeep: boolean }
+  /** Confirm an action on one version of an object (shown from the details panel). */
+  | { kind: "versionAction"; action: "restore" | "delete" | "undelete"; bucket: string; key: string; version: ObjectVersion; onlyVersion: boolean; previousIsMarker: boolean }
   | null;
 
 /** Modals that make sense without an open bucket. */
@@ -175,9 +183,15 @@ async function fetchPage(bucket: string, prefix: string, token: string | null, s
 
 // ---- connection ------------------------------------------------------------------
 
-export function setConnected(info: ConnectionInfo) {
+/** The saved connection the app is connected through (null: connected without saving, or not connected). */
+let savedConnectionId: string | null = null;
+
+export function setConnected(info: ConnectionInfo, savedId: string | null = null) {
+  savedConnectionId = savedId;
   clearClipboard();
   clearRecent();
+  clearArchive();
+  clearVersioning();
   set({
     connection: info,
     buckets: [],
@@ -195,15 +209,19 @@ export function setConnected(info: ConnectionInfo) {
   void loadAddedBuckets();
 }
 
-export async function disconnect() {
+/** `cancelActive`: cancel every queued or running transfer, folder transfer and job before disconnecting. */
+export async function disconnect(cancelActive = false) {
   try {
-    await api.disconnect();
+    await api.disconnect(cancelActive);
   } catch {
     /* disconnect is best effort */
   }
   listSeq++;
+  savedConnectionId = null;
   clearClipboard();
   clearRecent();
+  clearArchive();
+  clearVersioning();
   set({
     connection: null,
     buckets: [],
@@ -225,6 +243,16 @@ export function requestDisconnect() {
     selectActiveCount(useTransfers.getState()) + selectActiveJobCount(useJobs.getState()) + selectActiveBatchCount(useBatches.getState());
   if (running > 0) openModal({ kind: "disconnect", running });
   else void disconnect();
+}
+
+/**
+ * A saved connection was deleted. The backend also forgets the buckets added by name for it, so if
+ * it is the one in use, the cached list of added buckets goes too.
+ */
+export function forgetSavedConnection(id: string) {
+  if (savedConnectionId !== id) return;
+  savedConnectionId = null;
+  set({ addedBuckets: [], addedError: null });
 }
 
 export async function loadBuckets() {

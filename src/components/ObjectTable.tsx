@@ -257,7 +257,7 @@ export function ObjectTable() {
         break;
       case "F2":
         if (useApp.getState().selection.size !== 1) return;
-        requestRename();
+        void requestRename();
         break;
       case "a":
       case "A":
@@ -281,7 +281,7 @@ export function ObjectTable() {
         const k = e.key.toLowerCase();
         if (k === "v") requestPaste();
         else if (!useApp.getState().selection.size) return;
-        else copySelection(k === "x" ? "cut" : "copy");
+        else void copySelection(k === "x" ? "cut" : "copy");
         break;
       }
       default:

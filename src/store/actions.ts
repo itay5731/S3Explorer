@@ -6,6 +6,7 @@ import { basename, joinKey, sanitizeFileName, uniqueFileName } from "../lib/form
 import { refresh, setTransfersOpen, useApp, upsertListedFolder, upsertListedObject } from "./app";
 import { isDenied, toast, toastDenied, toastFailure } from "./toasts";
 import { notifyInBackground } from "./notify";
+import { ARCHIVED_MESSAGE, splitReadable, toastArchivedSkipped } from "./archive";
 import { scheduleTransferResync, onTransferFinished, selectActiveCount, useTransfers } from "./transfers";
 
 export async function uploadPaths(paths: string[]) {
@@ -41,9 +42,16 @@ export async function pickAndUpload() {
   }
 }
 
-export async function downloadObjects(objects: ObjectEntry[]) {
+export async function downloadObjects(selected: ObjectEntry[]) {
   const { bucket } = useApp.getState();
-  if (!bucket || !objects.length) return;
+  if (!bucket || !selected.length) return;
+  // Archived objects that aren't restored can't be read: left out, with the reason.
+  const { readable: objects, blocked } = await splitReadable(bucket, selected);
+  if (!objects.length) {
+    toast.error(blocked.length === 1 ? `Can’t download “${blocked[0].name}”` : "Can’t download these objects", `${ARCHIVED_MESSAGE}.`);
+    return;
+  }
+  if (blocked.length) toastArchivedSkipped(blocked.length, "download");
   try {
     if (objects.length === 1) {
       const obj = objects[0];

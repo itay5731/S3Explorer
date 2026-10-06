@@ -3,10 +3,21 @@
 import * as api from "../lib/api";
 import { useSettings } from "./settings";
 
+/** Does the app window have focus? Asks the OS window; the document's focus only if that fails. */
+async function windowFocused(): Promise<boolean> {
+  try {
+    return await api.isWindowFocused();
+  } catch {
+    return document.hasFocus();
+  }
+}
+
 /** Show an OS notification, unless the app window has focus or the setting is off. */
 export function notifyInBackground(title: string, body?: string) {
-  if (document.hasFocus()) return;
   if (!useSettings.getState().settings?.notifyOnFinish) return;
-  // A courtesy only: if the OS refuses it, the toast and the Activity panel still report the result.
-  api.notify(title, body).catch(() => {});
+  void windowFocused().then((focused) => {
+    if (focused) return;
+    // A courtesy only: if the OS refuses it, the toast and the Activity panel still report the result.
+    api.notify(title, body).catch(() => {});
+  });
 }

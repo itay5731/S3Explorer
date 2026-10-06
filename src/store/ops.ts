@@ -12,6 +12,7 @@ import { notifyInBackground } from "./notify";
 import { useSettings } from "./settings";
 import { toast, toastFailure } from "./toasts";
 import { getSelected } from "./view";
+import { ARCHIVED_MESSAGE, isArchiveClass, splitReadable, toastArchivedSkipped } from "./archive";
 
 /** The current selection as clip items (exact keys/prefixes), folders first. */
 export function selectedItems(): ClipItem[] {
@@ -67,12 +68,62 @@ export function requestBulkTags() {
   });
 }
 
+// ---- archived objects ------------------------------------------------------------------------
+
+/**
+ * Leave out objects that are archived and not restored (they can't be copied or moved), with a
+ * toast naming how many. Folders are kept: the backend fails archived objects inside per object.
+ * Returns null when nothing is left.
+ */
+export async function withoutArchived(bucket: string, items: ClipItem[], action: string): Promise<ClipItem[] | null> {
+  const listed = new Map(useApp.getState().listing.objects.map((o) => [o.key, o]));
+  const objects = items.filter((i) => !i.isPrefix).map((i) => ({ key: i.key, storageClass: listed.get(i.key)?.storageClass ?? null }));
+  const { blocked } = await splitReadable(bucket, objects);
+  if (!blocked.length) return items;
+  const out = new Set(blocked.map((o) => o.key));
+  const kept = items.filter((i) => i.isPrefix || !out.has(i.key));
+  if (!kept.length) {
+    toast.error(items.length === 1 ? `Can’t ${action} “${items[0].name}”` : `Can’t ${action} these objects`, `${ARCHIVED_MESSAGE}.`);
+    return null;
+  }
+  toastArchivedSkipped(blocked.length, action);
+  return kept;
+}
+
+/**
+ * Restore archived objects in the selection: one archived object opens the single restore dialog;
+ * anything else (several, or folders) a "restore" job over the selected folders and archived objects.
+ */
+export function requestRestoreArchived() {
+  const { bucket, prefix } = useApp.getState();
+  const { folders, objects } = getSelected();
+  if (!bucket) return;
+  const archived = objects.filter((o) => isArchiveClass(o.storageClass));
+  if (!folders.length && objects.length === 1 && archived.length === 1) {
+    openModal({ kind: "restore", bucket, key: archived[0].key, storageClass: archived[0].storageClass });
+    return;
+  }
+  // Objects that aren't in an archive class would only be skipped: they are left out of the request.
+  const items: JobItem[] = [
+    ...folders.map((f) => ({ from: f.prefix, to: null, isPrefix: true })),
+    ...archived.map((o) => ({ from: o.key, to: null, isPrefix: false })),
+  ];
+  if (!items.length) {
+    toast.info("Nothing to restore", "None of the selected objects is archived.");
+    return;
+  }
+  if (tooMany(items.length, "restore")) return;
+  const deep = archived.filter((o) => o.storageClass === "DEEP_ARCHIVE").length;
+  openModal({ kind: "bulkRestore", bucket, prefix, items, deepArchive: deep > 0, allDeep: !folders.length && deep === archived.length });
+}
+
 // ---- rename -------------------------------------------------------------------------------
 
-export function requestRename() {
+export async function requestRename() {
   const { bucket } = useApp.getState();
   const items = selectedItems();
   if (!bucket || items.length !== 1) return;
+  if (!(await withoutArchived(bucket, items, "rename"))) return;
   const it = items[0];
   // The parent is the exact key minus the exact name (and the folder's trailing "/").
   const tail = it.name.length + (it.isPrefix ? 1 : 0);
@@ -86,11 +137,13 @@ export function requestRename() {
 
 // ---- clipboard ------------------------------------------------------------------------------
 
-export function copySelection(mode: "copy" | "cut") {
+export async function copySelection(mode: "copy" | "cut") {
   const { bucket, prefix } = useApp.getState();
-  const items = selectedItems();
-  if (!bucket || !items.length) return;
-  if (tooMany(items.length, mode === "copy" ? "copy" : "move")) return;
+  const selected = selectedItems();
+  if (!bucket || !selected.length) return;
+  if (tooMany(selected.length, mode === "copy" ? "copy" : "move")) return;
+  const items = await withoutArchived(bucket, selected, mode === "copy" ? "copy" : "move");
+  if (!items) return;
   setClipboard(mode, bucket, prefix, items);
   toast.info(
     `${plural(items.length, "item")} ${mode === "copy" ? "copied" : "cut"}`,
@@ -315,14 +368,22 @@ function reportFinished(j: Job) {
     toast.error(`${verb.present} failed`, `${j.label}\n${j.error}`, view);
     return;
   }
-  const parts = [`${plural(j.doneItems, "object")} ${verb.past.toLowerCase()}`];
-  if (j.skippedItems) parts.push(`${j.skippedItems.toLocaleString()} skipped (already existed)`);
+  // A restore job only asks S3: the objects become readable hours later.
+  const restore = j.kind === "restore";
+  const parts = [restore ? `restore requested for ${plural(j.doneItems, "object")}` : `${plural(j.doneItems, "object")} ${verb.past.toLowerCase()}`];
+  if (j.skippedItems) {
+    parts.push(
+      j.kind === "restore"
+        ? `${j.skippedItems.toLocaleString()} skipped (not archived, or already being restored)`
+        : `${j.skippedItems.toLocaleString()} skipped (already existed)`,
+    );
+  }
   if (j.failedItems) parts.push(`${j.failedItems.toLocaleString()} failed`);
   if (j.failedItems || j.skippedItems) {
     const title = j.failedItems ? `${verb.present} finished with ${plural(j.failedItems, "failure")}` : `${verb.present} finished, some skipped`;
     toast.warning(title, `${j.label}\n${parts.join(" · ")}`, view);
   } else {
-    toast.success(`${verb.past} ${plural(j.doneItems, "object")}`, j.label);
+    toast.success(restore ? `Restore requested for ${plural(j.doneItems, "object")}` : `${verb.past} ${plural(j.doneItems, "object")}`, j.label);
   }
 }
 

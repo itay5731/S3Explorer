@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderOpen, FolderPlus, FolderUp, Info, Link, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderOpen, FolderPlus, FolderUp, Info, Link, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, setDetailsOpen, setSelection, useApp } from "../store/app";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { getSelected } from "../store/view";
 import { useClipboard } from "../store/clipboard";
-import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename } from "../store/ops";
+import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
+import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlocked } from "../store/archive";
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 
@@ -16,6 +17,8 @@ interface Item {
   danger?: boolean;
   hint?: string;
   disabled?: boolean;
+  /** Tooltip, e.g. why the item is disabled. */
+  title?: string;
 }
 
 export function ContextMenu() {
@@ -24,6 +27,11 @@ export function ContextMenu() {
   const clip = useClipboard((s) => s.clip);
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  // One archived object that isn't restored: actions that read it are disabled, with the reason.
+  const current = menu && bucket ? getSelected() : null;
+  const single = current && current.folders.length === 0 && current.objects.length === 1 ? current.objects[0] : null;
+  const blocked = useArchiveBlocked(bucket, single);
+  const singleInfo = useArchive((s) => (bucket && single ? s.byId[archiveId(bucket, single.key)] : undefined));
 
   useLayoutEffect(() => {
     if (!menu || !ref.current) {
@@ -82,11 +90,15 @@ export function ContextMenu() {
     hint: "Ctrl+V",
     disabled: !clip,
   };
-  const editItems = (n: number): Item[] => [
-    { label: n > 1 ? `Copy ${n} items` : "Copy", icon: <CopyPlus size={14} />, action: () => copySelection("copy"), hint: "Ctrl+C" },
-    { label: n > 1 ? `Cut ${n} items` : "Cut", icon: <Scissors size={14} />, action: () => copySelection("cut"), hint: "Ctrl+X" },
-    ...(n === 1 ? [{ label: "Rename…", icon: <PencilLine size={14} />, action: () => requestRename(), hint: "F2" }] : []),
-  ];
+  const editItems = (n: number, archived = false): Item[] => {
+    const why = archived ? { disabled: true, title: ARCHIVED_REASON } : {};
+    return [
+      { label: n > 1 ? `Copy ${n} items` : "Copy", icon: <CopyPlus size={14} />, action: () => void copySelection("copy"), hint: "Ctrl+C", ...why },
+      { label: n > 1 ? `Cut ${n} items` : "Cut", icon: <Scissors size={14} />, action: () => void copySelection("cut"), hint: "Ctrl+X", ...why },
+      ...(n === 1 ? [{ label: "Rename…", icon: <PencilLine size={14} />, action: () => void requestRename(), hint: "F2", ...why }] : []),
+    ];
+  };
+  const restoreItem = (label: string): Item => ({ label, icon: <ArchiveRestore size={14} />, action: () => requestRestoreArchived() });
   const deleteItem = (n: number, folder: boolean): Item => ({
     label: n > 1 ? `Delete ${n} items…` : folder ? "Delete folder…" : "Delete…",
     icon: <Trash2 size={14} />,
@@ -114,16 +126,36 @@ export function ContextMenu() {
       { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, f.prefix), "S3 URI") },
     ]);
     groups.push(editItems(1));
-    groups.push([{ label: "Edit tags of everything inside…", icon: <Tags size={14} />, action: () => requestBulkTags() }]);
+    groups.push([
+      { label: "Edit tags of everything inside…", icon: <Tags size={14} />, action: () => requestBulkTags() },
+      restoreItem("Restore archived objects inside…"),
+    ]);
     groups.push([deleteItem(1, true)]);
   } else if (count === 1) {
     const o = objects[0];
-    groups.push([{ label: "Download…", icon: <Download size={14} />, action: () => void downloadObjects([o]) }]);
+    const restoreState = !isArchiveClass(o.storageClass)
+      ? null
+      : !singleInfo
+        ? { disabled: true, title: "Checking whether it is restored…" }
+        : singleInfo.restore?.inProgress
+          ? { disabled: true, title: "A restore is already in progress" }
+          : !singleInfo.archived
+            ? { disabled: true, title: "Already restored" }
+            : {};
+    groups.push([
+      {
+        label: "Download…",
+        icon: <Download size={14} />,
+        action: () => void downloadObjects([o]),
+        ...(blocked ? { disabled: true, title: ARCHIVED_REASON, hint: "Archived" } : {}),
+      },
+      ...(restoreState ? [{ ...restoreItem("Restore…"), ...restoreState }] : []),
+    ]);
     groups.push([
       { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(o.key, "Key") },
       { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, o.key), "S3 URI") },
     ]);
-    groups.push(editItems(1));
+    groups.push(editItems(1, blocked));
     groups.push([
       { label: "Edit tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "objectTags", bucket, key: o.key }) },
       {
@@ -163,7 +195,11 @@ export function ContextMenu() {
       },
     ]);
     groups.push(editItems(count));
-    groups.push([{ label: `Edit tags for ${count} items…`, icon: <Tags size={14} />, action: () => requestBulkTags() }]);
+    const archived = objects.filter((x) => isArchiveClass(x.storageClass)).length;
+    groups.push([
+      { label: `Edit tags for ${count} items…`, icon: <Tags size={14} />, action: () => requestBulkTags() },
+      ...(folders.length || archived ? [restoreItem("Restore archived…")] : []),
+    ]);
     groups.push([deleteItem(count, false)]);
   }
 
@@ -183,6 +219,7 @@ export function ContextMenu() {
               role="menuitem"
               className={`menu-item ${item.danger ? "danger" : ""}`}
               disabled={item.disabled}
+              title={item.title}
               onClick={() => {
                 openContextMenu(null);
                 item.action();

@@ -11,7 +11,7 @@ import { JOB_MAX_ITEMS } from "../lib/types";
 import { plural } from "../lib/ops";
 import { useApp } from "../store/app";
 import type { ClipItem } from "../store/clipboard";
-import { buildTransferRequest, confirmOrStart, tooMany } from "../store/ops";
+import { buildTransferRequest, confirmOrStart, tooMany, withoutArchived } from "../store/ops";
 import { toast } from "../store/toasts";
 import { getViewRows, type Row } from "../store/view";
 
@@ -237,7 +237,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
         toast.info(copy ? "Nothing was copied" : "Nothing was moved", target.refused);
         return;
       }
-      drop(dragged, target.bucket, target.prefix, copy);
+      void drop(dragged, target.bucket, target.prefix, copy);
     };
 
     const onCancel = () => finish();
@@ -282,8 +282,11 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
 const pick = (s: ReturnType<typeof useApp.getState>) => ({ bucket: s.bucket, prefix: s.prefix, selection: s.selection });
 
 /** A drop: the same request as paste, then the confirmation setting decides whether to ask. */
-function drop(src: Source, bucket: string, prefix: string, copy: boolean) {
-  const built = buildTransferRequest({ mode: copy ? "copy" : "cut", bucket: src.bucket, prefix: src.prefix, items: [...src.items] }, { bucket, prefix });
+async function drop(src: Source, bucket: string, prefix: string, copy: boolean) {
+  // Archived objects that aren't restored can't be copied or moved: left out, with a toast.
+  const items = await withoutArchived(src.bucket, [...src.items], copy ? "copy" : "move");
+  if (!items) return;
+  const built = buildTransferRequest({ mode: copy ? "copy" : "cut", bucket: src.bucket, prefix: src.prefix, items }, { bucket, prefix });
   if (!built.ok) {
     if (built.info) toast.info(built.title, built.detail);
     else toast.error(built.title, built.detail);

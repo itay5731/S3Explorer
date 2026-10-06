@@ -1,9 +1,12 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { ArchiveRestore, ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, RefreshCw, Snowflake, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
 import { navigate, openModal, setDetailsOpen, useApp } from "../store/app";
-import { requestBulkTags, requestDelete } from "../store/ops";
+import { requestBulkTags, requestDelete, requestRestoreArchived } from "../store/ops";
+import { ARCHIVED_REASON, isArchiveClass, rememberArchiveMeta, useArchiveBlocked } from "../store/archive";
+import { bumpObject, useObjectRev } from "../store/versions";
+import { VersionsSection } from "./VersionsSection";
 import { loadObjectTags, objectTagId, useTags } from "../store/tags";
 import { isDenied, permissionText } from "../store/toasts";
 import { TagChips } from "./TagEditor";
@@ -25,6 +28,63 @@ function Field({ label, children, mono, copy }: { label: string; children: React
             <Copy size={12} />
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+const ARCHIVE_NAMES: Record<string, string> = { GLACIER: "Glacier Flexible Retrieval", DEEP_ARCHIVE: "Glacier Deep Archive" };
+
+/** Where an archived object is, whether it is being restored or restored until when, and Restore…. */
+function ArchiveCallout({ bucket, objKey, storageClass, meta }: { bucket: string; objKey: string; storageClass: string | null; meta: ObjectMeta | null }) {
+  const where = storageClass ? (ARCHIVE_NAMES[storageClass] ?? formatStorageClass(storageClass)) : "an archive tier";
+  const restore = meta?.restore ?? null;
+  if (!meta) {
+    return (
+      <div className="callout archive" role="status">
+        <Snowflake size={14} />
+        <span>
+          Archived in {where}. <Loader2 size={12} className="spin" /> Checking whether it is restored…
+        </span>
+      </div>
+    );
+  }
+  if (!meta.archived) {
+    return (
+      <div className="callout archive restored" role="status">
+        <Snowflake size={14} />
+        <span>
+          Archived in {where}. <strong>{restore?.expiresAt ? `Restored until ${formatExact(restore.expiresAt)}` : "Readable now"}</strong>
+          {restore?.expiresAt ? ": it can be downloaded or copied until then." : "."}
+        </span>
+      </div>
+    );
+  }
+  if (restore?.inProgress) {
+    return (
+      <div className="callout archive" role="status">
+        <Snowflake size={14} />
+        <div className="grow">
+          <div>
+            Archived in {where}. <strong>Restore in progress</strong>: it can be downloaded or copied once S3 has finished.
+          </div>
+          <button type="button" className="link-btn archive-action" onClick={() => bumpObject(bucket, objKey)}>
+            <RefreshCw size={12} /> Check again
+          </button>
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="callout archive" role="status">
+      <Snowflake size={14} />
+      <div className="grow">
+        <div>
+          <strong>Archived in {where}.</strong> Restore it to download or copy.
+        </div>
+        <button type="button" className="btn btn-sm archive-action" onClick={() => openModal({ kind: "restore", bucket, key: objKey, storageClass })}>
+          <ArchiveRestore size={13} /> Restore…
+        </button>
       </div>
     </div>
   );
@@ -87,16 +147,30 @@ export function DetailsPanel() {
   const [showMore, setShowMore] = useState(false);
 
   const objKey = obj?.key ?? null;
+  // Bumped after a version is restored or deleted, or a restore is requested: read the metadata again.
+  const rev = useObjectRev(bucket ?? "", objKey ?? "");
+  const shownFor = useRef<string | null>(null);
   useEffect(() => {
-    setMeta(null);
-    setMetaError(null);
+    const id = bucket && objKey ? `${bucket}/${objKey}` : null;
+    // A new object starts empty; the same object being read again keeps its old metadata meanwhile.
+    if (shownFor.current !== id) {
+      setMeta(null);
+      setMetaError(null);
+      shownFor.current = id;
+    }
     if (!bucket || !objKey) return;
     let cancelled = false;
     setLoading(true);
     const t = setTimeout(() => {
       api
         .headObject(bucket, objKey)
-        .then((m) => !cancelled && setMeta(m))
+        .then((m) => {
+          rememberArchiveMeta(bucket, m);
+          if (!cancelled) {
+            setMeta(m);
+            setMetaError(null);
+          }
+        })
         .catch((e: AppError) => !cancelled && setMetaError(e))
         .finally(() => !cancelled && setLoading(false));
     }, 120); // debounce while arrowing through rows
@@ -105,7 +179,13 @@ export function DetailsPanel() {
       clearTimeout(t);
       setLoading(false);
     };
-  }, [bucket, objKey]);
+  }, [bucket, objKey, rev]);
+  const blocked = useArchiveBlocked(bucket, obj);
+  // Archived objects in a multiple selection (for "Restore archived…").
+  const archivedSelected = useMemo(
+    () => (sel.folders + sel.objects > 1 ? getSelected().objects.filter((o) => isArchiveClass(o.storageClass)).length : 0),
+    [sel],
+  );
 
   let body: ReactNode;
   if (!bucket) {
@@ -132,13 +212,18 @@ export function DetailsPanel() {
           </div>
         </div>
         <div className="dactions">
-          <button className="btn" onClick={() => void downloadObjects([obj])}>
+          <button className="btn" onClick={() => void downloadObjects([obj])} disabled={blocked} title={blocked ? ARCHIVED_REASON : undefined}>
             <Download size={14} /> Download
           </button>
           <button className="btn" onClick={() => void copyText(s3Uri(bucket, obj.key), "S3 URI")}>
             <Copy size={14} /> Copy URI
           </button>
         </div>
+        {(isArchiveClass(obj.storageClass) || m?.archived || m?.restore) && (
+          <div className="dsection">
+            <ArchiveCallout bucket={bucket} objKey={obj.key} storageClass={m?.storageClass ?? obj.storageClass} meta={m} />
+          </div>
+        )}
         <div className="dsection">
           <Field label="Size">
             {formatBytes(obj.size, 2)} <span className="muted">({obj.size.toLocaleString()} bytes)</span>
@@ -152,6 +237,7 @@ export function DetailsPanel() {
           </Field>
         </div>
         <ObjectTagsSection bucket={bucket} objKey={obj.key} />
+        <VersionsSection bucket={bucket} objKey={obj.key} name={obj.name} />
         <div className="dsection">
           <button type="button" className="disclosure" onClick={() => setShowMore((v) => !v)} aria-expanded={showMore}>
             <ChevronRight size={14} className={showMore ? "rot90" : ""} /> More details
@@ -271,6 +357,13 @@ export function DetailsPanel() {
             <Tags size={14} /> Edit tags for {(sel.folders + sel.objects).toLocaleString()} items…
           </button>
         </div>
+        {archivedSelected > 0 && (
+          <div className="dactions">
+            <button className="btn" onClick={() => requestRestoreArchived()}>
+              <ArchiveRestore size={14} /> Restore {plural(archivedSelected, "archived object")}…
+            </button>
+          </div>
+        )}
         <div className="dactions">
           <button className="btn btn-danger-ghost" onClick={() => requestDelete()}>
             <Trash2 size={14} /> Delete {(sel.folders + sel.objects).toLocaleString()} items…

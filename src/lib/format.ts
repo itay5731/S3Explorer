@@ -35,6 +35,14 @@ const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 const shortDate = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
 const shortDateYear = new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" });
 const exactFmt = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium" });
+const dateTimeFmt = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+
+/** Date and time to the minute ("6 Oct 2026, 19:03"); "" for a missing date. */
+export function formatDateTime(iso: string | null): string {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? iso : dateTimeFmt.format(new Date(t));
+}
 
 export function formatRelative(iso: string | null, now = Date.now()): string {
   if (!iso) return "—";

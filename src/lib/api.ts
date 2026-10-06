@@ -33,15 +33,18 @@ import {
   type LifecycleConfiguration,
   type LifecycleIssue,
   type ListPage,
+  type ObjectEntry,
   type ObjectMeta,
   type ProfileInfo,
   type RecentListing,
+  type RestoreRequest,
   type SaveConnectionInput,
   type SavedConnection,
   type Tag,
   type Transfer,
   type UpdateInfo,
   type UpdateProgress,
+  type VersionListing,
 } from "./types";
 
 export type Unlisten = () => void;
@@ -56,7 +59,8 @@ export type FileDropEvent =
 export interface Backend {
   listProfiles(): Promise<ProfileInfo[]>;
   connect(config: ConnectionConfig): Promise<ConnectionInfo>;
-  disconnect(): Promise<void>;
+  /** `cancelActive`: cancel every queued or running transfer, batch and job first. */
+  disconnect(cancelActive: boolean): Promise<void>;
   connectionStatus(): Promise<ConnectionInfo | null>;
   listBuckets(): Promise<Bucket[]>;
   listObjects(bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number): Promise<ListPage>;
@@ -91,6 +95,13 @@ export interface Backend {
   removeBatch(id: string): Promise<void>;
   listBatches(): Promise<Batch[]>;
   onBatchProgress(cb: (b: Batch) => void): Promise<Unlisten>;
+  // Object versions
+  listObjectVersions(bucket: string, key: string): Promise<VersionListing>;
+  downloadObjectVersion(bucket: string, key: string, versionId: string, destPath: string): Promise<string>;
+  restoreObjectVersion(bucket: string, key: string, versionId: string): Promise<ObjectEntry>;
+  deleteObjectVersion(bucket: string, key: string, versionId: string): Promise<void>;
+  // Archived objects
+  restoreObject(bucket: string, key: string, request: RestoreRequest): Promise<void>;
   startDownload(bucket: string, key: string, destPath: string): Promise<string>;
   startUpload(bucket: string, key: string, srcPath: string): Promise<string>;
   cancelTransfer(id: string): Promise<void>;
@@ -112,6 +123,8 @@ export interface Backend {
   openExternal(url: string): Promise<void>;
   notify(title: string, body?: string): Promise<void>;
   setWindowTitle(title: string): Promise<void>;
+  /** Does the OS window have focus (not just the document)? */
+  isWindowFocused(): Promise<boolean>;
   setZoom(scale: number): Promise<void>;
   // Platform helpers (dialogs, paths, shell, drag & drop)
   pickFiles(): Promise<string[]>;
@@ -146,7 +159,7 @@ export function toAppError(e: unknown): AppError {
 const tauriBackend: Backend = {
   listProfiles: () => invoke<ProfileInfo[]>("list_profiles"),
   connect: (config) => invoke<ConnectionInfo>("connect", { config }),
-  disconnect: () => invoke<void>("disconnect"),
+  disconnect: (cancelActive) => invoke<void>("disconnect", { cancelActive }),
   connectionStatus: () => invoke<ConnectionInfo | null>("connection_status"),
   listBuckets: () => invoke<Bucket[]>("list_buckets"),
   listObjects: (bucket, prefix, continuationToken, pageSize) =>
@@ -182,6 +195,12 @@ const tauriBackend: Backend = {
   removeBatch: (id) => invoke<void>("remove_batch", { id }),
   listBatches: () => invoke<Batch[]>("list_batches"),
   onBatchProgress: (cb) => listen<Batch>(BATCH_PROGRESS_EVENT, (e) => cb(e.payload)),
+  listObjectVersions: (bucket, key) => invoke<VersionListing>("list_object_versions", { bucket, key }),
+  downloadObjectVersion: (bucket, key, versionId, destPath) =>
+    invoke<string>("download_object_version", { bucket, key, versionId, destPath }),
+  restoreObjectVersion: (bucket, key, versionId) => invoke<ObjectEntry>("restore_object_version", { bucket, key, versionId }),
+  deleteObjectVersion: (bucket, key, versionId) => invoke<void>("delete_object_version", { bucket, key, versionId }),
+  restoreObject: (bucket, key, request) => invoke<void>("restore_object", { bucket, key, request }),
   startDownload: (bucket, key, destPath) => invoke<string>("start_download", { bucket, key, destPath }),
   startUpload: (bucket, key, srcPath) => invoke<string>("start_upload", { bucket, key, srcPath }),
   cancelTransfer: (id) => invoke<void>("cancel_transfer", { id }),
@@ -200,6 +219,7 @@ const tauriBackend: Backend = {
   appVersion: () => getVersion(),
   openExternal: (url) => openUrl(url),
   setWindowTitle: (title) => getCurrentWindow().setTitle(title),
+  isWindowFocused: () => getCurrentWindow().isFocused(),
   setZoom: (scale) => getCurrentWebview().setZoom(scale),
   async notify(title, body) {
     // The OS remembers the answer, so the permission prompt appears at most once.
@@ -271,7 +291,8 @@ async function call<K extends keyof Backend>(
 
 export const listProfiles = () => call("listProfiles");
 export const connect = (config: ConnectionConfig) => call("connect", config);
-export const disconnect = () => call("disconnect");
+/** Drop the connection. `cancelActive` cancels queued and running transfers, batches and jobs first. */
+export const disconnect = (cancelActive: boolean) => call("disconnect", cancelActive);
 export const connectionStatus = () => call("connectionStatus");
 export const listBuckets = () => call("listBuckets");
 export const listObjects = (bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number) =>
@@ -330,6 +351,19 @@ export async function probeFolder(request: BatchPlanRequest): Promise<BatchPrevi
     throw e;
   }
 }
+/** Every version of exactly `key`, newest first (at most 1,000; `truncated` beyond that). */
+export const listObjectVersions = (bucket: string, key: string) => call("listObjectVersions", bucket, key);
+/** Download one version (the normal parallel download, pinned to `versionId`). Returns the transfer id. */
+export const downloadObjectVersion = (bucket: string, key: string, versionId: string, destPath: string) =>
+  call("downloadObjectVersion", bucket, key, versionId, destPath);
+/** Copy an older version over the current one. Non-destructive: the current version becomes a previous one. */
+export const restoreObjectVersion = (bucket: string, key: string, versionId: string) =>
+  call("restoreObjectVersion", bucket, key, versionId);
+/** Permanently delete one version (or remove a delete marker). Cannot be undone. */
+export const deleteObjectVersion = (bucket: string, key: string, versionId: string) =>
+  call("deleteObjectVersion", bucket, key, versionId);
+/** Ask S3 to restore an archived object for `request.days` days. `Conflict` when already in progress. */
+export const restoreObject = (bucket: string, key: string, request: RestoreRequest) => call("restoreObject", bucket, key, request);
 export const startDownload = (bucket: string, key: string, destPath: string) =>
   call("startDownload", bucket, key, destPath);
 export const startUpload = (bucket: string, key: string, srcPath: string) => call("startUpload", bucket, key, srcPath);
@@ -358,6 +392,8 @@ export const openExternal = (url: string): Promise<void> =>
 export const notify = (title: string, body?: string) => call("notify", title, body);
 /** Set the text in the OS window title bar and taskbar. */
 export const setWindowTitle = (title: string) => call("setWindowTitle", title);
+/** True when the OS window has focus (the webview's `document.hasFocus()` can disagree). */
+export const isWindowFocused = () => call("isWindowFocused");
 /** Scale the whole interface: 1 is normal size. */
 export const setZoom = (scale: number) => call("setZoom", scale);
 

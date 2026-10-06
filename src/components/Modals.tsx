@@ -18,6 +18,9 @@ const ObjectTagsModal = lazy(() => import("./TagDialogs").then((m) => ({ default
 const BulkTagsModal = lazy(() => import("./TagDialogs").then((m) => ({ default: m.BulkTagsModal })));
 const UploadFolderModal = lazy(() => import("./BatchDialogs").then((m) => ({ default: m.UploadFolderModal })));
 const DownloadFoldersModal = lazy(() => import("./BatchDialogs").then((m) => ({ default: m.DownloadFoldersModal })));
+const RestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ default: m.RestoreModal })));
+const BulkRestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ default: m.BulkRestoreModal })));
+const VersionActionModal = lazy(() => import("./VersionDialogs").then((m) => ({ default: m.VersionActionModal })));
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
@@ -202,6 +205,7 @@ const PREVIEW_ACTION: Record<string, string> = {
   copy: "copy files",
   move: "move files",
   tag: "change tags",
+  restore: "restore archived files",
 };
 
 /** The preview line: spinner while counting, the error (with retry), or "N objects, X GiB". */
@@ -635,33 +639,43 @@ function PasteModal({
 
 function DisconnectModal({ running }: { running: number }) {
   const titleId = useId();
+  const [busy, setBusy] = useState(false);
   const close = () => openModal(null);
+  const leave = async (cancelActive: boolean) => {
+    setBusy(true);
+    // The disconnect clears the modal along with the rest of the session.
+    await disconnect(cancelActive);
+  };
   return (
-    <ModalShell onClose={close} labelledBy={titleId}>
+    <ModalShell onClose={close} busy={busy} labelledBy={titleId} wide>
       <div className="modal-head">
         <div className="modal-icon danger">
           <LogOut size={18} />
         </div>
         <div>
-          <h2 id={titleId}>
-            {running === 1 ? "1 operation is" : `${running.toLocaleString()} operations are`} still running. Disconnect anyway?
-          </h2>
-          <p className="muted small">Transfers and file operations are listed in the Activity panel.</p>
+          <h2 id={titleId}>{running === 1 ? "1 operation is" : `${running.toLocaleString()} operations are`} still running.</h2>
+          <p className="muted small">Transfers, folder transfers and file operations are listed in the Activity panel.</p>
         </div>
       </div>
-      <div className="modal-actions">
-        <button type="button" className="btn" onClick={close} data-autofocus>
-          Stay connected
+      <ul className="disconnect-choices muted small">
+        <li>
+          <strong>Cancel them and disconnect</strong>: everything queued or running stops. Files and objects already finished stay
+          as they are.
+        </li>
+        <li>
+          <strong>Let them finish</strong>: they keep running in the background after you disconnect.
+        </li>
+      </ul>
+      <div className="modal-actions disconnect-actions">
+        <button type="button" className="btn btn-danger" onClick={() => void leave(true)} disabled={busy}>
+          {busy && <Loader2 size={14} className="spin" />} Cancel them and disconnect
         </button>
-        <button
-          type="button"
-          className="btn btn-danger"
-          onClick={() => {
-            close();
-            void disconnect();
-          }}
-        >
-          Disconnect
+        <span className="grow" />
+        <button type="button" className="btn" onClick={() => void leave(false)} disabled={busy}>
+          Let them finish
+        </button>
+        <button type="button" className="btn btn-primary" onClick={close} disabled={busy} data-autofocus>
+          Stay connected
         </button>
       </div>
     </ModalShell>
@@ -701,6 +715,22 @@ function ModalSwitch() {
       return <BulkTagsModal bucket={modal.bucket} prefix={modal.prefix} items={modal.items} />;
     case "disconnect":
       return <DisconnectModal running={modal.running} />;
+    case "restore":
+      return <RestoreModal key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} storageClass={modal.storageClass} />;
+    case "bulkRestore":
+      return <BulkRestoreModal bucket={modal.bucket} prefix={modal.prefix} items={modal.items} deepArchive={modal.deepArchive} allDeep={modal.allDeep} />;
+    case "versionAction":
+      return (
+        <VersionActionModal
+          key={`${modal.action}/${modal.version.versionId}`}
+          action={modal.action}
+          bucket={modal.bucket}
+          objectKey={modal.key}
+          version={modal.version}
+          onlyVersion={modal.onlyVersion}
+          previousIsMarker={modal.previousIsMarker}
+        />
+      );
     case "uploadFolder":
       return (
         <Suspense fallback={null}>
