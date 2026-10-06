@@ -15,7 +15,7 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 ## What it does
 
 - **Connect** with an AWS profile from `~/.aws`, or with access keys. A custom endpoint makes it work with MinIO, Cloudflare R2, SeaweedFS, LocalStack and friends.
-- **List buckets**, including buckets in other regions. A bucket shared with you from another account can be added by name, `s3://` address or ARN and used like any other.
+- **List buckets**, including buckets in other regions. A bucket shared with you from another account can be added by name, `s3://` address or ARN (the "+" above the bucket list) and used like any other.
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
 - **Download in parallel parts.** Large objects are split into byte ranges and fetched over several connections at once.
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
@@ -199,7 +199,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.4.0`:
+Honest status, as of `v0.4.1`:
 
 | | |
 |---|---|

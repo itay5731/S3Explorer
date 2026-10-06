@@ -5,6 +5,12 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-06
+
+### Changed
+
+- **Shared buckets stay out of the way until you use them.** The sidebar no longer shows a "Shared with me" section when you have none. To add a bucket shared from another account, use the small "+" next to the reload button above the bucket list; the section appears once a shared bucket exists.
+
 ## [0.4.0] - 2026-10-06
 
 The buckets update. Manage buckets, not only the files in them: shared buckets from other accounts, tags on buckets and objects, a full editor for lifecycle rules, drag and drop, and a new look.
