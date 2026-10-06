@@ -1064,7 +1064,6 @@ pub(crate) async fn run_tag(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planned]) -
 mod tests {
     use super::*;
     use crate::models::{now_iso, Job, JobPhase, JobStatus};
-    use std::sync::Mutex;
 
     fn entry(total: u64) -> JobEntry {
         let job = Job {
@@ -1086,7 +1085,7 @@ mod tests {
             started_at: now_iso(),
             finished_at: None,
         };
-        JobEntry { seq: 0, record: Mutex::new(job), cancel: CancellationToken::new(), finished: CancellationToken::new() }
+        JobEntry::new(0, job)
     }
 
     fn planned(src: &str, dest: Option<&str>, etag: Option<&str>) -> Planned {

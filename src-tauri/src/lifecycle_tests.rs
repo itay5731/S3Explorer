@@ -12,6 +12,14 @@ use serde_json::json;
 
 // ---- helpers -------------------------------------------------------------------------------
 
+/// 2025-06-01T00:00:00Z: the fixtures' 2026/2027 dates are in the future as of this "now".
+const NOW: i64 = 1_748_736_000;
+
+/// Validation as of [`NOW`] (shadows the glob-imported clock-based one).
+fn validate_lifecycle(c: &LifecycleConfiguration) -> Vec<LifecycleIssue> {
+    validate_lifecycle_at(c, NOW)
+}
+
 fn n(i: i64) -> Option<Number> {
     Some(Number::from(i))
 }
@@ -552,7 +560,17 @@ fn v_days_positive_whole() {
         "whole number, 1 or more (it is 1.5)",
     );
     bad(LifecycleRule { expiration: exp_days(i64::from(i32::MAX) + 1), ..rule("a") }, Some("expiration.days"), "at most 2147483647");
-    bad(LifecycleRule { transitions: vec![tr_days(0, C::Glacier)], ..rule("a") }, Some("transitions[0].days"), "1 or more");
+    // transitions may use day 0, but not less
+    ok(LifecycleRule { transitions: vec![tr_days(0, C::Glacier)], ..rule("a") });
+    assert_eq!(
+        bad(LifecycleRule { transitions: vec![tr_days(-1, C::Glacier)], ..rule("a") }, Some("transitions[0].days"), "0 or more"),
+        "Days must be a whole number, 0 or more (it is -1)."
+    );
+    bad(
+        LifecycleRule { transitions: vec![LifecycleTransition { days: f(0.5), date: None, storage_class: C::Glacier }], ..rule("a") },
+        Some("transitions[0].days"),
+        "whole number, 0 or more (it is 0.5)",
+    );
 }
 
 #[test]
@@ -571,14 +589,22 @@ fn v_date_midnight_utc() {
 
 #[test]
 fn v_infrequent_access_minimum_30_days() {
-    for c in [C::StandardIa, C::OnezoneIa, C::IntelligentTiering] {
+    // Only STANDARD_IA and ONEZONE_IA have the 30-day minimum.
+    for c in [C::StandardIa, C::OnezoneIa] {
         ok(LifecycleRule { transitions: vec![tr_days(30, c)], ..rule("a") });
         let m = bad(LifecycleRule { transitions: vec![tr_days(29, c)], ..rule("a") }, Some("transitions[0].days"), "at least 30 days");
         assert_eq!(m, format!("A transition to {} must be at least 30 days after creation (this one is after 29 days).", c.as_str()));
+        bad(LifecycleRule { transitions: vec![tr_days(0, c)], ..rule("a") }, Some("transitions[0].days"), "(this one is on day 0)");
     }
-    // archive classes have no minimum (beyond 1 day)
-    ok(LifecycleRule { transitions: vec![tr_days(1, C::GlacierIr)], ..rule("a") });
-    ok(LifecycleRule { transitions: vec![tr_days(1, C::DeepArchive)], ..rule("a") });
+    assert_eq!(
+        bad(LifecycleRule { transitions: vec![tr_days(10, C::StandardIa)], ..rule("a") }, Some("transitions[0].days"), "at least 30"),
+        "A transition to STANDARD_IA must be at least 30 days after creation (this one is after 10 days)."
+    );
+    // INTELLIGENT_TIERING and every archive class may move objects on day 0.
+    for c in [C::IntelligentTiering, C::GlacierIr, C::Glacier, C::DeepArchive] {
+        ok(LifecycleRule { transitions: vec![tr_days(0, c)], ..rule("a") });
+        ok(LifecycleRule { transitions: vec![tr_days(1, c)], ..rule("a") });
+    }
 }
 
 #[test]
@@ -593,17 +619,42 @@ fn v_distinct_storage_classes() {
 }
 
 #[test]
-fn v_same_tier_cannot_follow() {
+fn v_strict_waterfall() {
+    // STANDARD_IA -> INTELLIGENT_TIERING -> ONEZONE_IA -> GLACIER_IR -> GLACIER -> DEEP_ARCHIVE
+    ok(LifecycleRule { transitions: vec![tr_days(30, C::StandardIa), tr_days(60, C::OnezoneIa)], ..rule("a") });
+    ok(LifecycleRule { transitions: vec![tr_days(0, C::IntelligentTiering), tr_days(30, C::OnezoneIa)], ..rule("a") });
+    ok(LifecycleRule { transitions: vec![tr_days(30, C::StandardIa), tr_days(31, C::IntelligentTiering)], ..rule("a") });
+    ok(LifecycleRule {
+        transitions: vec![
+            tr_days(30, C::StandardIa),
+            tr_days(45, C::IntelligentTiering),
+            tr_days(60, C::OnezoneIa),
+            tr_days(90, C::GlacierIr),
+            tr_days(120, C::Glacier),
+            tr_days(300, C::DeepArchive),
+        ],
+        expiration: exp_days(400),
+        ..rule("a")
+    });
     let m = bad(
-        LifecycleRule { transitions: vec![tr_days(30, C::StandardIa), tr_days(90, C::OnezoneIa)], ..rule("a") },
-        Some("transitions[1].storageClass"),
-        "same tier",
+        LifecycleRule { transitions: vec![tr_days(30, C::OnezoneIa), tr_days(60, C::StandardIa)], ..rule("a") },
+        Some("transitions[0].days"),
+        "ONEZONE_IA must come later",
     );
-    assert!(m.starts_with("STANDARD_IA and ONEZONE_IA are the same tier"), "{m}");
+    assert_eq!(
+        m,
+        "Transition to ONEZONE_IA after 30 days comes before (or at the same time as) the transition to STANDARD_IA after 60 days: \
+transitions follow S3's order STANDARD_IA → INTELLIGENT_TIERING → ONEZONE_IA → GLACIER_IR → GLACIER → DEEP_ARCHIVE, so ONEZONE_IA must come later."
+    );
     bad(
-        LifecycleRule { transitions: vec![tr_days(30, C::IntelligentTiering), tr_days(90, C::StandardIa)], ..rule("a") },
-        Some("transitions[1].storageClass"),
-        "same tier",
+        LifecycleRule { transitions: vec![tr_days(40, C::IntelligentTiering), tr_days(60, C::StandardIa)], ..rule("a") },
+        Some("transitions[0].days"),
+        "INTELLIGENT_TIERING must come later",
+    );
+    bad(
+        LifecycleRule { transitions: vec![tr_days(30, C::OnezoneIa), tr_days(31, C::IntelligentTiering)], ..rule("a") },
+        Some("transitions[0].days"),
+        "ONEZONE_IA must come later",
     );
 }
 
@@ -618,12 +669,12 @@ fn v_only_colder() {
     let m = bad(
         LifecycleRule { transitions: vec![tr_days(60, C::StandardIa), tr_days(40, C::Glacier)], ..rule("a") },
         Some("transitions[1].days"),
-        "colder",
+        "must come later",
     );
     assert_eq!(
         m,
         "Transition to GLACIER after 40 days comes before (or at the same time as) the transition to STANDARD_IA after 60 days: \
-objects can only move to colder storage over time, so GLACIER must come later."
+transitions follow S3's order STANDARD_IA → INTELLIGENT_TIERING → ONEZONE_IA → GLACIER_IR → GLACIER → DEEP_ARCHIVE, so GLACIER must come later."
     );
     // same time is not later
     bad(
@@ -662,8 +713,31 @@ fn v_archive_30_days_after_infrequent_access() {
         "Transition to GLACIER after 45 days comes before the 30-day minimum for the earlier STANDARD_IA transition (after 30 days): \
 it must be after at least 60 days."
     );
+    assert_eq!(
+        bad(
+            LifecycleRule { transitions: vec![tr_days(30, C::StandardIa), tr_days(50, C::Glacier)], ..rule("a") },
+            Some("transitions[1].days"),
+            "30-day minimum",
+        ),
+        "Transition to GLACIER after 50 days comes before the 30-day minimum for the earlier STANDARD_IA transition (after 30 days): it must be after at least 60 days."
+    );
+    bad(
+        LifecycleRule { transitions: vec![tr_days(30, C::OnezoneIa), tr_days(31, C::GlacierIr)], ..rule("a") },
+        Some("transitions[1].days"),
+        "30-day minimum for the earlier ONEZONE_IA transition",
+    );
     // no gap needed between two archive tiers
     ok(LifecycleRule { transitions: vec![tr_days(10, C::GlacierIr), tr_days(11, C::Glacier)], ..rule("a") });
+    ok(LifecycleRule { transitions: vec![tr_days(0, C::Glacier), tr_days(90, C::DeepArchive)], ..rule("a") });
+    // no gap needed after INTELLIGENT_TIERING
+    ok(LifecycleRule { transitions: vec![tr_days(0, C::IntelligentTiering), tr_days(1, C::Glacier)], ..rule("a") });
+    ok(LifecycleRule { transitions: vec![tr_days(30, C::IntelligentTiering), tr_days(31, C::DeepArchive)], ..rule("a") });
+    // still strictly later
+    bad(
+        LifecycleRule { transitions: vec![tr_days(0, C::IntelligentTiering), tr_days(0, C::Glacier)], ..rule("a") },
+        Some("transitions[1].days"),
+        "GLACIER on day 0 comes before (or at the same time as) the transition to INTELLIGENT_TIERING on day 0",
+    );
     // dates
     ok(LifecycleRule {
         transitions: vec![tr_date("2026-01-01", C::OnezoneIa), tr_date("2026-01-31", C::DeepArchive)],
@@ -784,6 +858,8 @@ fn v_object_size_range() {
 fn v_filter_tags_follow_tag_limits() {
     let tagged = |tags: Vec<Tag>| LifecycleRule { filter: LifecycleFilter { tags, ..Default::default() }, ..rule("a") };
     ok(tagged(vec![t("env", "prod"), t("Env", "x"), t("team", "")]));
+    ok(tagged(vec![t("team\u{00A0}name", "a\u{3000}b")])); // any \p{Z} space separator
+    bad(tagged(vec![t("a\tb", "1")]), Some("filter.tags[0].key"), "aren't allowed");
     ok(tagged((0..10).map(|i| t(&format!("k{i}"), "v")).collect()));
     bad(tagged((0..11).map(|i| t(&format!("k{i}"), "v")).collect()), Some("filter.tags"), "at most 10 tags");
     bad(tagged(vec![t("ok", "1"), t("aws:x", "1")]), Some("filter.tags[1].key"), "reserved");
@@ -849,7 +925,7 @@ fn v_noncurrent_order() {
     bad(
         r(vec![nct(60, None, C::StandardIa), nct(30, None, C::Glacier)], None),
         Some("noncurrentVersionTransitions[1].noncurrentDays"),
-        "colder",
+        "must come later",
     );
     let m = bad(
         r(vec![nct(30, None, C::Glacier)], nce(30, None)),
@@ -981,4 +1057,198 @@ fn versioning_status() {
     assert_eq!(versioning_from_sdk(Some(&s3::BucketVersioningStatus::Enabled)).expect("on"), BucketVersioning::Enabled);
     assert_eq!(versioning_from_sdk(Some(&s3::BucketVersioningStatus::Suspended)).expect("s"), BucketVersioning::Suspended);
     assert!(versioning_from_sdk(Some(&s3::BucketVersioningStatus::from("Weird"))).is_err());
+}
+
+// ---- past dates (non-blocking note) --------------------------------------------------------
+
+#[test]
+fn v_past_date_is_a_note_not_an_error() {
+    // NOW is 2025-06-01: that day itself and earlier are "today or in the past".
+    for d in ["2025-06-01", "2024-01-01T00:00:00Z"] {
+        let i = issues_of(LifecycleRule { expiration: exp_date(d), ..rule("a") });
+        assert_eq!(i.len(), 1, "{i:#?}");
+        assert_eq!(i[0].field.as_deref(), Some("expiration.date"));
+        assert_eq!(
+            i[0].message,
+            "Note: this date is today or in the past, so every matching object, and every new one, is deleted at the next daily run."
+        );
+    }
+    let i = issues_of(LifecycleRule { transitions: vec![tr_date("2025-01-01", C::Glacier)], expiration: None, ..rule("a") });
+    assert_eq!(i.len(), 1);
+    assert_eq!(i[0].field.as_deref(), Some("transitions[0].date"));
+    assert!(i[0].message.starts_with(NOTE_PREFIX) && i[0].message.contains("is moved at the next daily run"), "{}", i[0].message);
+    ok(LifecycleRule { expiration: exp_date("2025-06-02"), ..rule("a") });
+}
+
+// ---- put_lifecycle against a scripted server (read-back, lag, rollback) ----------------------
+
+mod server {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::testutil::{FakeS3, Reply};
+
+    /// One stored rule as S3 XML: id, prefix, expiration days, optional noncurrent expiration.
+    fn xml_rule(id: &str, prefix: &str, days: i64, nce: Option<i64>) -> String {
+        let nce = nce
+            .map(|d| format!("<NoncurrentVersionExpiration><NoncurrentDays>{d}</NoncurrentDays></NoncurrentVersionExpiration>"))
+            .unwrap_or_default();
+        format!(
+            "<Rule><ID>{id}</ID><Filter><Prefix>{prefix}</Prefix></Filter><Status>Enabled</Status><Expiration><Days>{days}</Days></Expiration>{nce}</Rule>"
+        )
+    }
+    fn xml(rules: &[String]) -> Option<String> {
+        Some(format!(r#"<?xml version="1.0" encoding="UTF-8"?><LifecycleConfiguration>{}</LifecycleConfiguration>"#, rules.concat()))
+    }
+    fn model(id: &str, prefix_: &str, days: i64, nce_days: Option<i64>) -> LifecycleRule {
+        LifecycleRule {
+            filter: prefix(prefix_),
+            expiration: exp_days(days),
+            noncurrent_version_expiration: nce_days.and_then(|d| nce(d, None)),
+            ..rule(id)
+        }
+    }
+
+    type Get = Result<Option<String>, u16>;
+
+    /// Answers GETs from `gets` in order (the last one repeats; `Ok(None)` = no configuration,
+    /// `Err(403)` = AccessDenied); PUT and DELETE succeed when `write` is 200, else are refused.
+    async fn server(gets: Vec<Get>, write: u16) -> FakeS3 {
+        let q = Arc::new(Mutex::new(VecDeque::from(gets)));
+        FakeS3::start(move |r| match r.method.as_str() {
+            "GET" => {
+                let mut q = q.lock().unwrap_or_else(|p| p.into_inner());
+                let next = if q.len() > 1 { q.pop_front() } else { q.front().cloned() };
+                match next {
+                    Some(Ok(Some(body))) => Reply::xml(200, &body),
+                    Some(Ok(None)) => {
+                        Reply::xml(404, "<Error><Code>NoSuchLifecycleConfiguration</Code><Message>none</Message></Error>")
+                    }
+                    Some(Err(403)) => Reply::xml(403, "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"),
+                    _ => Reply::status(500),
+                }
+            }
+            "PUT" if write == 200 => Reply::status(200),
+            "DELETE" if write == 200 => Reply::status(204),
+            _ => Reply::xml(400, "<Error><Code>InvalidRequest</Code><Message>refused</Message></Error>"),
+        })
+        .await
+    }
+
+    fn fast() -> Vec<Duration> {
+        vec![Duration::ZERO, Duration::from_millis(5), Duration::from_millis(5), Duration::from_millis(5)]
+    }
+    fn puts(s3: &FakeS3) -> usize {
+        s3.count(|r| r.method == "PUT")
+    }
+    fn deletes(s3: &FakeS3) -> usize {
+        s3.count(|r| r.method == "DELETE")
+    }
+
+    fn old() -> (LifecycleConfiguration, Option<String>) {
+        (cfg(vec![model("old", "logs/", 365, None)]), xml(&[xml_rule("old", "logs/", 365, None)]))
+    }
+    fn new() -> (LifecycleConfiguration, Option<String>) {
+        (cfg(vec![model("new", "tmp/", 400, Some(30))]), xml(&[xml_rule("new", "tmp/", 400, Some(30))]))
+    }
+
+    #[tokio::test]
+    async fn stale_read_after_put_is_lag_not_a_drop() {
+        let ((a, ax), (b, bx)) = (old(), new());
+        // pre-check A, read-back A (stale), then B
+        let s3 = server(vec![Ok(ax.clone()), Ok(ax), Ok(bx)], 200).await;
+        let got = put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect("saved");
+        assert_eq!(got, Some(b));
+        assert_eq!((puts(&s3), deletes(&s3)), (1, 0), "nothing was put back");
+    }
+
+    #[tokio::test]
+    async fn stale_read_after_delete_is_lag() {
+        let (a, ax) = old();
+        let s3 = server(vec![Ok(ax.clone()), Ok(ax), Ok(None)], 200).await;
+        let got = put_lifecycle_with(&s3.client(), "b", &cfg(vec![]), Some(&a), &fast()).await.expect("deleted");
+        assert_eq!(got, None);
+        assert_eq!((puts(&s3), deletes(&s3)), (0, 1), "no PUT restoring the deleted rule");
+    }
+
+    #[tokio::test]
+    async fn lag_that_never_resolves_is_not_a_drop() {
+        let ((a, ax), (b, _)) = (old(), new());
+        let s3 = server(vec![Ok(ax)], 200).await;
+        let e = put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect_err("unconfirmed");
+        assert!(e.message.starts_with("Saved, but reading back failed: after about 20 seconds"), "{}", e.message);
+        assert_eq!(puts(&s3), 1, "nothing put back");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_field_seen_twice_is_put_back() {
+        let ((a, ax), (b, _)) = (old(), new());
+        let dropped = xml(&[xml_rule("new", "tmp/", 400, None)]);
+        // pre-check A; read-back B-without-nce twice; after the restore PUT, A.
+        let s3 = server(vec![Ok(ax.clone()), Ok(dropped.clone()), Ok(dropped), Ok(ax)], 200).await;
+        let e = put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect_err("dropped");
+        assert_eq!(e.code, ErrorCode::NotSupported);
+        assert!(e.message.contains("rule 1 (“new”): noncurrent-version expiration"), "{}", e.message);
+        assert!(e.message.ends_with("The previous configuration was put back, so nothing changed."), "{}", e.message);
+        assert_eq!(puts(&s3), 2, "the write and the restore");
+        let restore =
+            s3.requests().into_iter().filter(|r| r.method == "PUT").nth(1).map(|r| String::from_utf8_lossy(&r.body).to_string());
+        assert!(restore.unwrap_or_default().contains("<ID>old</ID>"));
+    }
+
+    #[tokio::test]
+    async fn a_different_read_once_then_the_target_is_saved() {
+        let ((a, ax), (b, bx)) = (old(), new());
+        let dropped = xml(&[xml_rule("new", "tmp/", 400, None)]);
+        let s3 = server(vec![Ok(ax), Ok(dropped), Ok(bx)], 200).await;
+        assert_eq!(put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect("saved"), Some(b));
+        assert_eq!(puts(&s3), 1);
+    }
+
+    #[tokio::test]
+    async fn someone_elses_rules_are_never_overwritten_by_a_restore() {
+        let ((a, ax), (b, _)) = (old(), new());
+        let theirs = xml(&[xml_rule("theirs", "x/", 10, None)]);
+        let s3 = server(vec![Ok(ax), Ok(theirs.clone()), Ok(theirs)], 200).await;
+        let e = put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect_err("changed");
+        assert_eq!((e.code, e.message.as_str()), (ErrorCode::Conflict, CHANGED_AFTER_SAVE));
+        assert_eq!(puts(&s3), 1);
+    }
+
+    #[tokio::test]
+    async fn write_error_but_stored_after_all_is_success() {
+        let ((a, ax), (b, bx)) = (old(), new());
+        let s3 = server(vec![Ok(ax), Ok(bx)], 400).await;
+        assert_eq!(put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect("saved"), Some(b));
+        // and a refused write that changed nothing says so
+        let ((a, ax), (b, _)) = (old(), new());
+        let s3 = server(vec![Ok(ax)], 400).await;
+        let e = put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect_err("refused");
+        assert_eq!(e.message, "The server refused the lifecycle configuration (InvalidRequest: refused). Nothing was changed.");
+    }
+
+    #[tokio::test]
+    async fn failed_read_back_after_a_successful_write() {
+        let ((a, ax), (b, _)) = (old(), new());
+        let s3 = server(vec![Ok(ax), Err(403)], 200).await;
+        let e = put_lifecycle_with(&s3.client(), "b", &b, Some(&a), &fast()).await.expect_err("read-back fails");
+        assert_eq!(e.code, ErrorCode::AccessDenied);
+        assert_eq!(e.message, "Saved, but reading back failed: AccessDenied: Access Denied. Reload to see the current state.");
+        assert_eq!(puts(&s3), 1);
+    }
+
+    #[tokio::test]
+    async fn a_past_date_note_does_not_block_saving() {
+        let c = cfg(vec![LifecycleRule { expiration: exp_date("2020-01-01T00:00:00Z"), ..rule("past") }]);
+        let issues = crate::lifecycle::validate_lifecycle(&c);
+        assert!(!issues.is_empty() && issues.iter().all(|i| i.message.starts_with(NOTE_PREFIX)), "{issues:?}");
+        let stored = xml(&[
+            "<Rule><ID>past</ID><Filter></Filter><Status>Enabled</Status><Expiration><Date>2020-01-01T00:00:00Z</Date></Expiration></Rule>"
+                .to_string(),
+        ]);
+        let s3 = server(vec![Ok(None), Ok(stored)], 200).await;
+        assert_eq!(put_lifecycle_with(&s3.client(), "b", &c, None, &fast()).await.expect("saved"), Some(c));
+    }
 }

@@ -7,6 +7,8 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::LazyLock;
 
+use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::types::{Tag as S3Tag, Tagging};
 use aws_sdk_s3::Client;
 
@@ -23,11 +25,12 @@ pub const KEY_MAX_CHARS: usize = 128;
 pub const VALUE_MAX_CHARS: usize = 256;
 pub const RESERVED_KEY_PREFIX: &str = "aws:";
 
-/// Letters, numbers, spaces and `+ - = . _ : / @` (the UI uses the same Unicode classes).
+/// Letters, numbers, space separators (any Unicode `\p{Z}`, as AWS allows) and `+ - = . _ : / @`
+/// (the UI uses the same Unicode classes).
 static ALLOWED: LazyLock<regex::Regex> = LazyLock::new(|| {
     // A fixed, valid pattern: this cannot fail at run time.
     #[allow(clippy::expect_used)]
-    regex::Regex::new(r"^[\p{L}\p{N} +\-=._:/@]*$").expect("static tag pattern")
+    regex::Regex::new(r"^[\p{L}\p{N}\p{Z}+\-=._:/@]*$").expect("static tag pattern")
 });
 
 pub const ALLOWED_CHARS_TEXT: &str = "letters, numbers, spaces and + - = . _ : / @";
@@ -185,6 +188,55 @@ fn from_sdk(set: &[S3Tag]) -> Vec<Tag> {
     set.iter().map(|t| Tag::new(t.key(), t.value())).collect()
 }
 
+/// Per-object failure when an object-level tagging call answers HTTP 405: the object's current
+/// version is a delete marker (not a missing feature).
+pub const DELETE_MARKER: &str = "The object was deleted (its current version is a delete marker).";
+
+/// An object-level tagging error: 405 / `MethodNotAllowed` is a delete marker (`NoSuchKey`);
+/// NotImplemented / 501 stays `NotSupported`.
+fn object_err<E>(e: SdkError<E, HttpResponse>) -> AppError
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    let status = e.raw_response().map(|r| r.status().as_u16());
+    let method_not_allowed = e.as_service_error().and_then(|s| s.code()) == Some("MethodNotAllowed");
+    if status == Some(405) || method_not_allowed {
+        return AppError::new(ErrorCode::NoSuchKey, DELETE_MARKER);
+    }
+    feature(e.into(), "object tags")
+}
+
+/// AWS system tags (`aws:...`, e.g. from CloudFormation): shown, passed through, never written changed.
+pub fn is_system_tag(key: &str) -> bool {
+    key.get(..RESERVED_KEY_PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_KEY_PREFIX))
+}
+
+/// The tag set to write for `tags`, given the set the UI loaded (`expected`). An `aws:` tag is
+/// accepted only when the same key and value are in `expected`; every system tag in `expected` is
+/// kept (they can't be removed here either); the other tags are validated normally. At most `max`
+/// in total.
+pub fn with_system_tags(tags: &[Tag], expected: &[Tag], max: usize) -> AppResult<Vec<Tag>> {
+    let system: Vec<Tag> = expected.iter().filter(|t| is_system_tag(&t.key)).cloned().collect();
+    for t in tags.iter().filter(|t| is_system_tag(&t.key)) {
+        if !system.iter().any(|s| s.key == t.key && s.value == t.value) {
+            return Err(AppError::invalid(format!(
+                "The tag {} is an AWS system tag (its key starts with “aws:”); it can't be added or changed here.",
+                shown(&t.key)
+            )));
+        }
+    }
+    let user: Vec<Tag> = tags.iter().filter(|t| !is_system_tag(&t.key)).cloned().collect();
+    validate_tags(&user, max)?;
+    let total = system.len() + user.len();
+    if total > max {
+        return Err(AppError::invalid(format!(
+            "At most {max} tags are allowed here; there are {total}, including {} AWS system tags.",
+            system.len()
+        )));
+    }
+    Ok(system.into_iter().chain(user).collect())
+}
+
 /// Rewrites a `NotSupported` error with a plain sentence naming the feature.
 fn feature(e: AppError, what: &str) -> AppError {
     if e.code == ErrorCode::NotSupported {
@@ -216,8 +268,10 @@ pub async fn get_bucket_tags(client: &Client, bucket: &str) -> AppResult<Vec<Tag
 
 /// Replaces the bucket's tag set with `tags` (empty: `DeleteBucketTagging`) if the current set
 /// equals `expected` (as a set), then returns what is stored. Mismatch: `Conflict`, nothing written.
+/// AWS system tags in `expected` are passed through (see [`with_system_tags`]), so the tagging is
+/// never deleted while the bucket has one.
 pub async fn put_bucket_tags(client: &Client, bucket: &str, tags: &[Tag], expected: &[Tag]) -> AppResult<Vec<Tag>> {
-    validate_tags(tags, BUCKET_MAX_TAGS)?;
+    let tags = &with_system_tags(tags, expected, BUCKET_MAX_TAGS)?;
     let current = get_bucket_tags(client, bucket).await?;
     if !same_set(&current, expected) {
         return Err(AppError::new(ErrorCode::Conflict, BUCKET_CONFLICT));
@@ -233,7 +287,7 @@ pub async fn put_bucket_tags(client: &Client, bucket: &str, tags: &[Tag], expect
             .await
             .map_err(|e| feature(e.into(), "bucket tags"))?;
     }
-    get_bucket_tags(client, bucket).await
+    get_bucket_tags(client, bucket).await.map_err(AppError::saved_but_unread)
 }
 
 /// `GetObjectTagging` (an object without tags has an empty set).
@@ -244,7 +298,7 @@ pub async fn get_object_tags(client: &Client, bucket: &str, key: &str) -> AppRes
         .key(key)
         .send()
         .await
-        .map_err(|e| feature(e.into(), "object tags"))?;
+        .map_err(object_err)?;
     Ok(from_sdk(out.tag_set()))
 }
 
@@ -257,7 +311,7 @@ async fn write_object_tags(client: &Client, bucket: &str, key: &str, tags: &[Tag
             .key(key)
             .send()
             .await
-            .map_err(|e| feature(e.into(), "object tags"))?;
+            .map_err(object_err)?;
     } else {
         client
             .put_object_tagging()
@@ -266,7 +320,7 @@ async fn write_object_tags(client: &Client, bucket: &str, key: &str, tags: &[Tag
             .tagging(to_sdk(tags)?)
             .send()
             .await
-            .map_err(|e| feature(e.into(), "object tags"))?;
+            .map_err(object_err)?;
     }
     Ok(())
 }
@@ -282,13 +336,13 @@ pub async fn put_object_tags(
     if key.is_empty() {
         return Err(AppError::invalid("An object key is required"));
     }
-    validate_tags(tags, OBJECT_MAX_TAGS)?;
+    let tags = &with_system_tags(tags, expected, OBJECT_MAX_TAGS)?;
     let current = get_object_tags(client, bucket, key).await?;
     if !same_set(&current, expected) {
         return Err(AppError::new(ErrorCode::Conflict, OBJECT_CONFLICT));
     }
     write_object_tags(client, bucket, key, tags).await?;
-    get_object_tags(client, bucket, key).await
+    get_object_tags(client, bucket, key).await.map_err(AppError::saved_but_unread)
 }
 
 pub const OBJECT_GONE: &str = "NoSuchKey: The object no longer exists.";
@@ -296,7 +350,7 @@ pub const OBJECT_GONE: &str = "NoSuchKey: The object no longer exists.";
 /// One object of a bulk tag job. `Err` carries the per-object message and the error code.
 pub async fn tag_object(client: &Client, bucket: &str, key: &str, op: &TagOperation) -> Result<(), AppError> {
     let gone = |e: AppError| {
-        if e.code == ErrorCode::NoSuchKey {
+        if e.code == ErrorCode::NoSuchKey && e.message != DELETE_MARKER {
             AppError::new(ErrorCode::NoSuchKey, OBJECT_GONE)
         } else {
             e
@@ -401,6 +455,16 @@ mod tests {
     }
 
     #[test]
+    fn unicode_space_separators_are_allowed() {
+        // non-breaking space, ideographic space, thin space: all \p{Z}
+        for k in ["a\u{00A0}b", "a\u{3000}b", "a\u{2009}b"] {
+            assert!(validate_tags(&[t(k, k)], 10).is_ok(), "{k:?}");
+        }
+        assert!(msg(validate_tags(&[t("a\tb", "v")], 10)).contains("aren't allowed"));
+        assert!(msg(validate_tags(&[t("ok", "a\nb")], 10)).contains("aren't allowed"));
+    }
+
+    #[test]
     fn long_keys_are_shortened_in_messages() {
         let key = "x".repeat(200);
         let m = msg(validate_tags(&[t(&key, "")], 10));
@@ -465,5 +529,146 @@ mod tests {
         let v = serde_json::to_value(TagOperation { mode: TagMode::Merge, set: vec![t("k", "v")], remove: vec!["r".into()] })
             .expect("json");
         assert_eq!(v, serde_json::json!({"mode": "merge", "set": [{"key": "k", "value": "v"}], "remove": ["r"]}));
+    }
+}
+
+/// Against a scripted fake S3: system-tag pass-through, read-back failures, delete markers.
+#[cfg(test)]
+mod server_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::testutil::{FakeS3, Reply, Req};
+
+    const STACK: &str = "aws:cloudformation:stack-name";
+
+    fn tagging(tags: &[(&str, &str)]) -> String {
+        let t: String = tags.iter().map(|(k, v)| format!("<Tag><Key>{k}</Key><Value>{v}</Value></Tag>")).collect();
+        format!(r#"<?xml version="1.0" encoding="UTF-8"?><Tagging><TagSet>{t}</TagSet></Tagging>"#)
+    }
+
+    fn put_body(s3: &FakeS3) -> Option<String> {
+        s3.requests().into_iter().find(|r| r.method == "PUT").map(|r| String::from_utf8_lossy(&r.body).to_string())
+    }
+
+    fn is_tagging(r: &Req, m: &str) -> bool {
+        r.method == m && r.has_query("tagging")
+    }
+
+    /// A bucket holding a CloudFormation system tag and one user tag.
+    async fn stack_bucket() -> FakeS3 {
+        FakeS3::start(|r| match r.method.as_str() {
+            "GET" => Reply::xml(200, &tagging(&[(STACK, "prod-stack"), ("env", "prod")])),
+            "PUT" => Reply::status(204),
+            "DELETE" => Reply::status(204),
+            _ => Reply::status(500),
+        })
+        .await
+    }
+
+    fn loaded() -> Vec<Tag> {
+        vec![Tag::new(STACK, "prod-stack"), Tag::new("env", "prod")]
+    }
+
+    #[tokio::test]
+    async fn get_returns_system_tags() {
+        let s3 = stack_bucket().await;
+        assert_eq!(get_bucket_tags(&s3.client(), "b").await.expect("get"), loaded());
+    }
+
+    #[tokio::test]
+    async fn editing_a_user_tag_passes_the_system_tag_through() {
+        let s3 = stack_bucket().await;
+        let next = vec![Tag::new(STACK, "prod-stack"), Tag::new("env", "dev")];
+        put_bucket_tags(&s3.client(), "b", &next, &loaded()).await.expect("put");
+        let body = put_body(&s3).expect("a PUT was sent");
+        assert!(body.contains(&format!("<Key>{STACK}</Key><Value>prod-stack</Value>")), "{body}");
+        assert!(body.contains("<Key>env</Key><Value>dev</Value>"), "{body}");
+        // The UI may also leave the read-only system tag out: it is still kept.
+        let s3 = stack_bucket().await;
+        put_bucket_tags(&s3.client(), "b", &[Tag::new("env", "dev")], &loaded()).await.expect("put");
+        assert!(put_body(&s3).expect("PUT").contains(STACK));
+    }
+
+    #[tokio::test]
+    async fn removing_every_user_tag_writes_only_the_system_tag() {
+        let s3 = stack_bucket().await;
+        put_bucket_tags(&s3.client(), "b", &[], &loaded()).await.expect("put");
+        assert_eq!(s3.count(|r| is_tagging(r, "DELETE")), 0, "never DeleteBucketTagging while a system tag exists");
+        let body = put_body(&s3).expect("a PUT was sent");
+        assert!(body.contains(STACK) && !body.contains("<Key>env</Key>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn new_or_changed_system_tags_are_rejected() {
+        let s3 = stack_bucket().await;
+        for bad in [
+            vec![Tag::new(STACK, "prod-stack"), Tag::new("aws:new", "x"), Tag::new("env", "prod")],
+            vec![Tag::new(STACK, "other-stack"), Tag::new("env", "prod")],
+        ] {
+            let e = put_bucket_tags(&s3.client(), "b", &bad, &loaded()).await.expect_err("rejected");
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.contains("AWS system tag"), "{}", e.message);
+        }
+        assert_eq!(s3.count(|r| r.method == "PUT" || r.method == "DELETE"), 0, "nothing written");
+        // Without a system tag in expected, an empty set still deletes the tagging.
+        let plain = FakeS3::start(|r| match r.method.as_str() {
+            "GET" => Reply::xml(200, &tagging(&[("env", "prod")])),
+            _ => Reply::status(204),
+        })
+        .await;
+        put_bucket_tags(&plain.client(), "b", &[], &[Tag::new("env", "prod")]).await.expect("put");
+        assert_eq!(plain.count(|r| is_tagging(r, "DELETE")), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_back_is_not_a_failed_save() {
+        let gets = Arc::new(AtomicUsize::new(0));
+        let g = gets.clone();
+        let s3 = FakeS3::start(move |r| match r.method.as_str() {
+            // The check before the write succeeds; the read-back after it is denied.
+            "GET" if g.fetch_add(1, Ordering::SeqCst) == 0 => Reply::xml(200, &tagging(&[("env", "prod")])),
+            "GET" => Reply::xml(403, "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"),
+            _ => Reply::status(204),
+        })
+        .await;
+        let e = put_bucket_tags(&s3.client(), "b", &[Tag::new("env", "dev")], &[Tag::new("env", "prod")])
+            .await
+            .expect_err("read-back fails");
+        assert_eq!(e.code, ErrorCode::AccessDenied);
+        assert!(e.message.starts_with("Saved, but reading back failed: AccessDenied"), "{}", e.message);
+        assert!(e.message.ends_with("Reload to see the current state."), "{}", e.message);
+        assert_eq!(s3.count(|r| r.method == "PUT"), 1);
+
+        let gets = Arc::new(AtomicUsize::new(0));
+        let g = gets.clone();
+        let s3 = FakeS3::start(move |r| match r.method.as_str() {
+            "GET" if g.fetch_add(1, Ordering::SeqCst) == 0 => Reply::xml(200, &tagging(&[])),
+            "GET" => Reply::xml(403, "<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"),
+            _ => Reply::status(200),
+        })
+        .await;
+        let e = put_object_tags(&s3.client(), "b", "k", &[Tag::new("a", "1")], &[]).await.expect_err("read-back fails");
+        assert!(e.message.starts_with("Saved, but reading back failed"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn http_405_on_an_object_is_a_delete_marker() {
+        let s3 = FakeS3::start(|_| {
+            Reply::xml(405, "<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message></Error>")
+        })
+        .await;
+        let e = get_object_tags(&s3.client(), "b", "k").await.expect_err("405");
+        assert_eq!((e.code, e.message.as_str()), (ErrorCode::NoSuchKey, DELETE_MARKER));
+        let op = TagOperation { mode: TagMode::Replace, set: vec![Tag::new("a", "1")], remove: vec![] };
+        let e = tag_object(&s3.client(), "b", "k", &op).await.expect_err("405");
+        assert_eq!((e.code, e.message.as_str()), (ErrorCode::NoSuchKey, DELETE_MARKER));
+        // 501 NotImplemented stays NotSupported.
+        let s3 = FakeS3::start(|_| {
+            Reply::xml(501, "<Error><Code>NotImplemented</Code><Message>not implemented</Message></Error>")
+        })
+        .await;
+        assert_eq!(get_object_tags(&s3.client(), "b", "k").await.expect_err("501").code, ErrorCode::NotSupported);
     }
 }

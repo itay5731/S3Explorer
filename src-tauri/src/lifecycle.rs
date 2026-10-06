@@ -12,6 +12,7 @@
 //! No Tauri types here.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types as s3;
@@ -31,9 +32,10 @@ use crate::tags;
 /// `LIFECYCLE_LIMITS` in `types.ts`.
 pub const MAX_RULES: usize = 1000;
 pub const RULE_ID_MAX_CHARS: usize = 255;
-/// Minimum days before a transition to STANDARD_IA / ONEZONE_IA / INTELLIGENT_TIERING.
+/// Minimum days before a transition to STANDARD_IA or ONEZONE_IA (INTELLIGENT_TIERING and the
+/// archive classes may use day 0).
 pub const MIN_DAYS_TO_INFREQUENT_ACCESS: i64 = 30;
-/// Minimum gap between an infrequent-access transition and a later archive transition.
+/// Minimum gap between a STANDARD_IA / ONEZONE_IA transition and a later archive transition.
 pub const MIN_DAYS_BETWEEN_TIERS: i64 = 30;
 pub const NEWER_NONCURRENT_MIN: i64 = 1;
 pub const NEWER_NONCURRENT_MAX: i64 = 100;
@@ -430,6 +432,7 @@ enum When {
 impl When {
     fn text(self) -> String {
         match self {
+            When::Days(0) => "on day 0".to_string(),
             When::Days(d) => format!("after {}", days_text(d)),
             When::Date(s) => format!("on {}", ymd(s)),
         }
@@ -458,6 +461,8 @@ impl When {
 
 struct Checker<'a> {
     rule: usize,
+    /// Midnight UTC today, seconds since the epoch (for the past-date note).
+    today: i64,
     out: &'a mut Vec<LifecycleIssue>,
 }
 
@@ -484,8 +489,16 @@ impl Checker<'_> {
         }
     }
 
-    /// Exactly one of `days` / `date`; returns when the action happens if valid.
-    fn when(&mut self, days: Option<&Number>, date: Option<&str>, base: &str, what: &str, needs: &str) -> Option<When> {
+    /// Exactly one of `days` (at least `min_days`) / `date`; returns when the action happens if valid.
+    fn when(
+        &mut self,
+        days: Option<&Number>,
+        date: Option<&str>,
+        min_days: i64,
+        base: &str,
+        what: &str,
+        needs: &str,
+    ) -> Option<When> {
         match (days, date) {
             (None, None) => {
                 self.at(format!("{base}.days"), format!("Choose when {needs}: a number of days or a date."));
@@ -495,9 +508,22 @@ impl Checker<'_> {
                 self.at(format!("{base}.days"), format!("{what} has both days and a date; use only one."));
                 None
             }
-            (Some(d), None) => self.whole(d, 1, i64::from(i32::MAX), &format!("{base}.days"), "Days").map(When::Days),
+            (Some(d), None) => {
+                self.whole(d, min_days, i64::from(i32::MAX), &format!("{base}.days"), "Days").map(When::Days)
+            }
             (None, Some(s)) => match parse_midnight(s) {
-                Ok(secs) => Some(When::Date(secs)),
+                Ok(secs) => {
+                    if secs <= self.today {
+                        let verb = if base == "expiration" { "deleted" } else { "moved" };
+                        self.at(
+                            format!("{base}.date"),
+                            format!(
+                                "{NOTE_PREFIX}this date is today or in the past, so every matching object, and every new one, is {verb} at the next daily run."
+                            ),
+                        );
+                    }
+                    Some(When::Date(secs))
+                }
                 Err(m) => {
                     self.at(format!("{base}.date"), m);
                     None
@@ -507,13 +533,17 @@ impl Checker<'_> {
     }
 }
 
-fn is_infrequent_access(c: StorageClass) -> bool {
-    c.rank() == 1
+const WATERFALL: &str = "STANDARD_IA → INTELLIGENT_TIERING → ONEZONE_IA → GLACIER_IR → GLACIER → DEEP_ARCHIVE";
+
+/// STANDARD_IA and ONEZONE_IA: at least 30 days after creation, and an archive transition after
+/// one of them must be at least 30 days later. (INTELLIGENT_TIERING has neither constraint.)
+fn needs_30_days(c: StorageClass) -> bool {
+    matches!(c, StorageClass::StandardIa | StorageClass::OnezoneIa)
 }
 
 /// Distinct classes, same-tier exclusivity and "only colder over time" for a list of
-/// (storage class, when) pairs. `gap` applies the 30-day minimum between an infrequent-access
-/// transition and a later archive one. Issues go on the colder item (`base[i].storageClass`, or
+/// (storage class, when) pairs. `gap` applies the 30-day minimum between a STANDARD_IA /
+/// ONEZONE_IA transition and a later archive one. Issues go on the colder item (`base[i].storageClass`, or
 /// its time field: `days_field`, or `days`/`date` when `None`); `noun` is "transition" or
 /// "noncurrent-version transition".
 fn check_order(
@@ -526,7 +556,7 @@ fn check_order(
 ) {
     for j in 0..items.len() {
         let (cj, wj) = items[j];
-        // Class used before (exact) or a class of the same tier.
+        // Each class once.
         if let Some(k) = (0..j).find(|&k| items[k].0 == cj) {
             ck.at(
                 format!("{base}[{j}].storageClass"),
@@ -538,37 +568,22 @@ fn check_order(
             );
             continue;
         }
-        if let Some(k) = (0..j).find(|&k| items[k].0.rank() == cj.rank()) {
-            ck.at(
-                format!("{base}[{j}].storageClass"),
-                format!(
-                    "{} and {} are the same tier: a rule can move objects to only one of STANDARD_IA, ONEZONE_IA and \
-INTELLIGENT_TIERING, and each later {noun} must be to a colder class.",
-                    items[k].0.as_str(),
-                    cj.as_str()
-                ),
-            );
-            continue;
-        }
         let Some(wj) = wj else { continue };
         let when_field = format!("{base}[{j}].{}", days_field.unwrap_or(wj.field()));
-        // Compare with every other item of a different tier (either list order).
-        for (k, &(ck_class, wk)) in items.iter().enumerate() {
-            if k == j || ck_class.rank() == cj.rank() {
+        // Compare with every class earlier in the waterfall (either list order); each pair is
+        // reported once, on the later class.
+        for &(ck_class, wk) in items {
+            if ck_class.rank() >= cj.rank() {
                 continue;
             }
             let Some(wk) = wk else { continue };
-            // Report each pair once, on the colder of the two.
-            if cj.rank() < ck_class.rank() {
-                continue;
-            }
             let Some(g) = wk.gap_to(wj) else { continue };
             if g <= 0 {
                 ck.at(
                     when_field.clone(),
                     format!(
-                        "{} to {} {} comes before (or at the same time as) the {noun} to {} {}: objects can only move \
-to colder storage over time, so {} must come later.",
+                        "{} to {} {} comes before (or at the same time as) the {noun} to {} {}: transitions follow \
+S3's order {WATERFALL}, so {} must come later.",
                         capitalize(noun),
                         cj.as_str(),
                         wj.text(),
@@ -579,7 +594,7 @@ to colder storage over time, so {} must come later.",
                 );
                 break;
             }
-            if gap && is_infrequent_access(ck_class) && g < MIN_DAYS_BETWEEN_TIERS {
+            if gap && needs_30_days(ck_class) && cj.is_archive() && g < MIN_DAYS_BETWEEN_TIERS {
                 ck.at(
                     when_field.clone(),
                     format!(
@@ -688,21 +703,23 @@ action, or aborting incomplete multipart uploads).",
     for (j, t) in r.transitions.iter().enumerate() {
         let base = format!("transitions[{j}]");
         let class = t.storage_class.as_str();
+        // Day 0 is allowed for transitions (moves on the day of creation).
         let w = ck.when(
             t.days.as_ref(),
             t.date.as_deref(),
+            0,
             &base,
             &format!("The transition to {class}"),
             &format!("objects move to {class}"),
         );
         if let Some(When::Days(d)) = w {
-            if is_infrequent_access(t.storage_class) && d < MIN_DAYS_TO_INFREQUENT_ACCESS {
+            if needs_30_days(t.storage_class) && d < MIN_DAYS_TO_INFREQUENT_ACCESS {
                 ck.at(
                     format!("{base}.days"),
                     format!(
                         "A transition to {class} must be at least {MIN_DAYS_TO_INFREQUENT_ACCESS} days after creation \
-(this one is after {}).",
-                        days_text(d)
+(this one is {}).",
+                        When::Days(d).text()
                     ),
                 );
             }
@@ -730,7 +747,7 @@ object-size conditions.",
                 );
             }
         } else {
-            exp_when = ck.when(e.days.as_ref(), e.date.as_deref(), "expiration", "The expiration", "objects expire");
+            exp_when = ck.when(e.days.as_ref(), e.date.as_deref(), 1, "expiration", "The expiration", "objects expire");
         }
         if let Some(we) = exp_when {
             for &(class, wt) in &current {
@@ -870,6 +887,16 @@ conditions.",
 /// Every problem with `config`, placed by rule index and field (`[]`: valid). Pure: no network.
 /// An empty configuration is valid (saving it deletes the bucket's lifecycle configuration).
 pub fn validate_lifecycle(config: &LifecycleConfiguration) -> Vec<LifecycleIssue> {
+    validate_lifecycle_at(config, chrono::Utc::now().timestamp())
+}
+
+/// Start of the message of an issue that informs but does not block saving (a date that is today
+/// or in the past). `put_lifecycle` ignores these.
+pub const NOTE_PREFIX: &str = "Note: ";
+
+/// [`validate_lifecycle`] as of `now` (seconds since the epoch).
+pub fn validate_lifecycle_at(config: &LifecycleConfiguration, now: i64) -> Vec<LifecycleIssue> {
+    let today = now - now.rem_euclid(DAY_SECS);
     let mut out = Vec::new();
     if config.rules.len() > MAX_RULES {
         out.push(LifecycleIssue {
@@ -884,7 +911,7 @@ pub fn validate_lifecycle(config: &LifecycleConfiguration) -> Vec<LifecycleIssue
     }
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for (i, r) in config.rules.iter().enumerate() {
-        check_rule(&mut Checker { rule: i, out: &mut out }, r);
+        check_rule(&mut Checker { rule: i, today, out: &mut out }, r);
         if r.id.is_empty() {
             continue;
         }
@@ -1100,16 +1127,86 @@ async fn write_raw(
     Ok(())
 }
 
+/// Delays before each read-back after a write (about 20 s in all). Bucket configuration
+/// propagates with a lag, so the first reads may still show the configuration from before.
+const READ_BACK_DELAYS_MS: [u64; 7] = [0, 500, 1000, 2000, 4000, 8000, 4500];
+
+fn read_back_delays() -> Vec<Duration> {
+    READ_BACK_DELAYS_MS.iter().map(|&ms| Duration::from_millis(ms)).collect()
+}
+
+/// What repeated reads after a write showed.
+#[derive(Debug)]
+enum Settled {
+    /// The target configuration.
+    Target(Option<LifecycleConfiguration>),
+    /// Two consecutive reads showed the same configuration that is neither the target nor the
+    /// one from before the write.
+    Different(Option<LifecycleConfiguration>),
+    /// Out of reads without either (still the old one, or something else only once).
+    Unconfirmed,
+    ReadFailed(AppError),
+}
+
+/// Reads until the stored configuration is `target`. A read equal to `before` is propagation lag
+/// (keep waiting); a configuration that is neither counts only when two consecutive reads agree.
+async fn settle(
+    client: &Client,
+    bucket: &str,
+    target: Option<&LifecycleConfiguration>,
+    before: Option<&LifecycleConfiguration>,
+    delays: &[Duration],
+) -> Settled {
+    let mut other: Option<Option<LifecycleConfiguration>> = None;
+    for d in delays {
+        if !d.is_zero() {
+            tokio::time::sleep(*d).await;
+        }
+        let now = match get_lifecycle(client, bucket).await {
+            Ok(now) => now,
+            Err(e) => return Settled::ReadFailed(e),
+        };
+        if same_configuration(now.as_ref(), target) {
+            return Settled::Target(now);
+        }
+        if same_configuration(now.as_ref(), before) {
+            other = None; // lag
+            continue;
+        }
+        match &other {
+            Some(prev) if same_configuration(prev.as_ref(), now.as_ref()) => return Settled::Different(now),
+            _ => other = Some(now),
+        }
+    }
+    Settled::Unconfirmed
+}
+
+/// Rule ids in order: a stored configuration with the same ids as what was sent is ours with
+/// parts missing; one with other ids was written by someone else.
+fn same_rule_ids(a: &LifecycleConfiguration, b: Option<&LifecycleConfiguration>) -> bool {
+    let rb = rules_of(b);
+    a.rules.len() == rb.len() && a.rules.iter().zip(rb).all(|(x, y)| x.id == y.id)
+}
+
+pub const CHANGED_AFTER_SAVE: &str = "The lifecycle configuration was saved, but the server now returns a different \
+one (someone else may have changed it right afterwards, or the server did not keep all of it). Nothing was put back. \
+Reload to see the current rules.";
+
 /// Replaces the bucket's lifecycle configuration with `config` (no rules: deletes it) and returns
 /// what is stored afterwards.
 ///
-/// 1. `validate_lifecycle`; any issue: `InvalidInput` listing them, nothing written.
+/// 1. `validate_lifecycle`; any issue that is not a "Note: " (see [`NOTE_PREFIX`]): `InvalidInput`
+///    listing them, nothing written.
 /// 2. Re-read the stored configuration; if it is not [`same_configuration`] as `expected` (what
 ///    the UI loaded, `None` for none): `Conflict`, nothing written.
 /// 3. If `config` is already what is stored, nothing is written.
-/// 4. Write, read back, and compare with `config`. A server that accepted it but stored something
-///    else (dropped an action it does not implement) gets the previous configuration put back, and
-///    the call fails with `NotSupported` naming what was not kept.
+/// 4. Write (a refused write is reported as such, unless a read shows `config` stored after all).
+/// 5. Read back until it shows `config`, treating reads of the pre-write configuration as
+///    propagation lag (about 20 s). Only when two consecutive reads show our rules with parts
+///    missing (a server that accepted and dropped what it does not implement) is the previous
+///    configuration put back, failing with `NotSupported` naming what was not kept. Rules with
+///    other ids: `Conflict`, nothing put back. A read-back that fails or never confirms:
+///    "Saved, but reading back failed: …".
 ///
 /// S3 has no conditional write for lifecycle: a change made by someone else between step 2 and
 /// the write is not detected.
@@ -1119,7 +1216,18 @@ pub async fn put_lifecycle(
     config: &LifecycleConfiguration,
     expected: Option<&LifecycleConfiguration>,
 ) -> AppResult<Option<LifecycleConfiguration>> {
-    let issues = validate_lifecycle(config);
+    put_lifecycle_with(client, bucket, config, expected, &read_back_delays()).await
+}
+
+async fn put_lifecycle_with(
+    client: &Client,
+    bucket: &str,
+    config: &LifecycleConfiguration,
+    expected: Option<&LifecycleConfiguration>,
+    delays: &[Duration],
+) -> AppResult<Option<LifecycleConfiguration>> {
+    let issues: Vec<LifecycleIssue> =
+        validate_lifecycle(config).into_iter().filter(|i| !i.message.starts_with(NOTE_PREFIX)).collect();
     if !issues.is_empty() {
         return Err(AppError::invalid(issues_message(config, &issues)));
     }
@@ -1138,6 +1246,7 @@ pub async fn put_lifecycle(
     if let Err(e) = write_raw(client, bucket, sdk, before.min_size.clone()).await {
         // A refused write normally changes nothing; check rather than assume.
         let tail = match get_lifecycle(client, bucket).await {
+            Ok(now) if same_configuration(now.as_ref(), Some(config)) => return Ok(now), // stored after all
             Ok(now) if same_configuration(now.as_ref(), current.as_ref()) => "Nothing was changed.",
             _ => "Reload to see what is stored now.",
         };
@@ -1151,9 +1260,21 @@ pub async fn put_lifecycle(
         };
         return Err(AppError::new(e.code, message));
     }
-    let stored = get_lifecycle(client, bucket).await?;
-    if same_configuration(stored.as_ref(), Some(config)) {
-        return Ok(stored);
+
+    let stored = match settle(client, bucket, Some(config), current.as_ref(), delays).await {
+        Settled::Target(now) => return Ok(now),
+        Settled::ReadFailed(e) => return Err(AppError::saved_but_unread(e)),
+        Settled::Unconfirmed => {
+            return Err(AppError::saved_but_unread(AppError::new(
+                ErrorCode::Unknown,
+                "after about 20 seconds the server still does not return the new configuration (changes can take a \
+while to apply)",
+            )))
+        }
+        Settled::Different(now) => now,
+    };
+    if !same_rule_ids(config, stored.as_ref()) {
+        return Err(AppError::new(ErrorCode::Conflict, CHANGED_AFTER_SAVE));
     }
 
     // The server did not keep what it accepted: put the previous configuration back.
@@ -1169,18 +1290,18 @@ pub async fn put_lifecycle(
         write_raw(client, bucket, previous, before.min_size.clone()).await
     };
     let restored = match restore {
-        Ok(()) => match get_lifecycle(client, bucket).await {
-            Ok(now) if same_configuration(now.as_ref(), current.as_ref()) => Ok(()),
-            Ok(_) => Err("the configuration read back afterwards is different".to_string()),
-            Err(e) => Err(e.message),
+        Ok(()) => match settle(client, bucket, current.as_ref(), stored.as_ref(), delays).await {
+            Settled::Target(_) => Ok(()),
+            Settled::ReadFailed(e) => Err(format!("reading it back failed: {}", e.message)),
+            Settled::Different(_) | Settled::Unconfirmed => {
+                Err("the configuration read back afterwards is different".to_string())
+            }
         },
         Err(e) => Err(e.message),
     };
     let tail = match restored {
         Ok(()) => "The previous configuration was put back, so nothing changed.".to_string(),
-        Err(e) => format!(
-            "Putting the previous configuration back failed ({e}). Reload to see what is stored now."
-        ),
+        Err(e) => format!("Putting the previous configuration back failed ({e}). Reload to see what is stored now."),
     };
     Err(AppError::new(
         ErrorCode::NotSupported,

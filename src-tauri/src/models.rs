@@ -735,14 +735,23 @@ impl StorageClass {
         }
     }
 
-    /// Coldness (`STORAGE_CLASS_RANK` in `types.ts`): a later transition must be strictly colder.
+    /// Position in S3's transition waterfall (`STORAGE_CLASS_RANK` in `types.ts`): STANDARD_IA →
+    /// INTELLIGENT_TIERING → ONEZONE_IA → GLACIER_IR → GLACIER → DEEP_ARCHIVE. A later transition
+    /// must go to a strictly higher rank.
     pub fn rank(self) -> u8 {
         match self {
-            StorageClass::StandardIa | StorageClass::OnezoneIa | StorageClass::IntelligentTiering => 1,
-            StorageClass::GlacierIr => 2,
-            StorageClass::Glacier => 3,
-            StorageClass::DeepArchive => 4,
+            StorageClass::StandardIa => 1,
+            StorageClass::IntelligentTiering => 2,
+            StorageClass::OnezoneIa => 3,
+            StorageClass::GlacierIr => 4,
+            StorageClass::Glacier => 5,
+            StorageClass::DeepArchive => 6,
         }
+    }
+
+    /// GLACIER_IR, GLACIER and DEEP_ARCHIVE.
+    pub fn is_archive(self) -> bool {
+        self.rank() >= 4
     }
 }
 

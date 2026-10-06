@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aws_sdk_s3::Client;
 use dashmap::DashMap;
@@ -29,7 +29,7 @@ use crate::models::{
     now_iso, ConflictPolicy, Job, JobError, JobKind, JobPhase, JobPreview, JobRequest, JobStatus, JOB_MAX_ERRORS,
     JOB_PREVIEW_CAP,
 };
-use crate::transfers::gate::RunGate;
+use crate::transfers::gate::{RunGate, Waiter};
 use engine::Ctx;
 pub use validate::validate;
 
@@ -87,9 +87,31 @@ pub struct JobEntry {
     record: Mutex<Job>,
     cancel: CancellationToken,
     finished: CancellationToken,
+    /// When the last event was sent. Held while a snapshot is taken and sent, so events leave in
+    /// the order the state changed, and the ticker can keep same-state events >= 100 ms apart.
+    emitted: Mutex<Option<Instant>>,
 }
 
 impl JobEntry {
+    fn new(seq: u64, record: Job) -> Self {
+        Self {
+            seq,
+            record: Mutex::new(record),
+            cancel: CancellationToken::new(),
+            finished: CancellationToken::new(),
+            emitted: Mutex::new(None),
+        }
+    }
+    fn emit_lock(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.emitted.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    /// Sends the current state now: the first and last events and status/phase changes are
+    /// never throttled.
+    fn publish(&self, sink: &dyn JobSink) {
+        let mut at = self.emit_lock();
+        sink.emit(&self.snapshot());
+        *at = Some(Instant::now());
+    }
     fn lock(&self) -> MutexGuard<'_, Job> {
         self.record.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -195,30 +217,35 @@ impl JobManager {
             started_at: now_iso(),
             finished_at: None,
         };
-        let entry = Arc::new(JobEntry {
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
-            record: Mutex::new(record),
-            cancel: CancellationToken::new(),
-            finished: CancellationToken::new(),
-        });
+        let entry = Arc::new(JobEntry::new(self.seq.fetch_add(1, Ordering::Relaxed), record));
         self.entries.insert(id.clone(), entry.clone());
-        self.sink.emit(&entry.snapshot());
+        // Take the place in line now, in `start` order: the spawned task may first run later
+        // than the task of a job started after this one.
+        let waiter = self.gate.enqueue();
+        entry.publish(self.sink.as_ref());
         let me = self.clone();
-        tokio::spawn(async move { me.run(entry, req, src, dest).await });
+        tokio::spawn(async move { me.run(entry, waiter, req, src, dest).await });
         Ok(id)
     }
 
-    async fn run(self: Arc<Self>, entry: Arc<JobEntry>, req: JobRequest, src: Client, dest: Option<Client>) {
+    async fn run(
+        self: Arc<Self>,
+        entry: Arc<JobEntry>,
+        waiter: Waiter,
+        req: JobRequest,
+        src: Client,
+        dest: Option<Client>,
+    ) {
         let permit = tokio::select! {
             biased;
             _ = entry.cancel.cancelled() => None,
-            p = self.gate.acquire() => Some(p),
+            p = waiter.wait() => Some(p),
         };
         let result = match &permit {
             None => Err(AppError::cancelled()),
             Some(_) => {
                 entry.lock().status = JobStatus::Running;
-                self.sink.emit(&entry.snapshot());
+                entry.publish(self.sink.as_ref());
                 let stop = CancellationToken::new();
                 let ticker = tokio::spawn(ticker(self.sink.clone(), entry.clone(), stop.clone()));
                 // A panic must not leave the job "running" forever (has_active() would block the
@@ -238,7 +265,7 @@ impl JobManager {
             let mut j = entry.lock();
             finish(&mut j, result, entry.cancel.is_cancelled());
         }
-        self.sink.emit(&entry.snapshot());
+        entry.publish(self.sink.as_ref());
         // Release the slot only after the final event (see transfers).
         drop(permit);
         entry.finished.cancel();
@@ -280,7 +307,7 @@ impl JobManager {
 
         // ---- working phase ----
         entry.lock().phase = JobPhase::Working;
-        self.sink.emit(&entry.snapshot());
+        entry.publish(self.sink.as_ref());
         match req.kind {
             JobKind::Copy | JobKind::Move => engine::run_transfer(&ctx, entry, &exp.work, &existing).await,
             JobKind::Delete => engine::run_delete(&ctx, entry, &exp.work).await,
@@ -356,7 +383,9 @@ fn finish(j: &mut Job, result: AppResult<()>, cancel_requested: bool) {
     };
 }
 
-/// Emits progress at most every 100 ms while a job runs, only when something changed.
+/// Emits progress while a job runs, only when something changed and never within 100 ms of the
+/// previous event. (The interval alone is not enough: with `MissedTickBehavior::Skip`, a tick that
+/// fires late on a busy runtime is followed by the next on-grid tick only a few ms later.)
 async fn ticker(sink: Arc<dyn JobSink>, entry: Arc<JobEntry>, stop: CancellationToken) {
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -367,6 +396,10 @@ async fn ticker(sink: Arc<dyn JobSink>, entry: Arc<JobEntry>, stop: Cancellation
             biased;
             _ = stop.cancelled() => break,
             _ = interval.tick() => {}
+        }
+        let mut at = entry.emit_lock();
+        if at.is_some_and(|t| t.elapsed() < TICK) {
+            continue; // too soon after the last event; a later tick sends the change
         }
         let snap = entry.snapshot();
         let key = (
@@ -381,6 +414,7 @@ async fn ticker(sink: Arc<dyn JobSink>, entry: Arc<JobEntry>, stop: Cancellation
         if last != Some(key) {
             last = Some(key);
             sink.emit(&snap);
+            *at = Some(Instant::now());
         }
     }
 }
@@ -515,6 +549,29 @@ mod tests {
         assert!(err.contains("does not support object tags"), "{err}");
         let puts = s3.count(|r| r.method == "PUT");
         assert!(puts < 200 && j.failed_items as usize == puts, "stopped early: {puts} PUTs, {} failed", j.failed_items);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tag_job_continues_past_a_delete_marker() {
+        use crate::models::{Tag, TagMode, TagOperation};
+        let s3 = FakeS3::start(|r| {
+            let key = r.path.trim_start_matches("/b/");
+            match (r.method.as_str(), r.has_query("tagging")) {
+                ("HEAD", _) => Reply::with_headers(200, vec![h("Content-Length", "1")]),
+                ("PUT", true) if key == "k3" => Reply::xml(405, "<Error><Code>MethodNotAllowed</Code><Message>The specified method is not allowed against this resource.</Message></Error>"),
+                ("PUT", true) => Reply::status(200),
+                _ => Reply::status(500),
+            }
+        })
+        .await;
+        let items: Vec<JobItem> = (0..6).map(|i| obj(&format!("k{i}"), None)).collect();
+        let op = TagOperation { mode: TagMode::Replace, set: vec![Tag::new("a", "b")], remove: vec![] };
+        let (j, _) = run(tag_request(items, op), &s3.client()).await;
+        assert_eq!(j.error, None, "a delete marker is not a job-level failure");
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 5, 1));
+        assert_eq!(j.errors.len(), 1);
+        assert_eq!((j.errors[0].key.as_str(), j.errors[0].message.as_str()), ("k3", crate::tags::DELETE_MARKER));
+        assert_eq!(s3.count(|r| r.method == "PUT"), 6, "every object was attempted");
     }
 
     /// Delete job of keys k1..k3 whose DeleteObjects answer is `answer`; `exists` says which keys a
@@ -780,12 +837,7 @@ mod tests {
     }
 
     fn entry() -> JobEntry {
-        JobEntry {
-            seq: 0,
-            record: Mutex::new(job()),
-            cancel: CancellationToken::new(),
-            finished: CancellationToken::new(),
-        }
+        JobEntry::new(0, job())
     }
 
     #[test]
@@ -852,5 +904,59 @@ mod tests {
         assert!(m.list().is_empty() && !m.has_active());
         assert_eq!(m.cancel("nope").expect_err("unknown").code, crate::error::ErrorCode::InvalidInput);
         assert!(m.remove("nope").is_ok());
+    }
+
+    // ---- progress throttle (regression: a late tick used to be followed by an early one) ----
+
+    fn test_entry() -> Arc<JobEntry> {
+        let record = Job {
+            id: "t".into(),
+            kind: JobKind::Delete,
+            src_bucket: "b".into(),
+            dest_bucket: None,
+            label: "t".into(),
+            phase: JobPhase::Working,
+            total_items: 1000,
+            done_items: 0,
+            skipped_items: 0,
+            failed_items: 0,
+            total_bytes: 0,
+            done_bytes: 0,
+            status: JobStatus::Running,
+            error: None,
+            errors: Vec::new(),
+            started_at: now_iso(),
+            finished_at: None,
+        };
+        Arc::new(JobEntry::new(0, record))
+    }
+
+    /// Progress changes every 10 ms while the runtime is blocked once for 160 ms (as on a busy
+    /// machine). Same-state events must still be at least 100 ms apart. With tokio's
+    /// `MissedTickBehavior::Skip` alone, the late tick was followed by the next on-grid tick
+    /// ~40 ms later.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ticker_spacing_survives_a_late_tick() {
+        use std::time::Instant;
+        let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
+        let rec = times.clone();
+        let sink: Arc<dyn JobSink> = Arc::new(move |_: &Job| rec.lock().unwrap_or_else(|p| p.into_inner()).push(Instant::now()));
+        let entry = test_entry();
+        let stop = CancellationToken::new();
+        let tk = tokio::spawn(ticker(sink, entry.clone(), stop.clone()));
+        for i in 0..80 {
+            entry.done(1);
+            if i == 15 || i == 47 {
+                // Blocks the only runtime thread: the ticker's next tick fires late.
+                std::thread::sleep(Duration::from_millis(160));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stop.cancel();
+        let _ = tk.await;
+        let t = times.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        assert!(t.len() >= 4, "only {} events", t.len());
+        let min = t.windows(2).map(|w| w[1].duration_since(w[0])).min().unwrap_or_default();
+        assert!(min >= TICK - Duration::from_millis(1), "events {min:?} apart");
     }
 }

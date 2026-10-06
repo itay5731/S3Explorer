@@ -326,16 +326,18 @@ impl TransferManager {
         });
         self.entries.insert(id.clone(), entry.clone());
         self.sink.emit(&entry.snapshot());
+        // Take the place in line now, in start order (see `RunGate::enqueue`).
+        let waiter = self.running.enqueue();
         let me = self.clone();
-        tokio::spawn(async move { me.run_job(entry, client, job).await });
+        tokio::spawn(async move { me.run_job(entry, waiter, client, job).await });
         id
     }
 
-    async fn run_job(self: Arc<Self>, entry: Arc<TransferEntry>, client: Client, job: Job) {
+    async fn run_job(self: Arc<Self>, entry: Arc<TransferEntry>, waiter: gate::Waiter, client: Client, job: Job) {
         let permit = tokio::select! {
             biased;
             _ = entry.cancel.cancelled() => None,
-            p = self.running.acquire() => Some(p),
+            p = waiter.wait() => Some(p),
         };
 
         let result = match &permit {

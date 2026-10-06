@@ -15,6 +15,8 @@
 //! - raising the limit wakes everybody; the oldest waiters start until `running == limit`;
 //! - lowering it never touches running transfers; new starts wait until `running < limit`;
 //! - permits are RAII guards, so a slot can't leak (a panic or a cancelled waiter cleans up in Drop);
+//! - the place in line is taken by `enqueue`, synchronously, so work started in order queues in
+//!   that order even when the waiting tasks are first polled in another order;
 //! - no deadlock: the mutex is never held across an `.await`.
 
 use std::collections::BTreeSet;
@@ -46,14 +48,15 @@ impl Drop for RunPermit {
     }
 }
 
-/// Removes a waiter's ticket if `acquire` is dropped before it got a slot (e.g. cancelled).
-struct Ticket<'a> {
-    gate: &'a RunGate,
+/// A place in line, taken by [`RunGate::enqueue`]. Dropping it (or the [`Waiter::wait`] future)
+/// before it got a slot gives up the place.
+pub struct Waiter {
+    gate: Arc<RunGate>,
     id: u64,
     pending: bool,
 }
 
-impl Drop for Ticket<'_> {
+impl Drop for Waiter {
     fn drop(&mut self) {
         if self.pending {
             self.gate.lock().waiting.remove(&self.id);
@@ -90,8 +93,9 @@ impl RunGate {
         self.lock().waiting.len()
     }
 
-    /// Waits for a run slot (FIFO). Cancel-safe: dropping the future gives up the place in line.
-    pub async fn acquire(self: &Arc<Self>) -> RunPermit {
+    /// Takes a place in line now (synchronously): the order of `enqueue` calls is the start
+    /// order, however the tasks that later call [`Waiter::wait`] happen to be scheduled.
+    pub fn enqueue(self: &Arc<Self>) -> Waiter {
         let id = {
             let mut s = self.lock();
             let id = s.next_ticket;
@@ -99,22 +103,36 @@ impl RunGate {
             s.waiting.insert(id);
             id
         };
-        let mut ticket = Ticket { gate: self, id, pending: true };
+        Waiter { gate: self.clone(), id, pending: true }
+    }
+
+    /// `enqueue` then `wait`: the place in line is taken when this future is first polled (tests;
+    /// the app enqueues synchronously at start).
+    #[cfg(test)]
+    pub async fn acquire(self: &Arc<Self>) -> RunPermit {
+        self.enqueue().wait().await
+    }
+}
+
+impl Waiter {
+    /// Waits for a run slot (FIFO). Cancel-safe: dropping the future gives up the place in line.
+    pub async fn wait(mut self) -> RunPermit {
+        let gate = self.gate.clone();
         loop {
-            let notified = self.notify.notified();
+            let notified = gate.notify.notified();
             tokio::pin!(notified);
             // Register before checking so a notify between the check and the await isn't lost.
             notified.as_mut().enable();
             {
-                let mut s = self.lock();
-                if s.running < s.limit && s.waiting.first() == Some(&id) {
-                    s.waiting.remove(&id);
+                let mut s = gate.lock();
+                if s.running < s.limit && s.waiting.first() == Some(&self.id) {
+                    s.waiting.remove(&self.id);
                     s.running += 1;
-                    ticket.pending = false;
+                    self.pending = false;
                     drop(s);
                     // The next waiter is now the oldest; it may fit too.
-                    self.notify.notify_waiters();
-                    return RunPermit { gate: self.clone() };
+                    gate.notify.notify_waiters();
+                    return RunPermit { gate: gate.clone() };
                 }
             }
             notified.await;
@@ -263,6 +281,44 @@ mod tests {
         let _ = first.send(());
         settle().await;
         assert_eq!(drain(&mut rx), vec![0, 2], "the next waiter is not stuck behind the cancelled one");
+        assert_eq!(gate.running(), 1);
+    }
+
+    /// Places in line are taken by `enqueue`, in call order, not when the waiting task first
+    /// runs. (Regression: jobs and transfers took their ticket inside a spawned task, so three
+    /// jobs started in order could queue in any order on the multi-thread runtime.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn order_is_enqueue_order_not_poll_order() {
+        let gate = RunGate::new(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let first = spawn_holder(&gate, 0, &tx);
+        settle().await;
+        let waiters: Vec<Waiter> = (1..=3).map(|_| gate.enqueue()).collect();
+        // Spawn (and so first poll) them in reverse order; each releases its slot at once.
+        for (n, w) in waiters.into_iter().enumerate().rev() {
+            let started = tx.clone();
+            tokio::spawn(async move {
+                let _p = w.wait().await;
+                let _ = started.send(n + 1);
+            });
+        }
+        settle().await;
+        assert_eq!((gate.running(), gate.waiting()), (1, 3));
+        let _ = first.send(());
+        settle().await;
+        assert_eq!(drain(&mut rx), vec![0, 1, 2, 3]);
+        assert_eq!((gate.running(), gate.waiting()), (0, 0));
+    }
+
+    /// An enqueued waiter that is dropped without waiting gives up its place.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_waiter_leaves_the_line() {
+        let gate = RunGate::new(1);
+        let w = gate.enqueue();
+        assert_eq!(gate.waiting(), 1);
+        drop(w);
+        assert_eq!(gate.waiting(), 0);
+        let _p = gate.acquire().await;
         assert_eq!(gate.running(), 1);
     }
 }

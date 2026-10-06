@@ -37,6 +37,9 @@ pub struct AppError {
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Start of the message of [`AppError::saved_but_unread`]; the UI must reload, never say "nothing changed".
+pub const SAVED_BUT_UNREAD: &str = "Saved, but reading back failed";
+
 impl AppError {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self { code, message: message.into() }
@@ -49,6 +52,10 @@ impl AppError {
     }
     pub fn invalid(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidInput, message)
+    }
+    /// A write succeeded but reading the result back failed: not a failed save. Keeps the code.
+    pub fn saved_but_unread(e: AppError) -> Self {
+        Self::new(e.code, format!("{SAVED_BUT_UNREAD}: {}. Reload to see the current state.", e.message))
     }
     pub fn is_cancelled(&self) -> bool {
         self.code == ErrorCode::Cancelled
