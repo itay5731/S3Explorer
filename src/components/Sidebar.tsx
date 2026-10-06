@@ -141,8 +141,16 @@ export function Sidebar() {
   const shownShared = shared.filter((b) => matches(b.name));
 
   const onMenu = (b: BucketEntry, x: number, y: number) => setMenu({ b, x, y });
+  // Buckets shared from another account are rare, so the only standing entry point is this small button;
+  // the "Shared with me" group appears in the list only once such a bucket exists.
   const addButton = (
-    <button type="button" className="icon-btn" onClick={() => openModal({ kind: "addBucket" })} title="Add a bucket by name" aria-label="Add a bucket">
+    <button
+      type="button"
+      className="icon-btn"
+      onClick={() => openModal({ kind: "addBucket" })}
+      title={canList ? "Add a bucket shared with you from another account" : "Add a bucket by name"}
+      aria-label="Add a bucket by name"
+    >
       <Plus size={14} />
     </button>
   );
@@ -152,13 +160,14 @@ export function Sidebar() {
       <div className="sidebar-buckets">
         <div className="sidebar-head">
           <span className="section-title">Buckets</span>
-          {canList ? (
-            <button className="icon-btn" onClick={() => void loadBuckets()} title="Reload buckets" disabled={loading}>
-              <RefreshCw size={13} className={loading ? "spin" : ""} />
-            </button>
-          ) : (
-            addButton
-          )}
+          <span className="sidebar-head-actions">
+            {canList && (
+              <button className="icon-btn" onClick={() => void loadBuckets()} title="Reload buckets" disabled={loading}>
+                <RefreshCw size={13} className={loading ? "spin" : ""} />
+              </button>
+            )}
+            {addButton}
+          </span>
         </div>
 
         <div className="search-box">
@@ -189,10 +198,11 @@ export function Sidebar() {
               {!loading && !error && shownListed.length === 0 && (
                 <div className="empty-note small">{filter ? "No matching buckets" : "No buckets"}</div>
               )}
-              <div className="bucket-group-head">
-                <span className="section-title">Shared with me</span>
-                {addButton}
-              </div>
+              {shownShared.length > 0 && (
+                <div className="bucket-group-head">
+                  <span className="section-title">Shared with me</span>
+                </div>
+              )}
             </>
           ) : (
             <div className="bucket-note">
@@ -215,12 +225,12 @@ export function Sidebar() {
           {shownShared.map((b) => (
             <BucketRow key={b.name} b={b} selected={selected === b.name} onMenu={onMenu} />
           ))}
-          {!addedLoading && !addedError && shownShared.length === 0 && (
+          {!addedLoading && !addedError && shownShared.length === 0 && !canList && (
             filter && shared.length ? (
               <div className="empty-note small">No matching buckets</div>
             ) : (
               <button type="button" className="bucket-add" onClick={() => openModal({ kind: "addBucket" })}>
-                <Plus size={13} /> {canList ? "Add a bucket shared with you" : "Add a bucket"}
+                <Plus size={13} /> Add a bucket
               </button>
             )
           )}

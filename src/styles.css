@@ -4870,3 +4870,10 @@ input.lc-date {
   margin-top: 3px;
   color: var(--text-2);
 }
+
+/* v0.4.1: the bucket header's reload and add buttons sit together */
+.sidebar-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
