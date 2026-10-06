@@ -58,6 +58,7 @@ const RowView = memo(function RowView({
     <div
       className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""} ${cut ? "cut" : ""} ${dragged ? "dragged" : ""}`}
       data-index={index}
+      data-row-id={row.id}
       role="row"
       aria-selected={selected}
       style={{ transform: `translateY(${start}px)` }}

@@ -2,7 +2,7 @@
 // docs/CONTRACT.md). The parent owns the rows and decides what Save does.
 
 import { useRef, useState } from "react";
-import { Plus, X } from "lucide-react";
+import { Lock, Plus, X } from "lucide-react";
 import type { Tag } from "../lib/types";
 import { validateTags, type TagValidation } from "../lib/tags";
 
@@ -16,7 +16,10 @@ export interface TagRow {
 let rowSeq = 0;
 export const toRows = (tags: Tag[]): TagRow[] => tags.map((t) => ({ id: ++rowSeq, key: t.key, value: t.value }));
 export const fromRows = (rows: TagRow[]): Tag[] => rows.map((r) => ({ key: r.key, value: r.value }));
-export const validateRows = (rows: TagRow[], max: number): TagValidation => validateTags(fromRows(rows), max);
+export const validateRows = (rows: TagRow[], max: number, locked = 0): TagValidation => validateTags(fromRows(rows), max, locked);
+
+/** Why a system tag's row is locked. */
+export const SYSTEM_TAG_TEXT = "Set by AWS; can’t be edited here";
 
 export function TagEditor({
   rows,
@@ -27,8 +30,11 @@ export function TagEditor({
   addLabel = "Add tag",
   emptyText = "No tags.",
   label = "Tags",
+  locked = [],
 }: {
   rows: TagRow[];
+  /** AWS system tags: shown read-only above the editable rows, counted in the total, never sent changed. */
+  locked?: Tag[];
   onChange(rows: TagRow[]): void;
   max: number;
   disabled?: boolean;
@@ -38,11 +44,12 @@ export function TagEditor({
   emptyText?: string;
   label?: string;
 }) {
-  const v = validateRows(rows, max);
+  const v = validateRows(rows, max, locked.length);
   // Errors on a row show once the user has left it, so a fresh empty row isn't red right away.
   const [left, setLeft] = useState<Set<number>>(new Set());
   const listRef = useRef<HTMLDivElement>(null);
-  const full = rows.length >= max;
+  const total = rows.length + locked.length;
+  const full = total >= max;
 
   const update = (id: number, patch: Partial<TagRow>) => onChange(rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   const remove = (id: number) => onChange(rows.filter((r) => r.id !== id));
@@ -56,14 +63,24 @@ export function TagEditor({
   return (
     <div className="tag-editor">
       <div className="tag-editor-list" ref={listRef} role="group" aria-label={label}>
-        {rows.length > 0 && (
+        {total > 0 && (
           <div className="tag-editor-head" aria-hidden="true">
             <span>Key</span>
             <span>Value</span>
             <span />
           </div>
         )}
-        {rows.length === 0 && <p className="tag-editor-empty muted small">{emptyText}</p>}
+        {locked.map((t) => (
+          <div key={`sys:${t.key}`} className="tag-editor-row locked" data-system-tag={t.key} title={SYSTEM_TAG_TEXT}>
+            <input value={t.key} readOnly disabled aria-label={`System tag ${t.key} key (read-only)`} />
+            <input value={t.value} readOnly disabled aria-label={`System tag ${t.key} value (read-only)`} />
+            <span className="icon-btn tag-lock" aria-hidden="true">
+              <Lock size={12} />
+            </span>
+            <p className="tag-editor-locked muted small">{SYSTEM_TAG_TEXT}.</p>
+          </div>
+        ))}
+        {total === 0 && <p className="tag-editor-empty muted small">{emptyText}</p>}
         {rows.map((r, i) => {
           const errs = v.rows[i];
           const show = showAllErrors || left.has(r.id) || r.key !== "";
@@ -119,8 +136,9 @@ export function TagEditor({
         <button type="button" className="btn btn-sm" onClick={add} disabled={disabled || full} title={full ? `The limit is ${max} tags` : undefined}>
           <Plus size={13} /> {addLabel}
         </button>
-        <span className={`tag-count ${rows.length > max ? "err-text" : full ? "at-limit" : ""}`} aria-live="polite">
-          {rows.length} of {max}
+        <span className={`tag-count ${total > max ? "err-text" : full ? "at-limit" : ""}`} aria-live="polite">
+          {total} of {max}
+          {locked.length > 0 && ` (${rows.length} editable, ${locked.length} set by AWS)`}
         </span>
       </div>
       {v.set && (

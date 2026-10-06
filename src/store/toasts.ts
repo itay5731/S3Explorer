@@ -64,6 +64,15 @@ export function isDenied(e: AppError | string | null | undefined): boolean {
   return e.code === "AccessDenied";
 }
 
+/**
+ * The start of the backend's message when a save's write succeeded but reading the result back did
+ * not (put_lifecycle, put_bucket_tags, put_object_tags): the save probably applied.
+ */
+export const SAVED_UNREAD_PREFIX = "Saved, but reading back failed";
+
+/** "Nothing was changed" is only true for errors the backend raises before writing anything. */
+export const nothingWritten = (e: AppError) => e.code === "InvalidInput" || e.code === "AccessDenied";
+
 const recentDenied = new Map<string, number>();
 /** How long an identical permission toast is suppressed: one toast per problem, not one per file. */
 const DENIED_QUIET_MS = 6000;

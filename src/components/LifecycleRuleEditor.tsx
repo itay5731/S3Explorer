@@ -21,6 +21,8 @@ import {
   TRANSITION_CLASSES,
   dateFromInput,
   dateInputValue,
+  dateTense,
+  isNoteIssue,
   describeFilter,
   fromBytes,
   isEmptyFilter,
@@ -58,7 +60,8 @@ export class RuleIssues {
   }
   at = (field: string) => this.all.filter((i) => i.field === field);
   under = (prefix: string) => this.all.filter((i) => i.field !== null && i.field.startsWith(prefix));
-  has = (field: string) => this.all.some((i) => i.field === field);
+  /** A blocking issue at `field` (marks the input invalid); notes don't count. */
+  has = (field: string) => this.all.some((i) => i.field === field && !isNoteIssue(i));
   /** Issues with no field, or a field the form doesn't show (e.g. a row that no longer exists). */
   general(): LifecycleIssue[] {
     const rowIndex = (f: string, list: string) => {
@@ -78,15 +81,23 @@ export class RuleIssues {
   }
 }
 
+/** Issues at a field. "Note: …" issues are warnings (they don't block saving) and look like one. */
 export function IssueList({ issues, id }: { issues: LifecycleIssue[]; id?: string }) {
   if (!issues.length) return null;
   return (
     <ul className="lc-issues" id={id}>
-      {issues.map((i, n) => (
-        <li key={n} className="err-text">
-          {i.message}
-        </li>
-      ))}
+      {issues.map((i, n) =>
+        isNoteIssue(i) ? (
+          <li key={n} className="lc-note" data-note="true">
+            <AlertTriangle size={12} />
+            <span>{i.message}</span>
+          </li>
+        ) : (
+          <li key={n} className="err-text">
+            {i.message}
+          </li>
+        ),
+      )}
     </ul>
   );
 }
@@ -734,7 +745,12 @@ export function LifecycleRuleEditor({
           )}
           {mode !== "none" && mode !== "markers" && (
             <p className="small lc-deletes">
-              <AlertTriangle size={12} /> Matching objects are deleted {mode === "date" ? "on that date" : "when they reach that age"}.
+              <AlertTriangle size={12} />{" "}
+              {mode !== "date"
+                ? "Matching objects are deleted when they reach that age."
+                : rule.expiration?.date && dateTense(rule.expiration.date) === "past"
+                  ? "This date has passed: every matching object, and each new one, is deleted at the next daily run."
+                  : "From that date, every matching object of any age is deleted."}
             </p>
           )}
           <IssueList issues={iss.under("expiration.")} />

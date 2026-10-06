@@ -5,13 +5,13 @@ import { useCallback, useEffect, useId, useMemo, useState, type FormEvent, type 
 import { AlertCircle, AlertTriangle, Ban, Loader2, Plus, RotateCw, Tags, X } from "lucide-react";
 import * as api from "../lib/api";
 import { TAG_LIMITS, type AppError, type JobItem, type JobRequest, type Tag } from "../lib/types";
-import { sameTagSet, tagKeyError } from "../lib/tags";
+import { sameTagSet, splitSystemTags, tagKeyError } from "../lib/tags";
 import { plural } from "../lib/ops";
 import { s3Uri } from "../lib/format";
 import { openModal } from "../store/app";
 import { startConfirmedJob } from "../store/ops";
 import { setBucketTags, setObjectTags } from "../store/tags";
-import { isDenied, permissionText, toast } from "../store/toasts";
+import { isDenied, nothingWritten, permissionText, SAVED_UNREAD_PREFIX, toast } from "../store/toasts";
 import { KeyList, ModalShell, PreviewLine, usePreview } from "./Modals";
 import { fromRows, TagEditor, toRows, validateRows, type TagRow } from "./TagEditor";
 
@@ -20,6 +20,13 @@ type LoadState =
   | { phase: "ready"; loaded: Tag[] }
   | { phase: "unsupported" }
   | { phase: "error"; error: AppError };
+
+/**
+ * What the dialog says after a save that did not end cleanly, kept across the reload that follows.
+ * "conflict": someone else changed the tags, nothing was written. "applied": the write went through
+ * but couldn't be read back. "unknown": it is not known whether the write went through.
+ */
+type Outcome = { kind: "conflict" | "applied" | "unknown"; detail: string | null };
 
 /** The plain state for a server without tagging (MinIO, R2, SeaweedFS and others implement it only partly). */
 function Unsupported() {
@@ -57,21 +64,21 @@ function TagSetDialog({
   const [rows, setRows] = useState<TagRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [saveError, setSaveError] = useState<AppError | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [tried, setTried] = useState(false);
   const titleId = useId();
   const close = () => openModal(null);
 
   const reload = useCallback(
-    async (after?: string) => {
+    async () => {
       setState({ phase: "loading" });
       try {
         const tags = await load();
         setState({ phase: "ready", loaded: tags });
-        setRows(toRows(tags));
+        // AWS system tags are not editable: only the user's tags become rows.
+        setRows(toRows(splitSystemTags(tags).user));
         setTried(false);
         onLoaded(tags);
-        setNotice(after ?? null);
       } catch (e) {
         const err = e as AppError;
         setState(err.code === "NotSupported" ? { phase: "unsupported" } : { phase: "error", error: err });
@@ -85,9 +92,11 @@ function TagSetDialog({
     void reload();
   }, [reload]);
 
-  const tags = fromRows(rows);
-  const v = validateRows(rows, max);
   const loaded = state.phase === "ready" ? state.loaded : null;
+  /** System tags as loaded: passed through unchanged, in the saved set and in `expected`. */
+  const system = useMemo(() => (loaded ? splitSystemTags(loaded).system : []), [loaded]);
+  const tags = [...system, ...fromRows(rows)];
+  const v = validateRows(rows, max, system.length);
   const unchanged = !!loaded && sameTagSet(tags, loaded);
   const canSave = !!loaded && v.valid && !unchanged && !busy;
 
@@ -97,7 +106,7 @@ function TagSetDialog({
     if (!canSave || !loaded) return;
     setBusy(true);
     setSaveError(null);
-    setNotice(null);
+    setOutcome(null);
     try {
       const stored = await save(tags, loaded);
       onLoaded(stored);
@@ -105,9 +114,17 @@ function TagSetDialog({
       close();
     } catch (err) {
       const appErr = err as AppError;
-      if (appErr.code === "Conflict") await reload("Tags changed on the server. Reloaded.");
-      else if (appErr.code === "NotSupported") setState({ phase: "unsupported" });
-      else setSaveError(appErr);
+      if (appErr.code === "Conflict") {
+        setOutcome({ kind: "conflict", detail: null });
+        await reload();
+      } else if (appErr.code === "NotSupported") setState({ phase: "unsupported" });
+      else if (nothingWritten(appErr)) setSaveError(appErr);
+      else {
+        // The write may have landed (or did, but couldn't be read back): never claim nothing changed.
+        // Read the tags again before anything else can be done (busy stays on until then).
+        setOutcome({ kind: appErr.message.startsWith(SAVED_UNREAD_PREFIX) ? "applied" : "unknown", detail: appErr.message });
+        await reload();
+      }
     } finally {
       setBusy(false);
     }
@@ -125,6 +142,22 @@ function TagSetDialog({
             <p className="muted small mono">{where}</p>
           </div>
         </div>
+        {outcome && outcome.kind !== "conflict" && state.phase !== "loading" && (
+          <div className="callout warn" role="alert" data-save-outcome={outcome.kind}>
+            <AlertTriangle size={15} />
+            <span>
+              <strong>
+                {outcome.kind === "applied"
+                  ? "The tags were probably saved, but reading them back failed."
+                  : "Couldn’t confirm whether the save was applied."}
+              </strong>{" "}
+              {state.phase === "ready"
+                ? "The tags below were read again from the server: check them before changing anything."
+                : "Reading the tags again failed too; retry to see what the server has now."}
+              {outcome.detail && <span className="small save-outcome-detail">{outcome.detail}</span>}
+            </span>
+          </div>
+        )}
         {state.phase === "loading" ? (
           <div className="preview-line muted" role="status">
             <Loader2 size={14} className="spin" /> Loading tags…
@@ -148,16 +181,23 @@ function TagSetDialog({
           </div>
         ) : (
           <>
-            {notice && (
-              <div className="callout warn" role="status">
+            {outcome?.kind === "conflict" && (
+              <div className="callout warn" role="status" data-save-outcome="conflict">
                 <AlertTriangle size={15} />
                 <span>
-                  <strong>{notice}</strong> Someone else changed them; your edits were not saved. Make them again on the
-                  current tags.
+                  <strong>Tags changed on the server. Reloaded.</strong> Someone else changed them; your edits were not saved. Make
+                  them again on the current tags.
                 </span>
               </div>
             )}
-            <TagEditor rows={rows} onChange={(r) => (setRows(r), setSaveError(null))} max={max} disabled={busy} showAllErrors={tried} />
+            <TagEditor
+              rows={rows}
+              locked={system}
+              onChange={(r) => (setRows(r), setSaveError(null))}
+              max={max}
+              disabled={busy}
+              showAllErrors={tried}
+            />
             {saveError && (
               <div className="inline-error" role="alert">
                 <AlertCircle size={14} />
@@ -165,6 +205,7 @@ function TagSetDialog({
                   <div>
                     <strong>{isDenied(saveError) ? `${permissionText("change tags")}.` : "Couldn’t save the tags."}</strong> Nothing
                     was changed.
+
                   </div>
                   <div>{saveError.message}</div>
                 </div>

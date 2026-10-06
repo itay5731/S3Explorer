@@ -216,7 +216,11 @@ export async function confirmOrStart(p: {
     dialog();
     return;
   }
-  if (checking) return;
+  if (checking) {
+    // One preview at a time; say so instead of dropping the request silently.
+    toast.info("Another drop is still being prepared", "Nothing was started for this one. Try again in a moment.");
+    return;
+  }
   checking = true;
   document.body.classList.add("busy-cursor");
   try {

@@ -38,14 +38,16 @@ import {
   diffConfigurations,
   duplicateRule,
   emptyRule,
+  isNoteIssue,
   ruleDeletesData,
   rulesDeletingData,
   sameConfiguration,
+  serverChangedIds,
   type ConfigurationDiff,
 } from "../lib/lifecycle";
 import { plural } from "../lib/ops";
 import { openModal } from "../store/app";
-import { isDenied, permissionText, toast } from "../store/toasts";
+import { isDenied, nothingWritten, permissionText, SAVED_UNREAD_PREFIX, toast } from "../store/toasts";
 import { LifecycleRuleEditor } from "./LifecycleRuleEditor";
 
 const FOCUSABLE =
@@ -88,6 +90,16 @@ interface PendingSave {
   deleting: { index: number; rule: LifecycleRule }[];
   /** Danger styling: a rule that deletes data is added or changed, or the configuration is removed. */
   danger: boolean;
+  /** Rule ids someone else changed on the server (after a `Conflict`): saving this draft reverts them. */
+  reverts: ReadonlySet<string>;
+}
+
+const NO_IDS: ReadonlySet<string> = new Set();
+const disabledPrefix = (r: LifecycleRule) => (r.status === "Disabled" ? "(Disabled) " : "");
+const REVERTS_TEXT = "reverts a change made on the server";
+
+function RevertsTag({ show }: { show: boolean }) {
+  return show ? <span className="lc-reverts">({REVERTS_TEXT})</span> : null;
 }
 
 type Prompt = { kind: "close" } | { kind: "discard" } | { kind: "reload" } | null;
@@ -129,7 +141,7 @@ function ConfirmSave({
   const ref = useRef<HTMLDivElement>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
-  const { diff, deleting, config } = pending;
+  const { diff, deleting, config, reverts } = pending;
   useEffect(() => {
     cancelRef.current?.focus();
   }, []);
@@ -198,7 +210,11 @@ function ConfirmSave({
                   {diff.added.map(({ rule, index }) => (
                     <li key={`a${index}`}>
                       <span className="lc-change-id mono">{rule.id}</span>
-                      <span className="lc-change-text">{describeRule(rule)}</span>
+                      <span className="lc-change-text">
+                        {disabledPrefix(rule)}
+                        {describeRule(rule)}
+                        <RevertsTag show={reverts.has(rule.id)} />
+                      </span>
                     </li>
                   ))}
                 </ul>
@@ -211,7 +227,11 @@ function ConfirmSave({
                   {diff.removed.map(({ rule, index }) => (
                     <li key={`r${index}`}>
                       <span className="lc-change-id mono">{rule.id}</span>
-                      <span className="lc-change-text muted">{describeRule(rule)}</span>
+                      <span className="lc-change-text muted">
+                        {disabledPrefix(rule)}
+                        {describeRule(rule)}
+                        <RevertsTag show={reverts.has(rule.id)} />
+                      </span>
                     </li>
                   ))}
                 </ul>
@@ -222,8 +242,8 @@ function ConfirmSave({
                 <h3>Changed ({diff.changed.length})</h3>
                 <ul>
                   {diff.changed.map(({ before, after, index }) => {
-                    const b = `${before.status === "Disabled" ? "(Disabled) " : ""}${describeRule(before)}`;
-                    const a = `${after.status === "Disabled" ? "(Disabled) " : ""}${describeRule(after)}`;
+                    const b = `${disabledPrefix(before)}${describeRule(before)}`;
+                    const a = `${disabledPrefix(after)}${describeRule(after)}`;
                     return (
                       <li key={`c${index}`}>
                         <span className="lc-change-id mono">{after.id}</span>
@@ -233,6 +253,7 @@ function ConfirmSave({
                             →
                           </span>
                           <span>{a}</span>
+                          <RevertsTag show={reverts.has(after.id)} />
                         </span>
                       </li>
                     );
@@ -310,6 +331,7 @@ const RuleCard = memo(function RuleCard({
   count,
   issues,
   marker,
+  reverts,
   expanded,
   versioning,
   actions,
@@ -320,6 +342,8 @@ const RuleCard = memo(function RuleCard({
   count: number;
   issues: LifecycleIssue[];
   marker: "new" | "edited" | null;
+  /** After a `Conflict`: this rule differs from a change someone else made on the server. */
+  reverts: boolean;
   expanded: boolean;
   versioning: BucketVersioning | null;
   actions: RuleActions;
@@ -336,9 +360,10 @@ const RuleCard = memo(function RuleCard({
   const enabled = r.status === "Enabled";
   const bodyId = `lc-rule-body-${row.key}`;
   const label = r.id || `rule ${index + 1}`;
+  const problems = issues.filter((i) => !isNoteIssue(i)).length;
   return (
     <li
-      className={`lc-rule ${expanded ? "expanded" : ""} ${enabled ? "" : "disabled"} ${issues.length ? "has-issues" : ""}`}
+      className={`lc-rule ${expanded ? "expanded" : ""} ${enabled ? "" : "disabled"} ${problems ? "has-issues" : ""}`}
       data-rule-index={index}
       data-row-key={row.key}
     >
@@ -369,14 +394,19 @@ const RuleCard = memo(function RuleCard({
             </span>
           )}
           {marker && <span className={`lc-badge accent`}>{marker === "new" ? "new" : "edited"}</span>}
-          {issues.length > 0 && (
+          {reverts && (
+            <span className="lc-badge reverts" title="Someone else changed this rule on the server; saving your draft undoes that change">
+              {REVERTS_TEXT}
+            </span>
+          )}
+          {problems > 0 && (
             <button
               type="button"
               className="lc-badge warn"
               onClick={() => !expanded && onToggle()}
               title="Open the rule to see the problems"
             >
-              <AlertCircle size={11} /> {plural(issues.length, "problem")}
+              <AlertCircle size={11} /> {plural(problems, "problem")}
             </button>
           )}
         </span>
@@ -454,6 +484,10 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
   const [saveError, setSaveError] = useState<AppError | null>(null);
   /** Set after a save hit `Conflict` and the server version was reloaded under the draft. */
   const [conflict, setConflict] = useState(false);
+  /** The server configuration the draft was made from, kept across `Conflict` reloads (to label reverts). */
+  const [conflictBase, setConflictBase] = useState<{ config: LifecycleConfiguration | null } | null>(null);
+  /** A save whose result isn't known for sure; the server state was read again under the draft. */
+  const [outcome, setOutcome] = useState<{ kind: "applied" | "unknown"; detail: string; reread: boolean } | null>(null);
   const [prompt, setPrompt] = useState<Prompt>(null);
   const [copied, setCopied] = useState(false);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -467,15 +501,24 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
   const dirty = ready && !sameConfiguration(loaded, config);
   const fresh = validation !== null && validation.key === configKey;
   const issues = fresh ? validation.issues : (validation?.issues ?? []);
-  const valid = fresh && validation.issues.length === 0 && !validationError;
+  // "Note: …" issues (e.g. a date that has passed) are warnings: shown at the field, never blocking.
+  const blocking = useMemo(() => issues.filter((i) => !isNoteIssue(i)), [issues]);
+  const valid = fresh && validation.issues.every(isNoteIssue) && !validationError;
   const canSave = ready && dirty && valid && !saving;
   const diff = useMemo(() => diffConfigurations(loaded, config), [loaded, config]);
+  /** After a `Conflict`: rule ids someone else changed on the server since the draft was made. */
+  const revertIds = useMemo(
+    () => (conflictBase ? serverChangedIds(conflictBase.config, loaded) : NO_IDS),
+    [conflictBase, loaded],
+  );
   const atLimit = rows.length >= LIFECYCLE_LIMITS.maxRules;
 
   const load = useCallback(async () => {
     setState({ phase: "loading" });
     setSaveError(null);
     setConflict(false);
+    setConflictBase(null);
+    setOutcome(null);
     setVersioningFailed(false);
     const ver = api.getBucketVersioning(bucket).then(
       (v) => setVersioning(v),
@@ -641,6 +684,7 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
       diff: d,
       deleting,
       danger: d.removesConfiguration || deleting.some((x) => deletingIds.has(x.index)),
+      reverts: new Set(revertIds),
     });
   };
 
@@ -648,6 +692,7 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
     if (!pending) return;
     setSaving(true);
     setSaveError(null);
+    setOutcome(null);
     try {
       await api.putLifecycle(bucket, pending.config, pending.expected);
       toast.success(pending.diff.removesConfiguration ? "Lifecycle configuration removed" : "Lifecycle rules saved", `s3://${bucket}`);
@@ -659,14 +704,31 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
       if (err.code === "Conflict") {
         toast.warning("Lifecycle rules changed on the server", "Your edits are kept. Review the current rules and save again.");
         try {
-          // The server's version becomes `expected`; the draft stays as the user left it.
+          // The server's version becomes `expected`; the draft stays as the user left it. The version
+          // the draft was made from is kept (first conflict only) to tell which differences undo
+          // someone else's change.
+          const base = pending.expected;
           setLoaded(await api.getLifecycle(bucket));
+          setConflictBase((cur) => cur ?? { config: base });
           setConflict(true);
         } catch (e2) {
           setSaveError(e2 as AppError);
         }
       } else if (notUnderstood(err)) {
         setState({ phase: "unreadable", message: err.message });
+      } else if (err.code !== "NotSupported" && !nothingWritten(err)) {
+        // The write may have landed ("Saved, but reading back failed…": it did). Never say nothing
+        // changed; read the server's configuration again under the draft before anything else can be
+        // done (saving stays on until then). If it was applied, the draft now equals it.
+        const kind = err.message.startsWith(SAVED_UNREAD_PREFIX) ? "applied" : "unknown";
+        let reread = false;
+        try {
+          setLoaded(await api.getLifecycle(bucket));
+          reread = true;
+        } catch {
+          /* said in the callout */
+        }
+        setOutcome({ kind, detail: err.message, reread });
       } else {
         // NotSupported on save: the server refused part of this configuration ("Nothing was changed")
         // or stored only part of it and the previous one was put back. Either way the draft stays so
@@ -737,7 +799,7 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
     [],
   );
 
-  const configIssues = issues.filter((i) => i.ruleIndex === null);
+  const configIssues = blocking.filter((i) => i.ruleIndex === null);
   const issuesByRule = useMemo(() => {
     const m = new Map<number, LifecycleIssue[]>();
     for (const i of issues) if (i.ruleIndex !== null) m.set(i.ruleIndex, [...(m.get(i.ruleIndex) ?? []), i]);
@@ -745,7 +807,9 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
   }, [issues]);
   const addedIdx = new Set(diff.added.map((x) => x.index));
   const changedIdx = new Set(diff.changed.map((x) => x.index));
-  const invalidCount = new Set(issues.filter((i) => i.ruleIndex !== null).map((i) => i.ruleIndex)).size;
+  const invalidCount = new Set(blocking.filter((i) => i.ruleIndex !== null).map((i) => i.ruleIndex)).size;
+  /** Draft rules that differ from the server; those whose server version someone else changed are reverts. */
+  const differs = new Set([...diff.added.map((x) => x.rule.id), ...diff.changed.map((x) => x.after.id)]);
 
   const saveTitle = !ready
     ? undefined
@@ -888,6 +952,24 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
                   </span>
                 </div>
               )}
+              {outcome && (
+                <div className="callout warn" role="alert" data-save-outcome={outcome.kind}>
+                  <AlertTriangle size={15} />
+                  <span>
+                    <strong>
+                      {outcome.kind === "applied"
+                        ? "The rules were probably saved, but reading them back failed."
+                        : "Couldn’t confirm whether the save was applied."}
+                    </strong>{" "}
+                    {outcome.reread
+                      ? dirty
+                        ? "The server’s configuration was read again: rules marked “new” or “edited” differ from it."
+                        : "The server’s configuration was read again and matches your rules."
+                      : "Reading the configuration again failed too: reload before saving again."}
+                    <span className="small save-outcome-detail">{outcome.detail}</span>
+                  </span>
+                </div>
+              )}
               {saveError && (
                 <div className="inline-error" role="alert">
                   <AlertCircle size={14} />
@@ -949,6 +1031,7 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
                           count={rows.length}
                           issues={issuesByRule.get(i) ?? NO_ISSUES}
                           marker={addedIdx.has(i) ? "new" : changedIdx.has(i) ? "edited" : null}
+                          reverts={differs.has(row.rule.id) && revertIds.has(row.rule.id)}
                           expanded={expanded === row.key}
                           versioning={versioning}
                           actions={actions}
@@ -960,7 +1043,7 @@ export function LifecycleDialog({ bucket }: { bucket: string }) {
                   {diff.removed.length > 0 && (
                     <p className="lc-removed small">
                       <Trash2 size={12} /> {conflict ? "On the server but not in your draft" : "Removed (until you save)"}:{" "}
-                      {diff.removed.map((x) => x.rule.id).join(", ")}
+                      {diff.removed.map((x) => x.rule.id + (revertIds.has(x.rule.id) ? ` (${REVERTS_TEXT})` : "")).join(", ")}
                     </p>
                   )}
                   <div>

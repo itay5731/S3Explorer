@@ -39,6 +39,8 @@ const rank = (c: TransitionStorageClass) => STORAGE_CLASS_RANK[c] ?? 0;
 /** STANDARD_IA and ONEZONE_IA: at least 30 days after creation, and an archive transition after one of
  * them at least 30 days later. INTELLIGENT_TIERING has neither constraint. */
 const needs30Days = (c: TransitionStorageClass) => c === "STANDARD_IA" || c === "ONEZONE_IA";
+const isArchive = (c: TransitionStorageClass) => c === "GLACIER_IR" || c === "GLACIER" || c === "DEEP_ARCHIVE";
+const WATERFALL = "STANDARD_IA → INTELLIGENT_TIERING → ONEZONE_IA → GLACIER_IR → GLACIER → DEEP_ARCHIVE";
 const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /** Midnight UTC, as "YYYY-MM-DD" or RFC 3339; returns ms since the epoch or an error text. */
@@ -85,6 +87,8 @@ class Checker {
     base: string,
     what: string,
     needs: string,
+    /** For a past date: "moves to GLACIER" / "is deleted". */
+    pastVerb: string,
   ): When | null {
     const hasDays = days !== null && days !== undefined;
     const hasDate = date !== null && date !== undefined;
@@ -104,6 +108,13 @@ class Checker {
     if (typeof r === "string") {
       this.add(`${base}.date`, r);
       return null;
+    }
+    // Valid for S3, but not a no-op: a warning-style issue ("Note: …") that doesn't block saving.
+    if (r <= Math.floor(Date.now() / DAY_MS) * DAY_MS) {
+      this.add(
+        `${base}.date`,
+        `Note: ${ymd(r)} is today or in the past, so every matching object, and every new one, ${pastVerb} at the next daily run.`,
+      );
     }
     return { kind: "date", ms: r };
   }
@@ -127,30 +138,22 @@ function checkOrder(
       );
       continue;
     }
-    const tier = items.slice(0, j).findIndex(([c]) => rank(c) === rank(cj));
-    if (tier >= 0) {
-      ck.add(
-        `${base}[${j}].storageClass`,
-        `${items[tier][0]} and ${cj} are the same tier: a rule can move objects to only one of STANDARD_IA, ONEZONE_IA and INTELLIGENT_TIERING, and each later ${noun} must be to a colder class.`,
-      );
-      continue;
-    }
     if (!wj) continue;
     const whenField = `${base}[${j}].${daysField ?? wj.kind}`;
+    // Compare with every class earlier in the waterfall (either list order); reported on the later class.
     for (let k = 0; k < items.length; k++) {
       const [ckClass, wk] = items[k];
-      if (k === j || rank(ckClass) === rank(cj) || !wk) continue;
-      if (rank(cj) < rank(ckClass)) continue;
+      if (rank(ckClass) >= rank(cj) || !wk) continue;
       const g = gapTo(wk, wj);
       if (g === null) continue;
       if (g <= 0) {
         ck.add(
           whenField,
-          `${capitalize(noun)} to ${cj} ${whenText(wj)} comes before (or at the same time as) the ${noun} to ${ckClass} ${whenText(wk)}: objects can only move to colder storage over time, so ${cj} must come later.`,
+          `${capitalize(noun)} to ${cj} ${whenText(wj)} comes before (or at the same time as) the ${noun} to ${ckClass} ${whenText(wk)}: transitions follow S3's order ${WATERFALL}, so ${cj} must come later.`,
         );
         break;
       }
-      if (gap && needs30Days(ckClass) && rank(cj) >= 2 && g < LIFECYCLE_LIMITS.minDaysBetweenTiers) {
+      if (gap && needs30Days(ckClass) && isArchive(cj) && g < LIFECYCLE_LIMITS.minDaysBetweenTiers) {
         ck.add(
           whenField,
           `${capitalize(noun)} to ${cj} ${whenText(wj)} comes before the ${LIFECYCLE_LIMITS.minDaysBetweenTiers}-day minimum for the earlier ${ckClass} ${noun} (${whenText(wk)}): it must be ${plusDays(wk, LIFECYCLE_LIMITS.minDaysBetweenTiers)}.`,
@@ -229,7 +232,7 @@ function checkRule(ck: Checker, r: LifecycleRule) {
   transitions.forEach((t, j) => {
     const base = `transitions[${j}]`;
     // Day 0 is allowed for transitions (moves on the day of creation).
-    const w = ck.when(t.days, t.date, 0, base, `The transition to ${t.storageClass}`, `objects move to ${t.storageClass}`);
+    const w = ck.when(t.days, t.date, 0, base, `The transition to ${t.storageClass}`, `objects move to ${t.storageClass}`, `moves to ${t.storageClass}`);
     if (w && w.kind === "days" && needs30Days(t.storageClass) && w.n < LIFECYCLE_LIMITS.minDaysToInfrequentAccess) {
       ck.add(
         `${base}.days`,
@@ -257,7 +260,7 @@ function checkRule(ck: Checker, r: LifecycleRule) {
         );
       }
     } else {
-      expWhen = ck.when(e.days, e.date, 1, "expiration", "The expiration", "objects expire");
+      expWhen = ck.when(e.days, e.date, 1, "expiration", "The expiration", "objects expire", "is deleted");
     }
     if (expWhen) {
       for (const [cls, wt] of current) {

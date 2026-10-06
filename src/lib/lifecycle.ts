@@ -17,11 +17,14 @@ import type {
 
 // ---- storage classes ---------------------------------------------------------------------------
 
-/** Every transition target, warmest first (the order of the editor's select). */
+/**
+ * Every transition target in S3's waterfall order (STORAGE_CLASS_RANK, strictly increasing): a later
+ * transition in a rule must go to a class further down this list. Also the order of the editor's select.
+ */
 export const TRANSITION_CLASSES: readonly TransitionStorageClass[] = [
   "STANDARD_IA",
-  "ONEZONE_IA",
   "INTELLIGENT_TIERING",
+  "ONEZONE_IA",
   "GLACIER_IR",
   "GLACIER",
   "DEEP_ARCHIVE",
@@ -126,6 +129,34 @@ export function describeFilter(f: LifecycleFilter): string {
   return parts.length ? `Objects ${parts.join(" ")}` : "All objects in the bucket";
 }
 
+/** Today's date in UTC as "YYYY-MM-DD" (lifecycle dates are midnight UTC). */
+export const todayUtc = (now: Date = new Date()): string => now.toISOString().slice(0, 10);
+
+/**
+ * A lifecycle date compared with `today` ("YYYY-MM-DD", UTC): "past" covers today too, because the
+ * date's midnight UTC has already been reached. null when the text isn't a date.
+ */
+export function dateTense(date: string, today: string = todayUtc()): "past" | "future" | null {
+  const d = canonDate(date);
+  if (d === null || !/^\d{4}-\d{2}-\d{2}$/.test(d)) return null;
+  return d <= today ? "past" : "future";
+}
+
+/**
+ * What a date-based action does, in words. A date that is today or past is not a no-op: S3 applies
+ * it to every matching object, and to each new one, at the next daily run.
+ */
+function dateAction(date: string, verb: { now: string; from: string }, today: string): string | null {
+  const t = dateTense(date, today);
+  const d = formatDate(date);
+  if (t === "past") return `every matching object, and each new one, ${verb.now} at the next daily run (date ${d} has passed)`;
+  if (t === "future") return `from ${d}, every matching object of any age ${verb.from}`;
+  return null;
+}
+
+/** A warning-style issue from `validate_lifecycle`: shown at its field, never blocks saving. */
+export const isNoteIssue = (i: { message: string }): boolean => i.message.startsWith("Note: ");
+
 /** "after 30 days" / "on 2027-01-01" / "(when not set)". */
 function whenText(days: number | null, date: string | null): string {
   if (isNum(days) && date) return `after ${formatDays(days)} and on ${formatDate(date)}`;
@@ -137,15 +168,26 @@ function whenText(days: number | null, date: string | null): string {
 const daysOrUnset = (n: number | null | undefined) => (isNum(n) ? `after ${formatDays(n)}` : "(days not set)");
 const keeping = (n: number | null) => (isNum(n) ? `, keeping the ${num(n)} newest` : "");
 
-function transitionsText(ts: Transition[]): string | null {
+function transitionsText(ts: Transition[], today: string): string | null {
   if (!ts.length) return null;
-  return ts.map((t, i) => `${i === 0 ? "move" : "then"} to ${storageClassName(t.storageClass)} ${whenText(t.days, t.date)}`).join(", ");
+  // A date phrase is a clause of its own ("from <d>, every matching object …"): separate with "; ".
+  let out = "";
+  ts.forEach((t, i) => {
+    const cls = storageClassName(t.storageClass);
+    const byDate = !isNum(t.days) && t.date ? dateAction(t.date, { now: `moves to ${cls}`, from: `moves to ${cls}` }, today) : null;
+    const part = byDate ?? `${i === 0 ? "move" : "then"} to ${cls} ${whenText(t.days, t.date)}`;
+    const prevByDate = i > 0 && !isNum(ts[i - 1].days) && !!ts[i - 1].date && dateTense(ts[i - 1].date as string, today) !== null;
+    out += i === 0 ? part : `${byDate || prevByDate ? "; " : ", "}${part}`;
+  });
+  return out;
 }
 
-function expirationText(e: Expiration | null): string | null {
+function expirationText(e: Expiration | null, today: string): string | null {
   if (!e) return null;
   const parts: string[] = [];
-  if (isNum(e.days) || e.date) parts.push(`delete ${whenText(e.days, e.date)}`);
+  const byDate = !isNum(e.days) && e.date ? dateAction(e.date, { now: "is deleted", from: "is deleted" }, today) : null;
+  if (byDate) parts.push(byDate);
+  else if (isNum(e.days) || e.date) parts.push(`delete ${whenText(e.days, e.date)}`);
   if (e.expiredObjectDeleteMarker) parts.push("remove delete markers that have no older versions left");
   return parts.length ? parts.join(", and ") : "delete (when is not set)";
 }
@@ -168,10 +210,13 @@ function noncurrentText(ts: NoncurrentTransition[], e: NoncurrentExpiration | nu
  * Glacier Instant Retrieval after 30 days, then to Glacier Deep Archive after 180 days; delete after
  * 365 days. Noncurrent versions: delete after 30 days, keeping the 2 newest. Incomplete multipart
  * uploads are aborted after 7 days." Never throws on an incomplete rule (unset values say so).
+ * Dates: one that is today or past (UTC) means "every matching object, and each new one, … at the
+ * next daily run"; a future one "from <date>, every matching object of any age …". `today` is
+ * "YYYY-MM-DD" (UTC), for tests.
  */
-export function describeRule(rule: LifecycleRule): string {
+export function describeRule(rule: LifecycleRule, today: string = todayUtc()): string {
   const subject = describeFilter(rule.filter);
-  const current = [transitionsText(rule.transitions), expirationText(rule.expiration)].filter(Boolean).join("; ");
+  const current = [transitionsText(rule.transitions, today), expirationText(rule.expiration, today)].filter(Boolean).join("; ");
   const sentences: string[] = [];
   if (current) sentences.push(`${subject}: ${current}.`);
   else sentences.push(`Applies to ${subject.charAt(0).toLowerCase()}${subject.slice(1)}.`);
@@ -348,6 +393,29 @@ export function diffConfigurations(before: LifecycleConfiguration | null, after:
     removesConfiguration: a.length === 0 && b.length > 0,
     same: sameConfiguration(before, after),
   };
+}
+
+/**
+ * Rule ids whose rule on the server changed between `base` (what the draft was made from) and
+ * `current` (the server's configuration read again after a `Conflict`): added, removed or edited by
+ * someone else. A draft that differs from `current` on one of these ids reverts that change.
+ * With duplicate ids (never valid) the first rule of each id counts.
+ */
+export function serverChangedIds(base: LifecycleConfiguration | null, current: LifecycleConfiguration | null): Set<string> {
+  const first = (c: LifecycleConfiguration | null) => {
+    const m = new Map<string, LifecycleRule>();
+    for (const r of c?.rules ?? []) if (!m.has(r.id)) m.set(r.id, r);
+    return m;
+  };
+  const b = first(base);
+  const c = first(current);
+  const out = new Set<string>();
+  for (const id of new Set([...b.keys(), ...c.keys()])) {
+    const x = b.get(id);
+    const y = c.get(id);
+    if (!x || !y || !sameRule(x, y)) out.add(id);
+  }
+  return out;
 }
 
 // ---- new rules ----------------------------------------------------------------------------------------

@@ -34,7 +34,7 @@ import type {
 import { DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
 import { planParts, validateAppSettings } from "./settings";
 import { parseBucketInput } from "./buckets";
-import { sameTagSet, validateTags } from "./tags";
+import { isSystemTag, sameTagSet, validateTags } from "./tags";
 import { validateLifecycleConfig } from "./lifecycleCheck";
 import { sameConfiguration } from "./lifecycle";
 
@@ -245,6 +245,8 @@ function seed() {
   // ---- v0.4.0: tags, shared buckets, a server without tagging ----
   assets.tags = tagList({ team: "web", env: "prod", "cost-center": "4410" });
   logs.tags = tagList({ team: "platform", retention: "90d" });
+  // Created by CloudFormation: AWS system tags (read-only, passed through on every save) next to a user tag.
+  backups.tags = tagList({ "aws:cloudformation:stack-name": "backups-prod", "aws:cloudformation:logical-id": "ArchiveBucket", owner: "ops" });
   const tagged = (key: string, t: Record<string, string>) => {
     const o = assets.objects.get(key);
     if (o) o.tags = tagList(t);
@@ -364,14 +366,44 @@ function addedForConnection(): AddedBucket[] {
 /** Every tag write the mock received, verbatim, for test inspection. */
 const tagCallLog: { cmd: string; bucket: string; key: string | null; tags: Tag[]; expected: Tag[]; at: string }[] = [];
 
-function checkTagWrite(tags: Tag[], expected: Tag[], max: number) {
+/**
+ * Validate a tag write the way the backend does and return the set to store. AWS system tags
+ * ("aws:…") are accepted only as a pass-through: the same key and value must be in `expected`; a new
+ * or changed one is refused. System tags in `expected` are never dropped: they are kept even when
+ * `tags` omits them, so the set is never deleted while one exists.
+ */
+function checkTagWrite(tags: Tag[], expected: Tag[], max: number): Tag[] {
   if (!Array.isArray(tags) || !Array.isArray(expected)) throw fail("InvalidInput", "tags and expected must be lists");
-  const v = validateTags(tags, max);
+  const system = tags.filter(isSystemTag);
+  for (const t of system) {
+    if (!expected.some((e) => e.key === t.key && e.value === t.value)) {
+      throw fail(
+        "InvalidInput",
+        `The tag key “${t.key}” starts with “aws:”, which is reserved for AWS: a system tag can only be kept unchanged, not added or changed.`,
+      );
+    }
+  }
+  const user = tags.filter((t) => !isSystemTag(t));
+  const kept = expected.filter((e) => isSystemTag(e) && !system.some((t) => t.key === e.key));
+  const v = validateTags(user, max, system.length + kept.length);
   if (!v.valid) {
     const i = v.rows.findIndex((r) => r.key || r.value);
     const msg = v.set ?? (i >= 0 ? `tags[${i}]: ${v.rows[i].key ?? v.rows[i].value}` : "invalid tags");
     throw fail("InvalidInput", msg);
   }
+  return [...kept, ...tags];
+}
+
+/**
+ * Test hook: make the next tag or lifecycle save fail. `write: true` stores the change first (the
+ * failure happens after the write, like "Saved, but reading back failed…"); `false` stores nothing.
+ */
+type InjectedFailure = { code: ErrorCode; message: string; write: boolean };
+const injected: { tags: InjectedFailure | null; lifecycle: InjectedFailure | null } = { tags: null, lifecycle: null };
+function takeInjected(kind: "tags" | "lifecycle"): InjectedFailure | null {
+  const f = injected[kind];
+  injected[kind] = null;
+  return f;
 }
 
 const notSupported = () => fail("NotSupported", "This server does not support tagging (NotImplemented).");
@@ -817,6 +849,8 @@ const jobListeners = new Set<(j: Job) => void>();
 let jobTicker: ReturnType<typeof setInterval> | null = null;
 let jobSeq = 0;
 
+/** Test hook: the next preview_job takes this long (ms), to hold a preview open. */
+const previewDelay: { next: number | null } = { next: null };
 /** Every preview/start request the mock received, verbatim (deep-cloned), for test inspection. */
 const jobCallLog: { cmd: "preview_job" | "start_job"; request: unknown; at: string }[] = [];
 function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
@@ -828,6 +862,13 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
   tagCalls: tagCallLog,
   objectTags: (bucket: string, key: string) => copyTags(buckets.get(bucket)?.objects.get(key)?.tags),
   bucketTags: (bucket: string) => copyTags(buckets.get(bucket)?.tags),
+  /** Make the next tag / lifecycle save fail (see InjectedFailure). */
+  failNextTagSave: (f: InjectedFailure) => {
+    injected.tags = f;
+  },
+  failNextLifecycleSave: (f: InjectedFailure) => {
+    injected.lifecycle = f;
+  },
   /** Change tags behind the UI's back (simulates another client), to exercise Conflict. */
   setObjectTags: (bucket: string, key: string, tags: Tag[]) => {
     const o = buckets.get(bucket)?.objects.get(key);
@@ -844,6 +885,18 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
   setLifecycle: (bucket: string, config: LifecycleConfiguration | null) => writeLifecycle(bucket, config),
   setVersioning: (bucket: string, v: BucketVersioning) => {
     mockVersioning[bucket] = v;
+  },
+  /** Add or remove an object behind the UI's back (another client); the UI sees it on its next listing. */
+  putObject: (bucket: string, key: string, size = 1000) => {
+    const b = buckets.get(bucket);
+    if (b) put(b, key, size, { ageDays: 1 });
+  },
+  removeObject: (bucket: string, key: string) => {
+    const b = buckets.get(bucket);
+    if (b && b.objects.delete(key)) b.sorted = null;
+  },
+  slowNextPreview: (ms: number) => {
+    previewDelay.next = ms;
   },
   has: (bucket: string, key: string) => !!buckets.get(bucket)?.objects.has(key),
   size: (bucket: string, key: string) => buckets.get(bucket)?.objects.get(key)?.size ?? null,
@@ -1346,9 +1399,12 @@ export const mockBackend: Backend = {
     const b = requireBucket(bucket);
     if (tagsUnsupported(bucket)) throw notSupported();
     if (b.hidden) throw fail("AccessDenied", "Access Denied: s3:PutBucketTagging is not allowed on a bucket shared with you.");
-    checkTagWrite(tags, expected, TAG_LIMITS.bucketMaxTags);
+    const next = checkTagWrite(tags, expected, TAG_LIMITS.bucketMaxTags);
     if (!sameTagSet(b.tags ?? [], expected)) throw conflict();
-    b.tags = tags.length ? copyTags(tags) : undefined;
+    const f = takeInjected("tags");
+    if (f && !f.write) throw fail(f.code, f.message);
+    b.tags = next.length ? copyTags(next) : undefined;
+    if (f) throw fail(f.code, f.message);
     return copyTags(b.tags);
   },
 
@@ -1369,9 +1425,12 @@ export const mockBackend: Backend = {
     const o = b.objects.get(key);
     if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
     if (b.readOnly) throw fail("AccessDenied", "Access Denied: s3:PutObjectTagging is not allowed on this bucket.");
-    checkTagWrite(tags, expected, TAG_LIMITS.objectMaxTags);
+    const next = checkTagWrite(tags, expected, TAG_LIMITS.objectMaxTags);
     if (!sameTagSet(o.tags ?? [], expected)) throw conflict();
-    o.tags = tags.length ? copyTags(tags) : undefined;
+    const f = takeInjected("tags");
+    if (f && !f.write) throw fail(f.code, f.message);
+    o.tags = next.length ? copyTags(next) : undefined;
+    if (f) throw fail(f.code, f.message);
     return copyTags(o.tags);
   },
 
@@ -1400,7 +1459,8 @@ export const mockBackend: Backend = {
     const b = requireBucket(bucket);
     if (lifecycleUnsupported(bucket)) throw lifecycleNotSupported();
     if (lifecycleDenied(bucket, b)) throw fail("AccessDenied", "Access Denied: s3:PutLifecycleConfiguration is not allowed on a bucket shared with you.");
-    const issues = validateLifecycleConfig(config);
+    // "Note: …" issues are warnings (e.g. a date that has passed): they don't block saving.
+    const issues = validateLifecycleConfig(config).filter((i) => !i.message.startsWith("Note: "));
     if (issues.length) {
       const parts = issues.slice(0, 10).map((i) => (i.ruleIndex === null ? i.message : `Rule ${i.ruleIndex + 1}: ${i.message}`));
       throw fail("InvalidInput", `The lifecycle configuration was not saved because it has ${issues.length} problem${issues.length === 1 ? "" : "s"}: ${parts.join(" ")}`);
@@ -1428,7 +1488,10 @@ export const mockBackend: Backend = {
         );
       }
     }
+    const f = takeInjected("lifecycle");
+    if (f && !f.write) throw fail(f.code, f.message);
     writeLifecycle(bucket, config.rules.length ? asStored(config) : null);
+    if (f) throw fail(f.code, f.message);
     return storedLifecycle(bucket);
   },
 
@@ -1586,7 +1649,8 @@ export const mockBackend: Backend = {
   },
 
   async previewJob(request) {
-    await delay(250 + rand() * 350);
+    await delay(previewDelay.next ?? 250 + rand() * 350);
+    previewDelay.next = null;
     logJobCall("preview_job", request);
     return previewJobSync(request);
   },

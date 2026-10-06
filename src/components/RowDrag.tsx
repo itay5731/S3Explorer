@@ -11,9 +11,9 @@ import { JOB_MAX_ITEMS } from "../lib/types";
 import { plural } from "../lib/ops";
 import { useApp } from "../store/app";
 import type { ClipItem } from "../store/clipboard";
-import { buildTransferRequest, confirmOrStart, selectedItems, tooMany } from "../store/ops";
+import { buildTransferRequest, confirmOrStart, tooMany } from "../store/ops";
 import { toast } from "../store/toasts";
-import { getViewRows } from "../store/view";
+import { getViewRows, type Row } from "../store/view";
 
 /** The pointer must move this far (px) before a press becomes a drag, so clicks still work. */
 const DRAG_THRESHOLD = 6;
@@ -44,11 +44,12 @@ const NONE: ReadonlySet<string> = new Set();
 /** Drag state for the badge and the row styling. Only these subscribe; the table rows don't re-render on moves. */
 export const useRowDragView = create<DragView>(() => ({ ids: NONE, count: 0, copy: false, x: 0, y: 0, target: null }));
 
+/** What is dragged, frozen when the drag starts; a drop sends exactly these items. */
 interface Source {
-  bucket: string;
-  prefix: string;
-  items: ClipItem[];
-  ids: Set<string>;
+  readonly bucket: string;
+  readonly prefix: string;
+  readonly items: readonly ClipItem[];
+  readonly ids: ReadonlySet<string>;
 }
 
 interface Hit {
@@ -71,6 +72,14 @@ function refusal(src: Source, bucket: string, prefix: string, copy: boolean): st
 
 const targetLabel = (bucket: string, prefix: string) => `${bucket}/${prefix}`;
 
+/** Same drop target: the same bucket and the exact same prefix (or both nothing). */
+const sameTarget = (a: Hit | null, b: Hit | null) => (a && b ? a.bucket === b.bucket && a.prefix === b.prefix : a === b);
+
+const clipItem = (r: Row): ClipItem =>
+  Object.freeze(
+    r.kind === "folder" ? { key: r.folder.prefix, isPrefix: true, name: r.folder.name } : { key: r.object.key, isPrefix: false, name: r.object.name },
+  );
+
 /**
  * Pointer handlers for the table body. `scrollRef` is the virtualized list's scroll container.
  * Returns handlers to attach and nothing else: the drag lives outside React state.
@@ -81,9 +90,12 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
 
   const onPointerDown = (e: ReactPointerEvent) => {
     if (e.button !== 0) return;
-    const rowEl = (e.target as HTMLElement).closest<HTMLElement>("[data-index]");
-    if (!rowEl) return;
-    const index = Number(rowEl.dataset.index);
+    const rowEl = (e.target as HTMLElement).closest<HTMLElement>("[data-row-id]");
+    const rowId = rowEl?.dataset.rowId;
+    if (!rowEl || rowId === undefined) return;
+    // What was pressed, captured now: the row by its id (never by its position, which a refresh, "load
+    // more" or a re-sort can shift before the drag starts), the folder, and the selection as it is now.
+    const pressed = { rowId, ...pick(useApp.getState()) };
     const start = { x: e.clientX, y: e.clientY };
     swallowClick.current = false;
 
@@ -102,16 +114,20 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
       body.toggle("drag-refused", !!h?.refused);
     };
 
+    /** The drop target under the pointer (null: none), without changing anything. */
+    const hitTest = (): Hit | null => {
+      if (!src) return null;
+      const el = document.elementFromPoint(pointer.x, pointer.y)?.closest<HTMLElement>("[data-drop-prefix]") ?? null;
+      if (!el) return null;
+      const bucket = el.dataset.dropBucket ?? src.bucket;
+      const prefix = el.dataset.dropPrefix ?? "";
+      return { el, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
+    };
+
     /** Hit-test what is under the pointer and update the highlight and the badge. */
     const update = () => {
       if (!src) return;
-      const el = document.elementFromPoint(pointer.x, pointer.y)?.closest<HTMLElement>("[data-drop-prefix]") ?? null;
-      let next: Hit | null = null;
-      if (el) {
-        const bucket = el.dataset.dropBucket ?? src.bucket;
-        const prefix = el.dataset.dropPrefix ?? "";
-        next = { el, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
-      }
+      const next = hitTest();
       mark(next);
       useRowDragView.setState({
         copy,
@@ -143,20 +159,25 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
     };
 
     const begin = (): boolean => {
+      const { bucket, prefix } = useApp.getState();
+      if (!bucket || bucket !== pressed.bucket || prefix !== pressed.prefix) return false;
       const rows = getViewRows();
-      const row = rows[index];
-      const { bucket, prefix, selection } = useApp.getState();
-      if (!row || !bucket) return false;
-      // The whole selection when the pressed row is part of it, otherwise just that row.
-      const items: ClipItem[] = selection.has(row.id)
-        ? selectedItems()
-        : [row.kind === "folder" ? { key: row.folder.prefix, isPrefix: true, name: row.folder.name } : { key: row.object.key, isPrefix: false, name: row.object.name }];
+      // Resolve the pressed row by its id. Gone (the listing changed under the pointer): no drag.
+      const row = rows.find((r) => r.id === pressed.rowId);
+      if (!row) {
+        toast.info("Drag cancelled", "The list changed before the drag started. Nothing was moved.");
+        return false;
+      }
+      // The selection as it was when pressed, if the pressed row was part of it (only rows still
+      // listed and shown: never an item the user can't see), otherwise just that row. Folders first.
+      const picked = pressed.selection.has(row.id) ? rows.filter((r) => pressed.selection.has(r.id)) : [row];
+      const items = Object.freeze([...picked.filter((r) => r.kind === "folder"), ...picked.filter((r) => r.kind !== "folder")].map(clipItem));
       if (!items.length) return false;
       if (items.length > JOB_MAX_ITEMS) {
         tooMany(items.length, "move");
         return false;
       }
-      src = { bucket, prefix, items, ids: new Set(items.map((i) => i.key)) };
+      src = Object.freeze({ bucket, prefix, items, ids: new Set(items.map((i) => i.key)) });
       document.body.classList.add("row-dragging");
       window.getSelection()?.removeAllRanges();
       useRowDragView.setState({ ids: src.ids, count: items.length, copy, x: pointer.x, y: pointer.y, target: null });
@@ -182,6 +203,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
       if (!src) {
         if (Math.hypot(ev.clientX - start.x, ev.clientY - start.y) < DRAG_THRESHOLD) return;
         if (!begin()) {
+          swallowClick.current = true;
           finish();
           return;
         }
@@ -194,14 +216,23 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
 
     const onUp = (ev: PointerEvent) => {
       const dragged = src;
+      /** The target the user saw highlighted last. */
+      const shown = hit as Hit | null;
+      let target: Hit | null = null;
       if (dragged) {
         copy = copyHeld(ev);
         pointer = { x: ev.clientX, y: ev.clientY };
-        update();
+        target = hitTest();
       }
-      const target = hit as Hit | null;
       finish();
-      if (!dragged || !target) return;
+      if (!dragged) return;
+      // Commit only onto the target that was highlighted: if the page changed under the pointer in
+      // the last frame, the release lands somewhere the user never saw.
+      if (!sameTarget(shown, target)) {
+        toast.info("Drop cancelled: the target changed", "Nothing was moved or copied. Drag again onto the highlighted target.");
+        return;
+      }
+      if (!target) return;
       if (target.refused) {
         toast.info(copy ? "Nothing was copied" : "Nothing was moved", target.refused);
         return;
@@ -224,6 +255,9 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
         copy = ev.type === "keydown";
         update();
       }
+      // Nothing else reacts to keys mid-drag: no Delete, Backspace, F2, Ctrl+X/C/V or other shortcut.
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
     };
 
     window.addEventListener("pointermove", onMove);
@@ -245,9 +279,11 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
   return { onPointerDown, onClickCapture };
 }
 
+const pick = (s: ReturnType<typeof useApp.getState>) => ({ bucket: s.bucket, prefix: s.prefix, selection: s.selection });
+
 /** A drop: the same request as paste, then the confirmation setting decides whether to ask. */
 function drop(src: Source, bucket: string, prefix: string, copy: boolean) {
-  const built = buildTransferRequest({ mode: copy ? "copy" : "cut", bucket: src.bucket, prefix: src.prefix, items: src.items }, { bucket, prefix });
+  const built = buildTransferRequest({ mode: copy ? "copy" : "cut", bucket: src.bucket, prefix: src.prefix, items: [...src.items] }, { bucket, prefix });
   if (!built.ok) {
     if (built.info) toast.info(built.title, built.detail);
     else toast.error(built.title, built.detail);
