@@ -5,11 +5,14 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-title",
+    "core:webview:allow-set-webview-zoom",
     "opener:allow-reveal-item-in-dir",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://github.com/yonatand/S3Explorer/*" }]
     },
-    "dialog:default"
+    "dialog:default",
+    "notification:default"
   ]
 }

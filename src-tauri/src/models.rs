@@ -143,6 +143,23 @@ pub struct ListPage {
     pub is_truncated: bool,
 }
 
+/// `list_recent` stops scanning after this many objects and reports `truncated: true`.
+pub const RECENT_SCAN_LIMIT: u64 = 20_000;
+/// `list_recent` returns at most this many objects.
+pub const RECENT_MAX_RESULTS: usize = 200;
+
+/// The most recently modified objects under a prefix (`RecentListing` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentListing {
+    /// Newest first, at most [`RECENT_MAX_RESULTS`].
+    pub objects: Vec<ObjectEntry>,
+    /// Objects looked at.
+    pub scanned: u64,
+    /// The scan stopped at [`RECENT_SCAN_LIMIT`] before the end of the listing.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectMeta {
@@ -233,6 +250,29 @@ impl ThemeMode {
     }
 }
 
+/// The interface's accent colour (`AccentColor` in `types.ts`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AccentColor {
+    #[default]
+    Yellow,
+    Green,
+    Blue,
+    Red,
+}
+
+impl AccentColor {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "yellow" => Some(Self::Yellow),
+            "green" => Some(Self::Green),
+            "blue" => Some(Self::Blue),
+            "red" => Some(Self::Red),
+            _ => None,
+        }
+    }
+}
+
 /// User settings (flat object, `AppSettings` in `types.ts`). `part_size_mib: None` means Auto.
 ///
 /// Parsing goes through [`AppSettings::from_json_lenient`] (the on-disk file) or
@@ -251,7 +291,24 @@ pub struct AppSettings {
     pub theme: ThemeMode,
     #[serde(default)]
     pub check_updates_on_startup: bool,
+    #[serde(default = "default_notify_on_finish")]
+    pub notify_on_finish: bool,
+    /// Interface scale in percent.
+    #[serde(default = "default_text_size")]
+    pub text_size: u32,
+    /// Font weight of ordinary text.
+    #[serde(default = "default_text_weight")]
+    pub text_weight: u32,
+    #[serde(default)]
+    pub accent: AccentColor,
 }
+
+pub const TEXT_SIZE_MIN: u32 = 80;
+pub const TEXT_SIZE_MAX: u32 = 150;
+pub const DEFAULT_TEXT_SIZE: u32 = 100;
+pub const TEXT_WEIGHT_MIN: u32 = 300;
+pub const TEXT_WEIGHT_MAX: u32 = 600;
+pub const DEFAULT_TEXT_WEIGHT: u32 = 400;
 
 /// v0.2.0 name of the settings type; the transfer code only reads the transfer fields.
 pub type TransferSettings = AppSettings;
@@ -264,6 +321,18 @@ fn default_max_concurrent_transfers() -> u32 {
     DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
+fn default_notify_on_finish() -> bool {
+    true
+}
+
+fn default_text_size() -> u32 {
+    DEFAULT_TEXT_SIZE
+}
+
+fn default_text_weight() -> u32 {
+    DEFAULT_TEXT_WEIGHT
+}
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -272,6 +341,10 @@ impl Default for AppSettings {
             max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
             theme: ThemeMode::System,
             check_updates_on_startup: false,
+            notify_on_finish: default_notify_on_finish(),
+            text_size: DEFAULT_TEXT_SIZE,
+            text_weight: DEFAULT_TEXT_WEIGHT,
+            accent: AccentColor::Yellow,
         }
     }
 }
@@ -302,6 +375,24 @@ fn check_updates_error() -> crate::error::AppError {
     crate::error::AppError::invalid("checkUpdatesOnStartup must be true or false")
 }
 
+fn notify_error() -> crate::error::AppError {
+    crate::error::AppError::invalid("notifyOnFinish must be true or false")
+}
+
+fn text_size_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(format!("textSize must be an integer from {TEXT_SIZE_MIN} to {TEXT_SIZE_MAX}"))
+}
+
+fn text_weight_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "textWeight must be an integer from {TEXT_WEIGHT_MIN} to {TEXT_WEIGHT_MAX}"
+    ))
+}
+
+fn accent_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(r#"accent must be "yellow", "green", "blue" or "red""#)
+}
+
 fn part_size_ok(v: Option<u32>) -> bool {
     v.is_none_or(|v| (PART_SIZE_MIB_MIN..=PART_SIZE_MIB_MAX).contains(&v))
 }
@@ -314,6 +405,14 @@ fn transfers_ok(v: u32) -> bool {
     (MAX_CONCURRENT_TRANSFERS_MIN..=MAX_CONCURRENT_TRANSFERS_MAX).contains(&v)
 }
 
+fn text_size_ok(v: u32) -> bool {
+    (TEXT_SIZE_MIN..=TEXT_SIZE_MAX).contains(&v)
+}
+
+fn text_weight_ok(v: u32) -> bool {
+    (TEXT_WEIGHT_MIN..=TEXT_WEIGHT_MAX).contains(&v)
+}
+
 /// A JSON value as a `u32`, only if it is a non-negative integer that fits.
 fn json_u32(v: &serde_json::Value) -> Option<u32> {
     v.as_u64().and_then(|n| u32::try_from(n).ok())
@@ -321,7 +420,7 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 
 impl AppSettings {
     /// Rejects (`InvalidInput`, naming the field and its range) the first out-of-range field.
-    /// `theme` and `checkUpdatesOnStartup` are valid by construction.
+    /// `theme`, `checkUpdatesOnStartup` and `notifyOnFinish` are valid by construction.
     pub fn validate(&self) -> crate::error::AppResult<()> {
         if !part_size_ok(self.part_size_mib) {
             return Err(part_size_error());
@@ -331,6 +430,12 @@ impl AppSettings {
         }
         if !transfers_ok(self.max_concurrent_transfers) {
             return Err(transfers_error());
+        }
+        if !text_size_ok(self.text_size) {
+            return Err(text_size_error());
+        }
+        if !text_weight_ok(self.text_weight) {
+            return Err(text_weight_error());
         }
         Ok(())
     }
@@ -350,6 +455,8 @@ impl AppSettings {
             } else {
                 d.max_concurrent_transfers
             },
+            text_size: if text_size_ok(self.text_size) { self.text_size } else { d.text_size },
+            text_weight: if text_weight_ok(self.text_weight) { self.text_weight } else { d.text_weight },
             ..self
         }
     }
@@ -383,12 +490,29 @@ impl AppSettings {
                 .get("checkUpdatesOnStartup")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(d.check_updates_on_startup),
+            notify_on_finish: obj
+                .get("notifyOnFinish")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(d.notify_on_finish),
+            text_size: obj.get("textSize").and_then(json_u32).filter(|n| text_size_ok(*n)).unwrap_or(d.text_size),
+            text_weight: obj
+                .get("textWeight")
+                .and_then(json_u32)
+                .filter(|n| text_weight_ok(*n))
+                .unwrap_or(d.text_weight),
+            accent: obj
+                .get("accent")
+                .and_then(serde_json::Value::as_str)
+                .and_then(AccentColor::parse)
+                .unwrap_or(d.accent),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all five fields must be present. Transfer
-    /// fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the three
-    /// modes; `checkUpdatesOnStartup` a boolean. Anything else is `InvalidInput` naming the field.
+    /// Strict parse of the `update_settings` argument: all nine fields must be present. Transfer
+    /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
+    /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
+    /// `notifyOnFinish` booleans. Anything else is
+    /// `InvalidInput` naming the field.
     /// Unknown fields are ignored.
     pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
         let obj = v.as_object().ok_or_else(|| crate::error::AppError::invalid("settings must be an object"))?;
@@ -413,6 +537,17 @@ impl AppSettings {
                 .get("checkUpdatesOnStartup")
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(check_updates_error)?,
+            notify_on_finish: obj
+                .get("notifyOnFinish")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(notify_error)?,
+            text_size: int("textSize", text_size_error)?,
+            text_weight: int("textWeight", text_weight_error)?,
+            accent: obj
+                .get("accent")
+                .and_then(serde_json::Value::as_str)
+                .and_then(AccentColor::parse)
+                .ok_or_else(accent_error)?,
         };
         s.validate()?;
         Ok(s)

@@ -248,6 +248,84 @@ interface AppSettings {
   flash at startup the frontend mirrors the last saved theme in `localStorage` and applies it before
   first render; the backend value is the source of truth.
 
+### Desktop notifications (added after v0.3.0)
+
+`AppSettings` gains one field:
+
+```ts
+notifyOnFinish: boolean;   // default true
+```
+
+- `update_settings` requires all six fields and rejects a non-boolean `notifyOnFinish` with
+  `InvalidInput`. A `settings.json` without the field loads with it at its default.
+- With `notifyOnFinish` true the frontend shows an OS notification when a background job finishes
+  and when the last active transfer finishes, but only while the app window is not focused. In-app
+  toasts are unchanged.
+- Notifications go through the Tauri notification plugin (`notification:default` capability).
+  `src/lib/api.ts` asks for permission on first use and does nothing if it is denied. There is no
+  new command or event.
+
+### Text size and weight (added after v0.3.0)
+
+`AppSettings` gains two fields, both set with sliders in Settings under Appearance:
+
+```ts
+textSize: number;     // percent, integer 80 to 150, default 100
+textWeight: number;   // font weight of ordinary text, integer 300 to 600, default 400
+```
+
+- `update_settings` requires all eight fields and rejects a non-integer or out-of-range value with
+  `InvalidInput` naming the field. A `settings.json` without the fields, or with a bad value in
+  one of them, loads that field at its default.
+- **Size** scales the whole interface, not only the letters: the frontend sets the webview's zoom to
+  `textSize / 100` (capability `core:webview:allow-set-webview-zoom`), so layout, icons and
+  pointer coordinates stay consistent.
+- **Weight** is applied as the font weight of ordinary text. Headings and emphasised text keep
+  their own, heavier weights.
+- Like the theme, both preview live in the Settings dialog and revert if it is cancelled.
+
+### Accent colour (added after v0.3.0)
+
+`AppSettings` gains one field, chosen in Settings under Appearance:
+
+```ts
+type AccentColor = "yellow" | "green" | "blue" | "red";
+accent: AccentColor;   // default "yellow"
+```
+
+- `update_settings` requires all nine fields and rejects an unknown `accent` with `InvalidInput`.
+  A `settings.json` without the field, or with an unknown value, loads it as `"yellow"`.
+- The frontend applies it by setting `data-accent` on `<html>` (no attribute for yellow). Buttons,
+  selection, focus rings, the start screen's pulses and the logo inside the app follow it; the app
+  icon in the taskbar does not.
+- It previews live in the Settings dialog like the theme, and is mirrored in `localStorage` so the
+  right colour is there before the first render.
+
+### Newest files (added after v0.3.0)
+
+S3 lists keys in name order only, so "what was added last?" needs a scan.
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_recent` | `{ bucket, prefix }` | `RecentListing` — the most recently modified objects under `prefix` at any depth (no delimiter), newest first. |
+
+```ts
+interface RecentListing {
+  objects: ObjectEntry[];   // at most 200, newest first
+  scanned: number;          // objects looked at
+  truncated: boolean;       // true when the scan stopped at the limit before the end of the listing
+}
+```
+
+- The scan stops after 20,000 objects. `truncated: true` then means newer objects may exist beyond
+  what was scanned; the frontend must say so and never present a truncated result as complete.
+- Folder markers (keys ending in `/`) are skipped and not counted. Objects without a modification
+  time sort last. Paging follows the same rules as every other listing: a repeated continuation
+  token is an error, never a silent stop.
+- Read-only: it uses `ListObjectsV2`, the permission browsing already needs.
+- The frontend shows the newest files of the open bucket in the sidebar, below the bucket list,
+  and filters them there by age, file type and a search over the key.
+
 ### Saved connections
 
 Named connections the user can reuse. Metadata is stored in `connections.json` in the app config

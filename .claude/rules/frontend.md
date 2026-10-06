@@ -17,5 +17,8 @@ paths:
   OS drag-and-drop via `getCurrentWebview().onDragDropEvent`.
 - Keys: join with exactly one `/`, never double slashes; handle spaces and unicode.
 - Styling: CSS variables, dark theme default with light via `prefers-color-scheme`, dense 13px
-  table, system font stack. Icons from `lucide-react`. Must look polished, not default/Bootstrap.
+  table. Type is bundled (`@fontsource-variable`): Rubik for text, Gabarito for headings, with the
+  system font stack as fallback; never load fonts from the network. Text or icons in the accent
+  colour use `--accent-text`, because the marigold `--accent` is only readable as a fill. Icons
+  from `lucide-react`. Must look polished, not default/Bootstrap.
 - Never persist secrets in `localStorage` (profile name, region, endpoint, access key id only).

@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
-import { disconnect, useApp } from "../store/app";
+import { disconnect, readPref, useApp, writePref } from "../store/app";
 import { installTransferEffects, uploadPaths } from "../store/actions";
 import { installJobEffects } from "../store/ops";
 import { Sidebar } from "./Sidebar";
@@ -13,6 +13,7 @@ import { ContextMenu } from "./ContextMenu";
 import { Modals } from "./Modals";
 import { Logo } from "./Logo";
 import { SettingsButton } from "./SettingsDialog";
+import { ThemeToggle } from "./ThemeToggle";
 
 function ConnectionChip() {
   const conn = useApp((s) => s.connection);
@@ -40,25 +41,27 @@ function ConnectionChip() {
       </button>
       {open && (
         <div className="popover">
-          <div className="popover-row">
-            <span className="muted">Identity</span>
-            <span>{conn.label}</span>
+          <div className="popover-head">
+            <span className="popover-status">
+              <span className="status-dot" /> Connected
+            </span>
+            <span className="popover-name">{conn.label}</span>
           </div>
           <div className="popover-row">
             <span className="muted">
-              <MapPin size={12} /> Region
+              <MapPin size={13} /> Region
             </span>
-            <span className="mono">{conn.region}</span>
+            <span>{conn.region}</span>
           </div>
           <div className="popover-row">
             <span className="muted">
-              <Globe size={12} /> Endpoint
+              <Globe size={13} /> Endpoint
             </span>
-            <span className="mono">{conn.endpoint ?? "AWS default"}</span>
+            <span title={conn.endpoint ?? undefined}>{conn.endpoint ?? "AWS"}</span>
           </div>
-          {!conn.canListBuckets && <div className="popover-note">ListBuckets is denied for this identity.</div>}
+          {!conn.canListBuckets && <div className="popover-note">This connection is not allowed to list buckets.</div>}
           <button
-            className="menu-item danger"
+            className="btn btn-danger-ghost popover-action"
             onClick={() => {
               setOpen(false);
               void disconnect();
@@ -98,11 +101,55 @@ function useFileDrop() {
   return dragging;
 }
 
+const SIDEBAR_WIDTH_KEY = "s3x.sidebarWidth";
+const SIDEBAR_MIN = 200;
+const SIDEBAR_MAX = 640;
+
+/**
+ * The sidebar's width as set by dragging its border, or null while it follows the window size.
+ * During a drag the width is written straight to the element, so the file table does not re-render
+ * on every pointer move; the state and the saved preference are updated once, on release.
+ */
+function useSidebarResize() {
+  const workspace = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(() => readPref<number | null>(SIDEBAR_WIDTH_KEY, null));
+
+  const save = (next: number | null) => {
+    setWidth(next);
+    writePref(SIDEBAR_WIDTH_KEY, next);
+  };
+  const onPointerDown = (e: ReactPointerEvent) => {
+    const el = workspace.current;
+    if (!el || e.button !== 0) return;
+    e.preventDefault();
+    const left = el.getBoundingClientRect().left;
+    let latest = width;
+    const onMove = (move: PointerEvent) => {
+      latest = Math.round(Math.min(Math.max(move.clientX - left, SIDEBAR_MIN), SIDEBAR_MAX));
+      el.style.setProperty("--sidebar-w", `${latest}px`);
+    };
+    const onEnd = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      save(latest);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
+  };
+
+  const style = width === null ? undefined : ({ "--sidebar-w": `${width}px` } as CSSProperties);
+  return { workspace, style, onPointerDown, reset: () => save(null) };
+}
+
 export function Explorer() {
-  const detailsOpen = useApp((s) => s.detailsOpen);
   const bucket = useApp((s) => s.bucket);
+  // Details describe an item inside a bucket, so the panel stays closed until one is open.
+  const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
   const prefix = useApp((s) => s.prefix);
   const dragging = useFileDrop();
+  const sidebar = useSidebarResize();
 
   useEffect(() => installTransferEffects(), []);
   useEffect(() => installJobEffects(), []);
@@ -110,19 +157,29 @@ export function Explorer() {
   return (
     <div className="app">
       <header className="titlebar">
-        <div className="brand">
-          <Logo size={20} />
+        <button type="button" className="brand brand-link" onClick={() => void disconnect()} title="Back to connections">
+          <Logo size={26} />
           <span>S3 Explorer</span>
-        </div>
+        </button>
         <div className="spacer" />
         <ConnectionChip />
+        <ThemeToggle />
         <SettingsButton />
       </header>
-      <div className={`workspace ${detailsOpen ? "with-details" : ""}`}>
+      <div ref={sidebar.workspace} className={`workspace ${detailsOpen ? "with-details" : ""}`} style={sidebar.style}>
         <Sidebar />
+        <div
+          className="sidebar-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the sidebar"
+          title="Drag to resize. Double-click to reset."
+          onPointerDown={sidebar.onPointerDown}
+          onDoubleClick={sidebar.reset}
+        />
         <main className="browser">
-          <Toolbar />
-          <Breadcrumbs />
+          {bucket && <Toolbar />}
+          {bucket && <Breadcrumbs />}
           <div className="table-wrap">
             <ObjectTable />
             {dragging && (

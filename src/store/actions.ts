@@ -5,7 +5,8 @@ import type { AppError, ObjectEntry } from "../lib/types";
 import { basename, joinKey, sanitizeFileName, uniqueFileName } from "../lib/format";
 import { refresh, setTransfersOpen, useApp, upsertListedFolder, upsertListedObject } from "./app";
 import { toast } from "./toasts";
-import { scheduleTransferResync, onTransferFinished } from "./transfers";
+import { notifyInBackground } from "./notify";
+import { scheduleTransferResync, onTransferFinished, selectActiveCount, useTransfers } from "./transfers";
 
 export async function uploadPaths(paths: string[]) {
   const { bucket, prefix } = useApp.getState();
@@ -108,6 +109,10 @@ export async function copyText(text: string, what: string) {
 /** Keep the listing in sync with finished uploads and surface failures. */
 export function installTransferEffects(): () => void {
   return onTransferFinished((t) => {
+    // One notification when the queue drains, not one per file.
+    if (t.status !== "cancelled" && selectActiveCount(useTransfers.getState()) === 0) {
+      notifyInBackground(t.status === "failed" ? "Transfer failed" : "Transfers finished", basename(t.key));
+    }
     if (t.status === "failed") {
       toast.error(`${t.kind === "upload" ? "Upload" : "Download"} failed: ${basename(t.key)}`, t.error ?? undefined);
       return;
