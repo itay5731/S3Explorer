@@ -277,14 +277,17 @@ export type RuleStatus = "Enabled" | "Disabled";
 export type TransitionStorageClass =
   | "STANDARD_IA" | "ONEZONE_IA" | "INTELLIGENT_TIERING" | "GLACIER_IR" | "GLACIER" | "DEEP_ARCHIVE";
 
-/** Coldness order for transition validation: a later class is colder. Same-rank classes may not follow each other. */
+/**
+ * S3's transition waterfall: within a rule, each later transition must go to a class with a strictly
+ * higher rank (STANDARD_IA → INTELLIGENT_TIERING → ONEZONE_IA → GLACIER_IR → GLACIER → DEEP_ARCHIVE).
+ */
 export const STORAGE_CLASS_RANK: Record<TransitionStorageClass, number> = {
   STANDARD_IA: 1,
-  ONEZONE_IA: 1,
-  INTELLIGENT_TIERING: 1,
-  GLACIER_IR: 2,
-  GLACIER: 3,
-  DEEP_ARCHIVE: 4,
+  INTELLIGENT_TIERING: 2,
+  ONEZONE_IA: 3,
+  GLACIER_IR: 4,
+  GLACIER: 5,
+  DEEP_ARCHIVE: 6,
 };
 
 export interface LifecycleFilter {

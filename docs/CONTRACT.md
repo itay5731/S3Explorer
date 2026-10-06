@@ -746,8 +746,9 @@ unique; every rule has at least one action; per action exactly one of `days` / `
 `date` an ISO-8601 date at midnight UTC); **a transition may use `days` = 0** (AWS allows moving objects
 to INTELLIGENT_TIERING, GLACIER_IR, GLACIER or DEEP_ARCHIVE on day 0) while expiration `days` ≥ 1; a rule
 uses days for all of its transitions and its expiration, or dates for all of them, never a mix;
-transitions within a rule have distinct storage classes and move only "colder" (STANDARD_IA / ONEZONE_IA
-/ INTELLIGENT_TIERING → GLACIER_IR → GLACIER → DEEP_ARCHIVE, never back); **only STANDARD_IA and ONEZONE_IA**
+transitions within a rule follow S3's waterfall strictly (STANDARD_IA → INTELLIGENT_TIERING → ONEZONE_IA →
+GLACIER_IR → GLACIER → DEEP_ARCHIVE; each later transition goes to a strictly later class, so STANDARD_IA →
+ONEZONE_IA is allowed and nothing moves back); **only STANDARD_IA and ONEZONE_IA**
 need `days` ≥ 30 (INTELLIGENT_TIERING and the archive classes have no minimum); a later transition to
 GLACIER_IR / GLACIER / DEEP_ARCHIVE after a STANDARD_IA or ONEZONE_IA transition must be at least 30 days
 after it (no such gap is required after INTELLIGENT_TIERING); expiration must come after every transition (days greater, or date later); `expiredObjectDeleteMarker`
@@ -788,7 +789,29 @@ tells the user someone else changed it.
   restores the previous configuration and returns `NotSupported` naming what was dropped (the UI must reload).
   A configuration containing a storage class, status or shape this version does not understand is refused
   (`Unknown`, message says so) and can neither be shown nor written, so nothing is ever dropped.
-- Dates are returned as `YYYY-MM-DDT00:00:00Z`; `YYYY-MM-DD` is accepted as input.
+- Dates are returned as `YYYY-MM-DDT00:00:00Z`; `YYYY-MM-DD` is accepted as input. A date that is today or in
+  the past is valid for S3 and means "every matching object, and every new one, is deleted (or moved) at the
+  next daily run": `validate_lifecycle` reports it as a warning-style issue (`field` set, message says so) that
+  does not block saving, and the UI summary and confirmation use that wording.
+- **Eventual consistency.** Bucket configuration propagates with a lag, so a read-back right after a write may
+  still show the configuration from before the write. `put_lifecycle` treats a read-back equal to the
+  pre-write configuration as lag (polls with backoff for up to ~20 s) and never "restores" in that case. It
+  restores the previous configuration only when two consecutive reads show something that is neither the
+  requested nor the pre-write configuration. If the write errored but the read-back shows the requested
+  configuration, the save is reported as successful.
+- **A failed read-back after a successful write is not a failed save.** `put_lifecycle`, `put_bucket_tags` and
+  `put_object_tags` then return an error whose message starts with "Saved, but reading back failed"; the UI
+  must reload and must not say "nothing was changed".
+- **AWS system tags** (keys starting with `aws:`) can exist on buckets created by CloudFormation and others.
+  `get_*_tags` returns them; the UI shows them read-only; `put_*_tags` accepts an `aws:` key only when the same
+  key and value are present in `expected` (pass-through), never writes a changed one, and never issues
+  `DeleteBucketTagging` / `DeleteObjectTagging` while `expected` contains an `aws:` tag (it writes the set with
+  only the system tags instead).
+- Allowed tag characters follow AWS: any Unicode letter, number or space separator (p{L} p{N} p{Z}) plus
+  `+ - = . _ : / @`.
+- HTTP 405 on an object-level tagging call means the current version is a delete marker; it is a per-object
+  "the object was deleted" failure, not `NotSupported`. `NotSupported` is reserved for the server answering
+  NotImplemented or 501.
 - The frontend sends `expected` = the configuration it loaded (or the server snapshot re-read after a
   `Conflict`), order-sensitive.
 
