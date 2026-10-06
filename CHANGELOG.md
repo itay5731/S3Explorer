@@ -5,9 +5,16 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+The buckets update. Manage buckets, not only the files in them: shared buckets from other accounts, tags on buckets and objects, a full editor for lifecycle rules, drag and drop, and a new look.
+
 ### New
 
-- **A new look.** A marigold accent on neutral surfaces in both themes, new typefaces, and a new icon with a white bucket on a yellow tile.
+- **Shared buckets.** A bucket shared with you from another account does not appear in your bucket list. Add it by name, `s3://` address or ARN under "Shared with me" in the sidebar, and use it like any other bucket. Removing it from the list only forgets it here.
+- **Tags.** See an object's tags in the details panel and edit them. Edit tags on many objects or a whole folder at once, adding, changing and removing specific tags, or replacing them all. Bucket tags are in the bucket menu. Tags set by AWS itself are shown but can't be changed here.
+- **Lifecycle rules.** Edit a bucket's lifecycle configuration with the full set of S3 rules: filters by prefix, tags and object size; moves to colder storage; expiration; noncurrent-version actions; cleanup of incomplete uploads. Each rule is summarised in plain language, every rule that deletes data is marked, and before saving you see exactly what is added, removed and changed. If someone else changed the rules while you were editing, nothing is overwritten.
+- **Drag and drop.** Drag files and folders onto a folder, onto the path bar or onto a bucket to move them. Hold Ctrl (Option on macOS) to copy instead; the badge following the pointer tells you which.
+- **A setting to skip the copy and move confirmation** when nothing is in the way, in Settings under Behavior. You are still asked whenever something would be overwritten, and deleting always asks.
+- **A new look.** A marigold accent on neutral surfaces in both themes, new typefaces, and a new icon with a white bucket on a yellow tile. A marigold accent on neutral surfaces in both themes, new typefaces, and a new icon with a white bucket on a yellow tile.
 - **A start screen for your connections.** Saved connections are tiles: drag them into the order you want, right-click one for Connect, Edit and Delete, and scroll a page of six at a time when you have more. Behind them, pulses travel from small servers into your connections.
 - **Newest files.** The lower part of the sidebar lists the files most recently changed in the open bucket, wherever they are, with the folder each one is in. Narrow the list to the last hour, 24 hours or 7 days, to chosen file types, or by searching. Click a file to open its folder, or download it directly. It looks again by itself after an upload. The scan looks at up to 20,000 files and says so when it stops there.
 - **Desktop notifications** when your transfers are done, or a copy, move or delete finishes, while the app is in the background. Turn them off in Settings under Notifications.
@@ -25,6 +32,21 @@ The section for a version becomes the text of its GitHub Release.
 - **The logo in the top bar** takes you back to your connections.
 - **Copy the current path** with the button at the end of the path bar.
 - On a large window the side panels are wider.
+- Queued transfers and operations now start strictly in the order you requested them, whatever the machine is busy with.
+
+### Fixed
+
+- **The taskbar and Start menu showed the old Tauri icon** on Windows even though the window showed the app's icon. The app now sets its large icon itself, and the installer tells Windows the program changed. A pinned icon from an older version may need to be re-pinned once.
+- Progress updates could arrive twice in a few milliseconds after a busy moment.
+
+### Good to know
+
+- **Lifecycle rules act on their own.** Once saved, S3 applies them at its next daily run without asking again, and objects deleted by a rule can't be recovered unless versioning keeps older versions. The editor shows every deleting rule in red for that reason.
+- A lifecycle rule with a date in the past is not a historical no-op: every matching object, and every new one, is deleted or moved at the next daily run. The editor says so.
+- Bucket settings take a moment to propagate on AWS. If a save reads back the old configuration, the app waits and checks again rather than overwriting anything.
+- Lifecycle rules and bucket tags on a bucket shared from another account are usually not permitted; the app says so instead of failing.
+- Other S3-compatible services support tags and lifecycle rules to varying degrees. When a server refuses a feature, the app tells you and changes nothing.
+- Tested end to end against a local S3 server. The author uses the app against real AWS; the new bucket features have not yet been tried there.
 
 ## [0.3.0] - 2026-10-05
 
