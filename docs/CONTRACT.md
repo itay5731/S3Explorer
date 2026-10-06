@@ -742,12 +742,15 @@ interface LifecycleIssue { ruleIndex: number | null; field: string | null; messa
 | `get_bucket_versioning` | `{ bucket }` | `"Enabled" \| "Suspended" \| "Off"` — shown in the editor because noncurrent-version actions only matter with versioning. |
 
 **Validation rules (`validate_lifecycle`, every one unit-tested):** 1..=1,000 rules; ids 1..=255,
-unique; every rule has at least one action; per action exactly one of `days` / `date` (`days` ≥ 1,
-integer; `date` an ISO-8601 date at midnight UTC); transitions within a rule have distinct storage
-classes and move only "colder" (STANDARD_IA / ONEZONE_IA / INTELLIGENT_TIERING → GLACIER_IR → GLACIER →
-DEEP_ARCHIVE, never back); a transition to STANDARD_IA, ONEZONE_IA or INTELLIGENT_TIERING needs
-`days` ≥ 30; a transition to GLACIER_IR/GLACIER/DEEP_ARCHIVE after one of those must be at least 30 days
-later; expiration must come after every transition (days greater, or date later); `expiredObjectDeleteMarker`
+unique; every rule has at least one action; per action exactly one of `days` / `date` (integer days;
+`date` an ISO-8601 date at midnight UTC); **a transition may use `days` = 0** (AWS allows moving objects
+to INTELLIGENT_TIERING, GLACIER_IR, GLACIER or DEEP_ARCHIVE on day 0) while expiration `days` ≥ 1; a rule
+uses days for all of its transitions and its expiration, or dates for all of them, never a mix;
+transitions within a rule have distinct storage classes and move only "colder" (STANDARD_IA / ONEZONE_IA
+/ INTELLIGENT_TIERING → GLACIER_IR → GLACIER → DEEP_ARCHIVE, never back); **only STANDARD_IA and ONEZONE_IA**
+need `days` ≥ 30 (INTELLIGENT_TIERING and the archive classes have no minimum); a later transition to
+GLACIER_IR / GLACIER / DEEP_ARCHIVE after a STANDARD_IA or ONEZONE_IA transition must be at least 30 days
+after it (no such gap is required after INTELLIGENT_TIERING); expiration must come after every transition (days greater, or date later); `expiredObjectDeleteMarker`
 cannot be combined with `days`/`date` in the same expiration, and (like `abortIncompleteMultipartUpload`)
 cannot be used in a rule whose filter has tags or object-size conditions; `objectSizeGreaterThan` <
 `objectSizeLessThan` when both set; filter tags follow the tag limits; a rule with no filter conditions is

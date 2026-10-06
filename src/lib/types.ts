@@ -317,9 +317,9 @@ export interface LifecycleIssue { ruleIndex: number | null; field: string | null
 export const LIFECYCLE_LIMITS = {
   maxRules: 1000,
   ruleIdMaxChars: 255,
-  /** Minimum days before a transition to STANDARD_IA / ONEZONE_IA / INTELLIGENT_TIERING. */
+  /** Minimum days before a transition to STANDARD_IA or ONEZONE_IA only (INTELLIGENT_TIERING and the archive classes may use day 0). */
   minDaysToInfrequentAccess: 30,
-  /** Minimum gap in days between an infrequent-access transition and a later archive transition. */
+  /** Minimum gap in days between a STANDARD_IA / ONEZONE_IA transition and a later archive transition. */
   minDaysBetweenTiers: 30,
   newerNoncurrentVersions: { min: 1, max: 100 },
 } as const;
