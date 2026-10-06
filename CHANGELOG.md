@@ -5,6 +5,31 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+Whole folders, and your files' history. This version moves folders in and out in one go, shows and restores object versions, brings archived objects back, and lets you stop running work when you disconnect.
+
+### New
+
+- **Upload a folder.** Pick a folder, or drop one from your desktop. You see how many files and how much data it is, where it will go (editable), and what already exists there, with the usual Skip or Overwrite choice. Sub-folders become prefixes; shortcuts and junctions are skipped and listed.
+- **Download a folder**, or several, into a directory you choose. The folder structure is recreated and file names are made safe for your disk. Existing files are skipped unless you choose Overwrite. Two keys that would land on the same file name fail the second one instead of overwriting.
+- **One Activity row per folder transfer**, with overall progress, the files currently moving, and every file that failed. Cancel stops the rest; finished files stay. Folder transfers always confirm, whatever the copy/move setting says.
+- **Versions.** On a bucket with versioning, the details panel shows every version of the selected object: date, size, which one is current, and delete markers. Download a version, restore a version as the current one (the current one becomes a previous version; nothing is deleted), remove a delete marker to bring an object back, or permanently delete a version behind a confirmation that says it cannot be undone.
+- **Restore archived objects.** Objects in Glacier or Deep Archive show their restore state. Restore one with a retrieval tier and a number of days, or many at once as a background job. Download, copy and move are disabled on an archived object until it is restored, and say why.
+- **Disconnect while work is running** now asks: cancel it and disconnect, let it finish in the background, or stay connected.
+
+### Improved
+
+- Desktop notifications decide by the window's real focus, so a notification is not suppressed just because the page thought it was focused.
+- Deleting a saved connection also forgets the buckets you had added to it.
+- Queued files in a large folder transfer start in order without the queue slowing down as it grows.
+
+### Good to know
+
+- Folder transfers are limited to 50,000 files and 1 TiB each; split larger folders by sub-folder.
+- Permanently deleting a version is the one action in the app that cannot be undone by anything. The confirmation says so and names the version.
+- Restoring from Glacier or Deep Archive is billed by AWS and takes from minutes (Expedited) to up to two days (Bulk from Deep Archive). Expedited is not available for Deep Archive.
+- Restoring a version copies that version onto the key, so it keeps that version's metadata, content type, storage class and tags.
+- Versions, archive restore and folder transfers were tested end to end against a local S3 server that supports versioning but not restores, so the restore itself is verified only up to the request.
+
 ## [0.4.1] - 2026-10-06
 
 ### Changed
