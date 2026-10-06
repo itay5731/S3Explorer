@@ -19,7 +19,7 @@ pub async fn install_update(
     let restart_handle = app.clone();
     updates::install(
         &updater,
-        || (state.transfers.has_active(), state.jobs.has_active()),
+        || (state.transfers.has_active() || state.batches.has_active(), state.jobs.has_active()),
         |p| {
             let _ = app.emit(UPDATE_PROGRESS_EVENT, p);
         },

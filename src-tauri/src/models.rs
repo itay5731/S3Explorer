@@ -202,6 +202,8 @@ impl TransferStatus {
 pub struct Transfer {
     pub id: String,
     pub kind: TransferKind,
+    /// The folder transfer (batch) this file belongs to; `null` for a single transfer.
+    pub batch_id: Option<String>,
     pub bucket: String,
     pub key: String,
     pub local_path: String,
@@ -901,6 +903,96 @@ pub struct Job {
     pub finished_at: Option<String>,
 }
 
+// ---- v0.5.0: folder transfers (batches) ----
+
+pub const BATCH_PROGRESS_EVENT: &str = "batch:progress";
+/// Most files in one batch (mirror `BATCH_LIMITS.maxFiles` in `types.ts`).
+pub const BATCH_MAX_FILES: u64 = 50_000;
+/// Most bytes in one batch: 1 TiB (mirror `BATCH_LIMITS.maxBytes`).
+pub const BATCH_MAX_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+/// `Batch.errors` and `BatchPreview.notes` keep the first this many entries.
+pub const BATCH_MAX_ERRORS: usize = 50;
+pub const BATCH_MAX_NOTES: usize = 50;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BatchKind {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BatchStatus {
+    Planning,
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl BatchStatus {
+    pub fn is_active(self) -> bool {
+        matches!(self, BatchStatus::Planning | BatchStatus::Queued | BatchStatus::Running)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchPlanRequest {
+    pub kind: BatchKind,
+    pub bucket: String,
+    /// Upload: destination prefix ("" or ending in "/"). Download: source prefix (ending in "/").
+    pub prefix: String,
+    /// Upload: the folder to walk. Download: the directory to write into.
+    pub local_path: String,
+    #[serde(default)]
+    pub on_conflict: ConflictPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchPreview {
+    pub files: u64,
+    pub bytes: u64,
+    pub conflicts: u64,
+    pub skipped_unreadable: u64,
+    pub truncated: bool,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchError {
+    /// The key (download) or the local path (upload).
+    pub path: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Batch {
+    pub id: String,
+    pub kind: BatchKind,
+    pub bucket: String,
+    pub prefix: String,
+    pub local_path: String,
+    pub label: String,
+    pub total_files: u64,
+    pub done_files: u64,
+    pub skipped_files: u64,
+    pub failed_files: u64,
+    pub total_bytes: u64,
+    pub done_bytes: u64,
+    pub bytes_per_sec: u64,
+    pub status: BatchStatus,
+    pub error: Option<String>,
+    pub errors: Vec<BatchError>,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
 /// Current time as ISO-8601 UTC with millisecond precision.
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -944,6 +1036,7 @@ mod tests {
         let t = Transfer {
             id: "x".into(),
             kind: TransferKind::Download,
+            batch_id: None,
             bucket: "b".into(),
             key: "k".into(),
             local_path: "p".into(),
@@ -962,6 +1055,7 @@ mod tests {
         assert_eq!(v["status"], "queued");
         assert!(v.get("localPath").is_some());
         assert!(v.get("bytesPerSec").is_some());
+        assert_eq!(v["batchId"], serde_json::Value::Null, "batchId is always present");
         let e = serde_json::to_value(crate::error::AppError::not_connected()).expect("ser");
         assert_eq!(e["code"], "NotConnected");
     }
@@ -1023,6 +1117,55 @@ mod tests {
         }
         assert_eq!(serde_json::to_value(JobKind::Delete).expect("ser"), "delete");
         assert_eq!(serde_json::to_value(ConflictPolicy::Skip).expect("ser"), "skip");
+    }
+
+    #[test]
+    fn batch_json() {
+        let r: BatchPlanRequest = serde_json::from_str(
+            r#"{"kind":"download","bucket":"b","prefix":"logs/","localPath":"D:\\dl","onConflict":"overwrite"}"#,
+        )
+        .expect("parse");
+        assert_eq!(r.kind, BatchKind::Download);
+        assert_eq!(r.local_path, "D:\\dl");
+        assert_eq!(r.on_conflict, ConflictPolicy::Overwrite);
+        let p = serde_json::to_value(BatchPreview { files: 1, bytes: 2, conflicts: 3, skipped_unreadable: 4, truncated: true, notes: vec!["n".into()] })
+            .expect("ser");
+        assert_eq!(p, serde_json::json!({"files":1,"bytes":2,"conflicts":3,"skippedUnreadable":4,"truncated":true,"notes":["n"]}));
+        let b = Batch {
+            id: "i".into(),
+            kind: BatchKind::Upload,
+            bucket: "b".into(),
+            prefix: "p/".into(),
+            local_path: "/x".into(),
+            label: "l".into(),
+            total_files: 0,
+            done_files: 0,
+            skipped_files: 0,
+            failed_files: 0,
+            total_bytes: 0,
+            done_bytes: 0,
+            bytes_per_sec: 0,
+            status: BatchStatus::Planning,
+            error: None,
+            errors: vec![BatchError { path: "k".into(), message: "m".into() }],
+            started_at: now_iso(),
+            finished_at: None,
+        };
+        let v = serde_json::to_value(&b).expect("ser");
+        for f in [
+            "id", "kind", "bucket", "prefix", "localPath", "label", "totalFiles", "doneFiles", "skippedFiles", "failedFiles",
+            "totalBytes", "doneBytes", "bytesPerSec", "status", "error", "errors", "startedAt", "finishedAt",
+        ] {
+            assert!(v.get(f).is_some(), "missing {f}");
+        }
+        assert_eq!(v.as_object().map(|o| o.len()), Some(18));
+        assert_eq!(v["kind"], "upload");
+        assert_eq!(v["status"], "planning");
+        assert_eq!(v["errors"][0], serde_json::json!({"path":"k","message":"m"}));
+        for (k, s) in [(BatchStatus::Queued, "queued"), (BatchStatus::Running, "running"), (BatchStatus::Completed, "completed"), (BatchStatus::Failed, "failed"), (BatchStatus::Cancelled, "cancelled")] {
+            assert_eq!(serde_json::to_value(k).expect("ser"), s);
+        }
+        assert_eq!(BATCH_MAX_BYTES, 1u64 << 40);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Application state: the active S3 connection, the transfer manager and the job manager.
+//! Application state: the active S3 connection and the transfer, batch and job managers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,6 +12,7 @@ use dashmap::DashMap;
 use tokio::sync::RwLock;
 
 use crate::error::{is_access_denied, raw_status_and_region, AppError, AppResult};
+use crate::batches::{BatchManager, BatchSink};
 use crate::jobs::{JobManager, JobSink};
 use crate::models::{AppSettings, ConnectionConfig, ConnectionInfo};
 use crate::settings::SettingsStore;
@@ -210,14 +211,21 @@ pub struct AppState {
     connection: RwLock<Option<Arc<Connection>>>,
     pub transfers: Arc<TransferManager>,
     pub jobs: Arc<JobManager>,
+    pub batches: Arc<BatchManager>,
     pub settings: SettingsStore,
 }
 
 impl AppState {
     /// The transfer manager starts with the store's (loaded) settings.
-    pub fn new(sink: Arc<dyn ProgressSink>, job_sink: Arc<dyn JobSink>, settings: SettingsStore) -> Self {
+    pub fn new(
+        sink: Arc<dyn ProgressSink>,
+        job_sink: Arc<dyn JobSink>,
+        batch_sink: Arc<dyn BatchSink>,
+        settings: SettingsStore,
+    ) -> Self {
         let transfers = TransferManager::with_settings(sink, settings.get());
-        Self { connection: RwLock::new(None), transfers, jobs: JobManager::new(job_sink), settings }
+        let batches = BatchManager::new(transfers.clone(), batch_sink);
+        Self { connection: RwLock::new(None), transfers, jobs: JobManager::new(job_sink), batches, settings }
     }
 
     pub fn get_settings(&self) -> AppSettings {

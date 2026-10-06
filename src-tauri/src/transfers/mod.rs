@@ -5,7 +5,7 @@ pub(crate) mod gate;
 pub mod plan;
 mod upload;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -30,6 +30,24 @@ const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// Receives `Transfer` snapshots (the Tauri app emits them as `transfer:progress`).
 pub trait ProgressSink: Send + Sync + 'static {
     fn emit(&self, transfer: &Transfer);
+}
+
+/// Told when a transfer that belongs to a batch starts running and when it reaches its final
+/// state (called after its final `transfer:progress` event, before its run slot is released).
+/// Never called while the transfer's own record is locked.
+pub trait TransferObserver: Send + Sync + 'static {
+    fn running(&self, transfer_id: &str);
+    fn finished(&self, transfer: &Transfer);
+}
+
+/// Ties a transfer to its batch: the id it carries (`batchId`), the batch's cancel token (the
+/// transfer's own token is a child of it, so cancelling the batch cancels every file, even one
+/// started after the cancel) and the observer that aggregates it.
+#[derive(Clone)]
+pub struct BatchLink {
+    pub batch_id: String,
+    pub cancel: CancellationToken,
+    pub observer: Arc<dyn TransferObserver>,
 }
 
 /// A sink that drops every event.
@@ -61,6 +79,7 @@ pub struct TransferEntry {
     discarded_bytes: AtomicU64,
     /// Times a download's temp file was flushed to disk (`sync_all`) before the rename.
     file_syncs: AtomicU32,
+    observer: Option<Arc<dyn TransferObserver>>,
 }
 
 /// Internal counters of one transfer, for tests and benchmarks (not part of the bridge contract).
@@ -139,7 +158,9 @@ impl TransferEntry {
 }
 
 enum Job {
-    Download { dest: PathBuf },
+    /// `no_replace`: fail instead of replacing a file that already exists at `dest` (batch
+    /// downloads under `onConflict: skip`); the single-file command replaces it.
+    Download { dest: PathBuf, no_replace: bool },
     Upload { src: PathBuf },
 }
 
@@ -174,8 +195,10 @@ pub struct TransferManager {
     settings: Mutex<TransferSettings>,
     sink: Arc<dyn ProgressSink>,
     seq: AtomicU64,
-    /// Serializes the "is this destination already being downloaded?" check with the insert.
-    start_lock: Mutex<()>,
+    /// Destinations (see [`dest_key`]) of queued/running downloads. The lock also serializes the
+    /// "is this destination already being downloaded?" check with the insert. An index rather
+    /// than a scan of `entries`: a folder download starts up to 50,000 transfers in a row.
+    active_dests: Mutex<HashSet<String>>,
     tuning: TransferTuning,
 }
 
@@ -221,7 +244,7 @@ impl TransferManager {
             settings: Mutex::new(settings),
             sink,
             seq: AtomicU64::new(0),
-            start_lock: Mutex::new(()),
+            active_dests: Mutex::new(HashSet::new()),
             tuning,
         })
     }
@@ -263,28 +286,58 @@ impl TransferManager {
     /// Rejects (`InvalidInput`) a relative destination, one containing `..`, and one that an
     /// active (queued/running) download already targets.
     pub fn start_download(self: &Arc<Self>, client: Client, bucket: &str, key: &str, dest: PathBuf) -> AppResult<String> {
+        self.queue_download(client, bucket, key, dest, false, None)
+    }
+
+    /// Queues one file of a folder download. With `no_replace` the transfer fails (and leaves
+    /// the file untouched) when something already exists at `dest`, checked before the first
+    /// request and again atomically at the final rename. Otherwise as [`Self::start_download`].
+    pub fn start_batch_download(
+        self: &Arc<Self>,
+        client: Client,
+        bucket: &str,
+        key: &str,
+        dest: PathBuf,
+        no_replace: bool,
+        link: BatchLink,
+    ) -> AppResult<String> {
+        self.queue_download(client, bucket, key, dest, no_replace, Some(link))
+    }
+
+    fn queue_download(
+        self: &Arc<Self>,
+        client: Client,
+        bucket: &str,
+        key: &str,
+        dest: PathBuf,
+        no_replace: bool,
+        link: Option<BatchLink>,
+    ) -> AppResult<String> {
         validate_download_dest(&dest)?;
         let local = dest.to_string_lossy().into_owned();
-        let _guard = self.start_lock.lock().unwrap_or_else(|p| p.into_inner());
-        let wanted = dest_key(&local);
-        let busy = self.entries.iter().any(|e| {
-            let r = e.lock();
-            r.kind == TransferKind::Download && r.status.is_active() && dest_key(&r.local_path) == wanted
-        });
-        if busy {
+        let mut active = self.active_dests.lock().unwrap_or_else(|p| p.into_inner());
+        if !active.insert(dest_key(&local)) {
             return Err(AppError::invalid(format!(
                 "Another download is already writing to {local}. Wait for it to finish or cancel it first."
             )));
         }
-        Ok(self.start(client, TransferKind::Download, bucket, key, local, Job::Download { dest }))
+        // Still under the lock: the entry exists before another start can check this destination.
+        Ok(self.start(client, TransferKind::Download, bucket, key, local, Job::Download { dest, no_replace }, link))
     }
 
     /// Queues an upload of `src` to `bucket/key`. Must be called within a Tokio runtime.
     pub fn start_upload(self: &Arc<Self>, client: Client, bucket: &str, key: &str, src: PathBuf) -> String {
         let local = src.to_string_lossy().into_owned();
-        self.start(client, TransferKind::Upload, bucket, key, local, Job::Upload { src })
+        self.start(client, TransferKind::Upload, bucket, key, local, Job::Upload { src }, None)
     }
 
+    /// Queues one file of a folder upload (see [`BatchLink`]).
+    pub fn start_batch_upload(self: &Arc<Self>, client: Client, bucket: &str, key: &str, src: PathBuf, link: BatchLink) -> String {
+        let local = src.to_string_lossy().into_owned();
+        self.start(client, TransferKind::Upload, bucket, key, local, Job::Upload { src }, Some(link))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start(
         self: &Arc<Self>,
         client: Client,
@@ -293,11 +346,13 @@ impl TransferManager {
         key: &str,
         local_path: String,
         job: Job,
+        link: Option<BatchLink>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let record = Transfer {
             id: id.clone(),
             kind,
+            batch_id: link.as_ref().map(|l| l.batch_id.clone()),
             bucket: bucket.to_string(),
             key: key.to_string(),
             local_path,
@@ -314,7 +369,7 @@ impl TransferManager {
         let entry = Arc::new(TransferEntry {
             seq: self.seq.fetch_add(1, Ordering::Relaxed),
             record: Mutex::new(record),
-            cancel: CancellationToken::new(),
+            cancel: link.as_ref().map_or_else(CancellationToken::new, |l| l.cancel.child_token()),
             finished: CancellationToken::new(),
             transferred: AtomicU64::new(0),
             parts_done: AtomicU32::new(0),
@@ -323,6 +378,7 @@ impl TransferManager {
             part_retries: AtomicU32::new(0),
             discarded_bytes: AtomicU64::new(0),
             file_syncs: AtomicU32::new(0),
+            observer: link.map(|l| l.observer),
         });
         self.entries.insert(id.clone(), entry.clone());
         self.sink.emit(&entry.snapshot());
@@ -348,6 +404,10 @@ impl TransferManager {
                 cfg.upload_attempt_timeout = self.tuning.upload_attempt_timeout;
                 entry.lock().status = TransferStatus::Running;
                 self.sink.emit(&entry.snapshot());
+                if let Some(o) = &entry.observer {
+                    let id = entry.lock().id.clone();
+                    o.running(&id);
+                }
 
                 let stop = CancellationToken::new();
                 let ticker = tokio::spawn(ticker(self.sink.clone(), entry.clone(), stop.clone()));
@@ -358,11 +418,11 @@ impl TransferManager {
                 let fault = self.tuning.fault.clone();
                 let body = async {
                     match job {
-                        Job::Download { dest } => {
+                        Job::Download { dest, no_replace } => {
                             if let Some(f) = &fault {
                                 f("download");
                             }
-                            download::run(&client, &entry, cfg, &id, &bucket, &key, &dest).await
+                            download::run(&client, &entry, cfg, &id, &bucket, &key, &dest, no_replace).await
                         }
                         Job::Upload { src } => {
                             if let Some(f) = &fault {
@@ -400,8 +460,15 @@ impl TransferManager {
                     rec.error = Some(e.message);
                 }
             }
+            if rec.kind == TransferKind::Download {
+                self.active_dests.lock().unwrap_or_else(|p| p.into_inner()).remove(&dest_key(&rec.local_path));
+            }
         }
-        self.sink.emit(&entry.snapshot());
+        let last = entry.snapshot();
+        self.sink.emit(&last);
+        if let Some(o) = &entry.observer {
+            o.finished(&last);
+        }
         // Release the run slot only after the final event, so observers never see the next
         // queued transfer running while this one still looks running.
         drop(permit);
@@ -880,6 +947,68 @@ mod tests {
         let deletes: Vec<String> = s3.requests().into_iter().filter(|r| r.method == "DELETE").map(|r| r.query).collect();
         assert_eq!(deletes.len(), 1, "{deletes:?}");
         assert!(deletes[0].contains("uploadId=U1"));
+    }
+
+    struct CountingObserver(Mutex<Vec<(String, TransferStatus)>>);
+    impl TransferObserver for CountingObserver {
+        fn running(&self, id: &str) {
+            self.0.lock().unwrap().push((id.to_string(), TransferStatus::Running));
+        }
+        fn finished(&self, t: &Transfer) {
+            self.0.lock().unwrap().push((t.id.clone(), t.status));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_no_replace_download_never_overwrites() {
+        let dir = ScratchDir::new("dl-noreplace");
+        let s3 = object_server(1000, |_, _| None, false).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let dest = dir.0.join("exists.bin");
+        std::fs::write(&dest, b"keep me").expect("write");
+        let obs = Arc::new(CountingObserver(Mutex::new(Vec::new())));
+        let link = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs.clone() };
+        let id = tm.start_batch_download(s3.client(), "b", "k", dest.clone(), true, link.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Failed);
+        assert!(t.error.as_deref().unwrap_or_default().starts_with("A file already exists at "), "{:?}", t.error);
+        assert_eq!(t.batch_id.as_deref(), Some("B1"));
+        assert_eq!(std::fs::read(&dest).expect("read"), b"keep me", "left untouched");
+        assert!(s3.requests().is_empty(), "no request for a file that will be refused");
+        assert_eq!(dir.files().len(), 1, "no .part left: {:?}", dir.files());
+        // The observer saw it start and finish.
+        let seen = obs.0.lock().unwrap().clone();
+        assert_eq!(seen, vec![(id.clone(), TransferStatus::Running), (id.clone(), TransferStatus::Failed)]);
+        // A free destination downloads normally in the same mode.
+        let free = dir.0.join("free.bin");
+        let id = tm.start_batch_download(s3.client(), "b", "k", free.clone(), true, link.clone()).expect("start");
+        assert_eq!(finished(&tm, &id, Duration::from_secs(30)).await.status, TransferStatus::Completed);
+        assert_eq!(std::fs::read(&free).expect("read"), expected(1000));
+        // The single-file command (and no_replace = false) keeps replacing.
+        let id = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("start");
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed);
+        assert_eq!(t.batch_id, None);
+        assert_eq!(std::fs::read(&dest).expect("read"), expected(1000));
+        // Cancelling the batch token cancels a file started after the cancel.
+        link.cancel.cancel();
+        let id = tm.start_batch_download(s3.client(), "b", "k", dir.0.join("late.bin"), false, link).expect("start");
+        assert_eq!(finished(&tm, &id, Duration::from_secs(30)).await.status, TransferStatus::Cancelled);
+        assert!(!dir.0.join("late.bin").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_writer_per_destination_is_released_at_the_end() {
+        let dir = ScratchDir::new("dl-busy");
+        let s3 = object_server(1000, |_, _| None, false).await;
+        let tm = manager(TransferSettings { max_concurrent_transfers: 1, ..TransferSettings::default() }, TransferTuning::default());
+        let dest = dir.0.join("Same.bin");
+        let a = tm.start_download(s3.client(), "b", "k", dest.clone()).expect("first");
+        let other_case = dir.0.join(if cfg!(windows) { "same.BIN" } else { "Same.bin" });
+        assert!(tm.start_download(s3.client(), "b", "k", other_case).is_err(), "second writer refused");
+        finished(&tm, &a, Duration::from_secs(30)).await;
+        let b = tm.start_download(s3.client(), "b", "k", dest).expect("free again after the first finished");
+        assert_eq!(finished(&tm, &b, Duration::from_secs(30)).await.status, TransferStatus::Completed);
     }
 
     #[test]

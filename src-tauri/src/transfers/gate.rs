@@ -9,9 +9,11 @@
 //!
 //! Instead the whole state is a counter under one mutex: `running`, `limit` and the set of waiting
 //! tickets. A waiter may start only when `running < limit` *and* it holds the oldest waiting
-//! ticket (FIFO, matching queue order). Every state change (`set_limit`, a slot released, a
-//! waiter leaving or starting) calls `notify_waiters`, and each waiter registers its `Notified`
-//! future *before* re-checking the condition, so a wake-up can never be missed. Hence:
+//! ticket (FIFO, matching queue order). Only the oldest waiter can ever start, so every state
+//! change (`set_limit`, a slot released, a waiter leaving or starting) wakes just that one through
+//! its own `Notify` (`notify_one` stores the wake-up if the waiter is not parked yet, so none is
+//! lost). Waking everybody instead made each change cost O(waiting): a 50,000-file folder transfer
+//! queues 50,000 waiters and would have done ~10^9 wake-ups over its lifetime. Hence:
 //! - raising the limit wakes everybody; the oldest waiters start until `running == limit`;
 //! - lowering it never touches running transfers; new starts wait until `running < limit`;
 //! - permits are RAII guards, so a slot can't leak (a panic or a cancelled waiter cleans up in Drop);
@@ -19,7 +21,7 @@
 //!   that order even when the waiting tasks are first polled in another order;
 //! - no deadlock: the mutex is never held across an `.await`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
@@ -28,12 +30,21 @@ struct State {
     running: usize,
     limit: usize,
     next_ticket: u64,
-    waiting: BTreeSet<u64>,
+    /// Waiting tickets in line order, each with the `Notify` that wakes its waiter.
+    waiting: BTreeMap<u64, Arc<Notify>>,
+}
+
+impl State {
+    /// Wakes the oldest waiter (the only one that can start) so it re-checks.
+    fn wake_head(&self) {
+        if let Some((_, n)) = self.waiting.first_key_value() {
+            n.notify_one();
+        }
+    }
 }
 
 pub struct RunGate {
     state: Mutex<State>,
-    notify: Notify,
 }
 
 /// Held while a transfer runs; releases the slot on drop.
@@ -43,8 +54,9 @@ pub struct RunPermit {
 
 impl Drop for RunPermit {
     fn drop(&mut self) {
-        self.gate.lock().running -= 1;
-        self.gate.notify.notify_waiters();
+        let mut s = self.gate.lock();
+        s.running -= 1;
+        s.wake_head();
     }
 }
 
@@ -53,15 +65,17 @@ impl Drop for RunPermit {
 pub struct Waiter {
     gate: Arc<RunGate>,
     id: u64,
+    notify: Arc<Notify>,
     pending: bool,
 }
 
 impl Drop for Waiter {
     fn drop(&mut self) {
         if self.pending {
-            self.gate.lock().waiting.remove(&self.id);
+            let mut s = self.gate.lock();
+            s.waiting.remove(&self.id);
             // It may have been the oldest waiter: let the next one re-check.
-            self.gate.notify.notify_waiters();
+            s.wake_head();
         }
     }
 }
@@ -69,8 +83,7 @@ impl Drop for Waiter {
 impl RunGate {
     pub fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(State { running: 0, limit: limit.max(1), next_ticket: 0, waiting: BTreeSet::new() }),
-            notify: Notify::new(),
+            state: Mutex::new(State { running: 0, limit: limit.max(1), next_ticket: 0, waiting: BTreeMap::new() }),
         })
     }
 
@@ -80,8 +93,9 @@ impl RunGate {
 
     /// Changes the limit immediately (see module docs). Values below 1 are treated as 1.
     pub fn set_limit(&self, limit: usize) {
-        self.lock().limit = limit.max(1);
-        self.notify.notify_waiters();
+        let mut s = self.lock();
+        s.limit = limit.max(1);
+        s.wake_head();
     }
 
     pub fn running(&self) -> usize {
@@ -96,14 +110,15 @@ impl RunGate {
     /// Takes a place in line now (synchronously): the order of `enqueue` calls is the start
     /// order, however the tasks that later call [`Waiter::wait`] happen to be scheduled.
     pub fn enqueue(self: &Arc<Self>) -> Waiter {
+        let notify = Arc::new(Notify::new());
         let id = {
             let mut s = self.lock();
             let id = s.next_ticket;
             s.next_ticket += 1;
-            s.waiting.insert(id);
+            s.waiting.insert(id, notify.clone());
             id
         };
-        Waiter { gate: self.clone(), id, pending: true }
+        Waiter { gate: self.clone(), id, notify, pending: true }
     }
 
     /// `enqueue` then `wait`: the place in line is taken when this future is first polled (tests;
@@ -118,24 +133,21 @@ impl Waiter {
     /// Waits for a run slot (FIFO). Cancel-safe: dropping the future gives up the place in line.
     pub async fn wait(mut self) -> RunPermit {
         let gate = self.gate.clone();
+        let notify = self.notify.clone();
         loop {
-            let notified = gate.notify.notified();
-            tokio::pin!(notified);
-            // Register before checking so a notify between the check and the await isn't lost.
-            notified.as_mut().enable();
             {
                 let mut s = gate.lock();
-                if s.running < s.limit && s.waiting.first() == Some(&self.id) {
+                if s.running < s.limit && s.waiting.first_key_value().map(|(id, _)| *id) == Some(self.id) {
                     s.waiting.remove(&self.id);
                     s.running += 1;
                     self.pending = false;
-                    drop(s);
                     // The next waiter is now the oldest; it may fit too.
-                    gate.notify.notify_waiters();
+                    s.wake_head();
                     return RunPermit { gate: gate.clone() };
                 }
             }
-            notified.await;
+            // A wake-up sent between the check and this await is stored by `notify_one`.
+            notify.notified().await;
         }
     }
 }
@@ -307,6 +319,35 @@ mod tests {
         let _ = first.send(());
         settle().await;
         assert_eq!(drain(&mut rx), vec![0, 1, 2, 3]);
+        assert_eq!((gate.running(), gate.waiting()), (0, 0));
+    }
+
+    /// Many waiters: each release wakes only the next in line, so the whole queue drains in
+    /// order and quickly (waking everybody on every change was quadratic).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_long_queue_drains_in_order() {
+        let gate = RunGate::new(3);
+        let n = 20_000;
+        let order = Arc::new(Mutex::new(Vec::with_capacity(n)));
+        let waiters: Vec<Waiter> = (0..n).map(|_| gate.enqueue()).collect();
+        let mut tasks = Vec::with_capacity(n);
+        for (i, w) in waiters.into_iter().enumerate() {
+            let order = order.clone();
+            tasks.push(tokio::spawn(async move {
+                let _p = w.wait().await;
+                order.lock().unwrap().push(i);
+                tokio::task::yield_now().await;
+            }));
+        }
+        let t0 = std::time::Instant::now();
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "{:?}", t0.elapsed());
+        let order = order.lock().unwrap();
+        assert_eq!(order.len(), n);
+        // FIFO start order; with 3 slots, a start can be at most 2 places ahead of its turn.
+        assert!(order.iter().enumerate().all(|(pos, i)| i.abs_diff(pos) <= 2));
         assert_eq!((gate.running(), gate.waiting()), (0, 0));
     }
 

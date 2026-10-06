@@ -75,7 +75,7 @@ async fn run(dir: &std::path::Path, keychain: Arc<OsKeychain>, created: &mut Vec
     let secret = env("SMOKE_SECRET_KEY", "minioadmin");
     let path = dir.join(CONNECTIONS_FILE);
     let store = ConnectionStore::load(path.clone(), keychain.clone());
-    let state = AppState::new(Arc::new(Nop), Arc::new(Nop), SettingsStore::in_memory(Default::default()));
+    let state = AppState::new(Arc::new(Nop), Arc::new(Nop), Arc::new(s3explorer_lib::batches::NoopBatchSink), SettingsStore::in_memory(Default::default()));
 
     let input = |id: Option<&str>, name: &str, secret: &str| SaveConnectionInput {
         id: id.map(str::to_string),

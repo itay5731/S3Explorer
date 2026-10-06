@@ -4,6 +4,7 @@
 //! `aws_sdk_s3::Client` and a progress sink ([`transfers::ProgressSink`], [`jobs::JobSink`]);
 //! the Tauri glue is in `commands`.
 
+pub mod batches;
 pub mod buckets;
 pub mod commands;
 pub mod error;
@@ -27,9 +28,10 @@ use std::sync::Arc;
 
 use tauri::{Emitter, Manager};
 
+use crate::batches::BatchSink;
 use crate::jobs::JobSink;
 use crate::keychain::OsKeychain;
-use crate::models::{Job, Transfer, JOB_PROGRESS_EVENT, TRANSFER_PROGRESS_EVENT};
+use crate::models::{Batch, Job, Transfer, BATCH_PROGRESS_EVENT, JOB_PROGRESS_EVENT, TRANSFER_PROGRESS_EVENT};
 use crate::buckets::AddedBucketStore;
 use crate::saved::ConnectionStore;
 use crate::settings::SettingsStore;
@@ -55,6 +57,15 @@ impl JobSink for TauriJobSink {
     }
 }
 
+/// Forwards batch snapshots to the webview as `batch:progress` events.
+struct TauriBatchSink(tauri::AppHandle);
+
+impl BatchSink for TauriBatchSink {
+    fn emit(&self, batch: &Batch) {
+        let _ = self.0.emit(BATCH_PROGRESS_EVENT, batch);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
@@ -71,6 +82,7 @@ pub fn run() {
             windows_shell::set_taskbar_icons(app);
             let sink: Arc<dyn ProgressSink> = Arc::new(TauriSink(app.handle().clone()));
             let job_sink: Arc<dyn JobSink> = Arc::new(TauriJobSink(app.handle().clone()));
+            let batch_sink: Arc<dyn BatchSink> = Arc::new(TauriBatchSink(app.handle().clone()));
             // Never fail startup over settings or saved connections: no config dir means in-memory.
             let config_dir = app.path().app_config_dir().ok();
             let store = match &config_dir {
@@ -86,7 +98,7 @@ pub fn run() {
                 Some(dir) => AddedBucketStore::load(dir.join(buckets::ADDED_BUCKETS_FILE)),
                 None => AddedBucketStore::in_memory(),
             };
-            app.manage(AppState::new(sink, job_sink, store));
+            app.manage(AppState::new(sink, job_sink, batch_sink, store));
             app.manage(added);
             app.manage(connections);
             app.manage(UpdaterState::default());
@@ -107,6 +119,11 @@ pub fn run() {
             commands::transfers::cancel_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::list_transfers,
+            commands::batches::preview_batch,
+            commands::batches::start_batch,
+            commands::batches::cancel_batch,
+            commands::batches::remove_batch,
+            commands::batches::list_batches,
             commands::jobs::preview_job,
             commands::jobs::start_job,
             commands::jobs::cancel_job,

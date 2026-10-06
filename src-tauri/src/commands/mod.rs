@@ -1,5 +1,6 @@
 //! Tauri command layer: thin wrappers over `ops`, `state`, `transfers` and `jobs`.
 
+pub mod batches;
 pub mod browse;
 pub mod buckets;
 pub mod connection;

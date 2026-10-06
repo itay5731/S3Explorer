@@ -261,6 +261,89 @@ impl PartWriter {
     }
 }
 
+/// The error of a `no_replace` download whose destination exists.
+fn exists_error(dest: &Path) -> AppError {
+    AppError::new(
+        crate::error::ErrorCode::Conflict,
+        format!("A file already exists at {}; it was left unchanged", dest.display()),
+    )
+}
+
+/// Renames `from` to `to` but never replaces an existing `to` (`AlreadyExists` instead).
+/// Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (atomic). Elsewhere: a hard link
+/// (fails atomically if `to` exists) and removing `from`; on a filesystem without hard links,
+/// an existence check and a plain rename.
+pub(crate) fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        }
+        let wide = |p: &Path| -> Vec<u16> { verbatim(p).encode_wide().chain(std::iter::once(0)).collect() };
+        let (a, b) = (wide(from), wide(to));
+        // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive this synchronous call.
+        let ok = unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), 0) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        match std::fs::hard_link(from, to) {
+            Ok(()) => std::fs::remove_file(from),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e),
+            Err(_) => {
+                if std::fs::symlink_metadata(to).is_ok() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination exists"));
+                }
+                std::fs::rename(from, to)
+            }
+        }
+    }
+}
+
+/// `C:\a\b` as `\\?\C:\a\b` (and `\\server\share\x` as `\\?\UNC\server\share\x`), so the raw
+/// Win32 call accepts paths longer than 260 characters (`std::fs` does this by itself). Paths it
+/// cannot convert safely (relative, with `..`, already verbatim, device paths) are returned as is.
+#[cfg(windows)]
+fn verbatim(p: &Path) -> OsString {
+    use std::path::{Component, Prefix};
+    let mut comps = p.components();
+    let mut s = OsString::new();
+    match comps.next() {
+        Some(Component::Prefix(pre)) => match pre.kind() {
+            Prefix::Disk(_) => {
+                s.push(r"\\?\");
+                s.push(pre.as_os_str());
+            }
+            Prefix::UNC(server, share) => {
+                s.push(r"\\?\UNC\");
+                s.push(server);
+                s.push(r"\");
+                s.push(share);
+            }
+            _ => return p.as_os_str().to_owned(),
+        },
+        _ => return p.as_os_str().to_owned(),
+    }
+    for c in comps {
+        match c {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(n) => {
+                s.push(r"\");
+                s.push(n);
+            }
+            Component::ParentDir | Component::Prefix(_) => return p.as_os_str().to_owned(),
+        }
+    }
+    s
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     client: &Client,
     entry: &Arc<TransferEntry>,
@@ -269,9 +352,15 @@ pub(super) async fn run(
     bucket: &str,
     key: &str,
     dest: &Path,
+    no_replace: bool,
 ) -> AppResult<()> {
     if dest.as_os_str().is_empty() {
         return Err(AppError::invalid("Destination path is required"));
+    }
+    // Checked before any request (no bandwidth spent on a file that will be refused) and again,
+    // atomically, at the final rename (something may appear at `dest` meanwhile).
+    if no_replace && tokio::fs::symlink_metadata(dest).await.is_ok() {
+        return Err(exists_error(dest));
     }
     // Child token: cancelled by the user (parent) or when a sibling part fails.
     let token = entry.cancel.child_token();
@@ -318,9 +407,19 @@ pub(super) async fn run(
 
     match result {
         Ok(()) => {
-            if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+            let renamed = if no_replace {
+                let (from, to) = (tmp.clone(), dest.to_path_buf());
+                match tokio::task::spawn_blocking(move || rename_no_replace(&from, &to)).await {
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists_error(dest)),
+                    Ok(r) => r.map_err(AppError::from),
+                    Err(e) => Err(AppError::from(e)),
+                }
+            } else {
+                tokio::fs::rename(&tmp, dest).await.map_err(AppError::from)
+            };
+            if let Err(e) = renamed {
                 let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(e.into());
+                return Err(e);
             }
             tmp_guard.0 = None;
             Ok(())
@@ -696,5 +795,54 @@ mod tests {
         assert!(got[..1000].iter().all(|b| *b == 0));
         assert_eq!(&got[1000..1000 + data.len()], &data[..]);
         assert!(got[1000 + data.len()..].iter().all(|b| *b == 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verbatim_paths() {
+        assert_eq!(verbatim(Path::new(r"C:\dl\a.txt")), OsString::from(r"\\?\C:\dl\a.txt"));
+        assert_eq!(verbatim(Path::new("C:/dl/./sub/a.txt")), OsString::from(r"\\?\C:\dl\sub\a.txt"));
+        assert_eq!(verbatim(Path::new(r"\\srv\share\d\f")), OsString::from(r"\\?\UNC\srv\share\d\f"));
+        assert_eq!(verbatim(Path::new(r"\\?\C:\x")), OsString::from(r"\\?\C:\x"));
+        assert_eq!(verbatim(Path::new(r"C:\a\..\b")), OsString::from(r"C:\a\..\b"));
+        assert_eq!(verbatim(Path::new(r"rel\x")), OsString::from(r"rel\x"));
+    }
+
+    #[test]
+    fn rename_no_replace_handles_long_paths() {
+        let dir = std::env::temp_dir().join(format!("s3x-long-{}", uuid::Uuid::new_v4()));
+        let deep = (0..6).fold(dir.clone(), |p, i| p.join(format!("{i}{}", "d".repeat(60))));
+        std::fs::create_dir_all(&deep).unwrap();
+        let (a, b) = (deep.join("x.part"), deep.join("x.bin"));
+        assert!(b.as_os_str().len() > 300, "{}", b.as_os_str().len());
+        std::fs::write(&a, b"long").unwrap();
+        rename_no_replace(&a, &b).expect("long-path rename");
+        assert_eq!(std::fs::read(&b).unwrap(), b"long");
+        std::fs::write(&a, b"again").unwrap();
+        assert_eq!(rename_no_replace(&a, &b).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rename_no_replace_never_replaces() {
+        let dir = std::env::temp_dir().join(format!("s3x-norepl-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.part"), dir.join("b.txt"));
+        std::fs::write(&a, b"new").unwrap();
+        std::fs::write(&b, b"old").unwrap();
+        let e = rename_no_replace(&a, &b).expect_err("must not replace");
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists, "{e:?}");
+        assert_eq!(std::fs::read(&b).unwrap(), b"old", "existing file untouched");
+        assert_eq!(std::fs::read(&a).unwrap(), b"new", "source kept for the caller to remove");
+        // A directory in the way counts as existing too.
+        let d = dir.join("sub");
+        std::fs::create_dir(&d).unwrap();
+        assert!(rename_no_replace(&a, &d).is_err());
+        // Free destination: renamed, source gone.
+        let c = dir.join("c.txt");
+        rename_no_replace(&a, &c).expect("rename");
+        assert_eq!(std::fs::read(&c).unwrap(), b"new");
+        assert!(!a.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
