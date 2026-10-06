@@ -151,7 +151,7 @@ async function cancelJob(id: string) {
 }
 
 function jobWhere(j: Job): string {
-  if (j.kind !== "delete" && j.destBucket && j.destBucket !== j.srcBucket) return `${j.srcBucket} → ${j.destBucket}`;
+  if ((j.kind === "copy" || j.kind === "move") && j.destBucket && j.destBucket !== j.srcBucket) return `${j.srcBucket} → ${j.destBucket}`;
   return `in ${j.srcBucket}`;
 }
 
@@ -160,7 +160,8 @@ function jobProgressText(j: Job): string {
   if (j.phase === "listing") return `Listing… ${plural(j.totalItems, "object")} found`;
   const processed = j.doneItems + j.skippedItems + j.failedItems;
   const objects = `${processed.toLocaleString()} / ${j.totalItems.toLocaleString()} objects`;
-  if (j.kind === "delete") return objects;
+  // Deletes and tag edits move no data (a tag job's byte counters stay 0).
+  if (j.kind === "delete" || j.kind === "tag") return objects;
   return `${objects} · ${formatBytes(j.doneBytes)} / ${formatBytes(j.totalBytes)}`;
 }
 

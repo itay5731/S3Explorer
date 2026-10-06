@@ -4,13 +4,14 @@
 import { create } from "zustand";
 import * as api from "../lib/api";
 import { applyAccent, applyTheme, readAccentMirror, readThemeMirror, writeAccentMirror, writeThemeMirror } from "../lib/theme";
-import type { AppError, AppSettings } from "../lib/types";
+import type { AppError } from "../lib/types";
+import { withDefaults, type Settings } from "../lib/settings";
 
-export type SettingsTabId = "transfers" | "appearance" | "notifications" | "updates";
+export type SettingsTabId = "transfers" | "behavior" | "appearance" | "notifications" | "updates";
 
 interface SettingsState {
   /** Last values confirmed by the backend; null until the first load succeeds. */
-  settings: AppSettings | null;
+  settings: Settings | null;
   loading: boolean;
   error: AppError | null;
   saving: boolean;
@@ -41,7 +42,7 @@ export function applyTextStyle(size: number, weight: number) {
 }
 
 /** Apply the confirmed look and refresh the pre-render mirrors. Skipped while the dialog previews one. */
-function syncTheme(settings: AppSettings) {
+function syncTheme(settings: Settings) {
   writeThemeMirror(settings.theme);
   writeAccentMirror(settings.accent);
   if (useSettings.getState().open) return;
@@ -53,7 +54,7 @@ function syncTheme(settings: AppSettings) {
 export async function loadSettings(): Promise<void> {
   set({ loading: true, error: null });
   try {
-    const settings = await api.getSettings();
+    const settings = withDefaults(await api.getSettings());
     set({ settings, loading: false });
     syncTheme(settings);
   } catch (e) {
@@ -62,10 +63,10 @@ export async function loadSettings(): Promise<void> {
 }
 
 /** Save and store the values the backend returns. Rejects with the `AppError` on failure. */
-export async function saveSettings(next: AppSettings): Promise<AppSettings> {
+export async function saveSettings(next: Settings): Promise<Settings> {
   set({ saving: true });
   try {
-    const settings = await api.updateSettings(next);
+    const settings = withDefaults(await api.updateSettings(next));
     set({ settings, saving: false, error: null });
     writeThemeMirror(settings.theme);
     writeAccentMirror(settings.accent);

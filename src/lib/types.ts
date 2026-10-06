@@ -126,6 +126,8 @@ export interface AppSettings extends TransferSettings {
   /** Font weight of ordinary text. */
   textWeight: number;
   accent: AccentColor;
+  /** v0.4.0: show the Copy/Move confirmation even when nothing conflicts. Delete always confirms. */
+  confirmCopyMove: boolean;
 }
 
 /** Ranges and slider steps for the text settings (the backend enforces the same ranges). */
@@ -142,6 +144,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   textSize: 100,
   textWeight: 400,
   accent: "yellow",
+  confirmCopyMove: true,
 };
 
 // Saved connections

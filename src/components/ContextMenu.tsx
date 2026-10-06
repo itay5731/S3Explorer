@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ClipboardPaste, Copy, CopyPlus, Download, FolderOpen, FolderPlus, Info, Link, PencilLine, RefreshCw, Scissors, Trash2, Upload } from "lucide-react";
+import { ClipboardPaste, Copy, CopyPlus, Download, FolderOpen, FolderPlus, Info, Link, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, setDetailsOpen, setSelection, useApp } from "../store/app";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
 import { getSelected } from "../store/view";
 import { useClipboard } from "../store/clipboard";
-import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
+import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename } from "../store/ops";
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 
@@ -109,6 +109,7 @@ export function ContextMenu() {
       { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, f.prefix), "S3 URI") },
     ]);
     groups.push(editItems(1));
+    groups.push([{ label: "Edit tags of everything inside…", icon: <Tags size={14} />, action: () => requestBulkTags() }]);
     groups.push([deleteItem(1, true)]);
   } else if (count === 1) {
     const o = objects[0];
@@ -119,6 +120,7 @@ export function ContextMenu() {
     ]);
     groups.push(editItems(1));
     groups.push([
+      { label: "Edit tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "objectTags", bucket, key: o.key }) },
       {
         label: "Properties",
         icon: <Info size={14} />,
@@ -149,6 +151,7 @@ export function ContextMenu() {
       },
     ]);
     groups.push(editItems(count));
+    groups.push([{ label: `Edit tags for ${count} items…`, icon: <Tags size={14} />, action: () => requestBulkTags() }]);
     groups.push([deleteItem(count, false)]);
   }
 

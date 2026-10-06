@@ -1,7 +1,9 @@
-import { useMemo, useRef, useState, type CSSProperties, type FormEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { AlertTriangle, Archive, Plus, RefreshCw, Search, X } from "lucide-react";
-import { addManualBucket, loadBuckets, navigate, readPref, removeManualBucket, useApp, writePref } from "../store/app";
+import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Archive, ArchiveX, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
+import { loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, writePref } from "../store/app";
+import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
+import { PopupMenu } from "./PopupMenu";
 import { RecentFiles } from "./RecentFiles";
 
 const SHARE_KEY = "s3x.bucketsShare";
@@ -45,44 +47,117 @@ function useSplit() {
   return { sidebar, style: { "--buckets-share": share } as CSSProperties, onPointerDown, reset: () => save(DEFAULT_SHARE) };
 }
 
+interface BucketEntry {
+  name: string;
+  title: string;
+  /** Added by name ("Shared with me"), so it can be removed from the list. */
+  shared: boolean;
+}
+
+/** One bucket in the sidebar. It is also a drop target for dragged rows (move to its root). */
+function BucketRow({ b, selected, onMenu }: { b: BucketEntry; selected: boolean; onMenu(b: BucketEntry, x: number, y: number): void }) {
+  // Only buckets whose tags were loaded anyway (e.g. in the tag editor) show the icon: never fetched for it.
+  const tagCount = useTags((s) => s.buckets[b.name]?.length ?? 0);
+  const openMenuAt = (e: ReactMouseEvent<HTMLElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    onMenu(b, r.left, r.bottom + 2);
+  };
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className={`bucket-item ${selected ? "selected" : ""}`}
+      title={b.title}
+      data-drop-bucket={b.name}
+      data-drop-prefix=""
+      onClick={() => navigate(b.name, "")}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onMenu(b, e.clientX, e.clientY);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          navigate(b.name, "");
+        } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+          e.preventDefault();
+          openMenuAt(e as unknown as ReactMouseEvent<HTMLElement>);
+        }
+      }}
+    >
+      {b.shared ? <Users size={14} className="bucket-icon" /> : <Archive size={14} className="bucket-icon" />}
+      <span className="bucket-name">{b.name}</span>
+      {tagCount > 0 && (
+        <span className="bucket-tagged" title={`${tagCount} bucket tag${tagCount === 1 ? "" : "s"}`} aria-label={`${tagCount} bucket tags`}>
+          <Tag size={11} />
+        </span>
+      )}
+      <button
+        type="button"
+        className="icon-btn bucket-more"
+        aria-label={`More actions for ${b.name}`}
+        aria-haspopup="menu"
+        title="More actions"
+        onClick={(e) => {
+          e.stopPropagation();
+          openMenuAt(e);
+        }}
+      >
+        <MoreHorizontal size={14} />
+      </button>
+    </div>
+  );
+}
+
 export function Sidebar() {
   const connection = useApp((s) => s.connection);
   const buckets = useApp((s) => s.buckets);
   const loading = useApp((s) => s.bucketsLoading);
   const error = useApp((s) => s.bucketsError);
-  const manual = useApp((s) => s.manualBuckets);
+  const added = useApp((s) => s.addedBuckets);
+  const addedLoading = useApp((s) => s.addedLoading);
+  const addedError = useApp((s) => s.addedError);
   const selected = useApp((s) => s.bucket);
   const [filter, setFilter] = useState("");
-  const [manualName, setManualName] = useState("");
+  const [menu, setMenu] = useState<{ b: BucketEntry; x: number; y: number } | null>(null);
   const split = useSplit();
 
   const canList = connection?.canListBuckets ?? true;
 
-  const items = useMemo(() => {
-    const list = canList
-      ? buckets.map((b) => ({ name: b.name, title: b.creationDate ? `Created ${formatExact(b.creationDate)}` : b.name, manual: false }))
-      : manual.map((name) => ({ name, title: name, manual: true }));
-    const f = filter.trim().toLowerCase();
-    return f ? list.filter((b) => b.name.toLowerCase().includes(f)) : list;
-  }, [buckets, manual, canList, filter]);
+  const f = filter.trim().toLowerCase();
+  const matches = (name: string) => !f || name.toLowerCase().includes(f);
+  const listed = useMemo(
+    () => buckets.map((b): BucketEntry => ({ name: b.name, title: b.creationDate ? `Created ${formatExact(b.creationDate)}` : b.name, shared: false })),
+    [buckets],
+  );
+  // An added bucket that ListBuckets also returns is shown once, in the regular list.
+  const shared = useMemo(() => {
+    const inList = new Set(buckets.map((b) => b.name));
+    return added
+      .filter((a) => !inList.has(a.name))
+      .map((a): BucketEntry => ({ name: a.name, title: `${a.name}\nAdded by name${a.region ? ` · ${a.region}` : ""}`, shared: true }));
+  }, [added, buckets]);
+  const shownListed = listed.filter((b) => matches(b.name));
+  const shownShared = shared.filter((b) => matches(b.name));
 
-  const submitManual = (e: FormEvent) => {
-    e.preventDefault();
-    if (manualName.trim()) {
-      addManualBucket(manualName);
-      setManualName("");
-    }
-  };
+  const onMenu = (b: BucketEntry, x: number, y: number) => setMenu({ b, x, y });
+  const addButton = (
+    <button type="button" className="icon-btn" onClick={() => openModal({ kind: "addBucket" })} title="Add a bucket by name" aria-label="Add a bucket">
+      <Plus size={14} />
+    </button>
+  );
 
   return (
     <aside ref={split.sidebar} className="sidebar" style={split.style}>
       <div className="sidebar-buckets">
         <div className="sidebar-head">
           <span className="section-title">Buckets</span>
-          {canList && (
+          {canList ? (
             <button className="icon-btn" onClick={() => void loadBuckets()} title="Reload buckets" disabled={loading}>
               <RefreshCw size={13} className={loading ? "spin" : ""} />
             </button>
+          ) : (
+            addButton
           )}
         </div>
 
@@ -96,67 +171,64 @@ export function Sidebar() {
           )}
         </div>
 
-        {!canList && (
-          <form className="manual-bucket" onSubmit={submitManual}>
-            <p className="hint">
-              <AlertTriangle size={12} /> This identity can’t list buckets. Enter a bucket name to open it.
-            </p>
-            <div className="input-affix">
-              <input value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="bucket-name" spellCheck={false} />
-              <button type="submit" className="icon-btn" aria-label="Open bucket" disabled={!manualName.trim()}>
-                <Plus size={14} />
-              </button>
+        <nav className="bucket-list" aria-label="Buckets">
+          {canList ? (
+            <>
+              {loading && !buckets.length && [0, 1, 2, 3].map((i) => <div key={i} className="bucket-item skeleton" />)}
+              {error && (
+                <div className="sidebar-error">
+                  {error.message}
+                  <button className="link-btn" onClick={() => void loadBuckets()}>
+                    Retry
+                  </button>
+                </div>
+              )}
+              {shownListed.map((b) => (
+                <BucketRow key={b.name} b={b} selected={selected === b.name} onMenu={onMenu} />
+              ))}
+              {!loading && !error && shownListed.length === 0 && (
+                <div className="empty-note small">{filter ? "No matching buckets" : "No buckets"}</div>
+              )}
+              <div className="bucket-group-head">
+                <span className="section-title">Shared with me</span>
+                {addButton}
+              </div>
+            </>
+          ) : (
+            <div className="bucket-note">
+              <Info size={13} />
+              <span>
+                This connection can’t list buckets. Add the buckets you use by name, an s3:// address or an ARN; they
+                are remembered for this connection.
+              </span>
             </div>
-          </form>
-        )}
-
-        <nav className="bucket-list">
-          {loading && !buckets.length && [0, 1, 2, 3].map((i) => <div key={i} className="bucket-item skeleton" />)}
-          {error && canList && (
+          )}
+          {addedLoading && !added.length && <div className="bucket-item skeleton" />}
+          {addedError && (
             <div className="sidebar-error">
-              {error.message}
-              <button className="link-btn" onClick={() => void loadBuckets()}>
+              {addedError.message}
+              <button className="link-btn" onClick={() => void loadAddedBuckets()}>
                 Retry
               </button>
             </div>
           )}
-          {items.map((b) => (
-            <div
-              key={b.name}
-              role="button"
-              tabIndex={0}
-              className={`bucket-item ${selected === b.name ? "selected" : ""}`}
-              title={b.title}
-              onClick={() => navigate(b.name, "")}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  navigate(b.name, "");
-                }
-              }}
-            >
-              <Archive size={14} className="bucket-icon" />
-              <span className="bucket-name">{b.name}</span>
-              {b.manual && (
-                <button
-                  className="icon-btn bucket-remove"
-                  aria-label={`Remove ${b.name}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    removeManualBucket(b.name);
-                  }}
-                >
-                  <X size={12} />
-                </button>
-              )}
-            </div>
+          {shownShared.map((b) => (
+            <BucketRow key={b.name} b={b} selected={selected === b.name} onMenu={onMenu} />
           ))}
-          {!loading && !error && items.length === 0 && (canList || manual.length > 0) && (
-            <div className="empty-note small">{filter ? "No matching buckets" : "No buckets"}</div>
+          {!addedLoading && !addedError && shownShared.length === 0 && (
+            filter && shared.length ? (
+              <div className="empty-note small">No matching buckets</div>
+            ) : (
+              <button type="button" className="bucket-add" onClick={() => openModal({ kind: "addBucket" })}>
+                <Plus size={13} /> {canList ? "Add a bucket shared with you" : "Add a bucket"}
+              </button>
+            )
           )}
         </nav>
         <div className="sidebar-foot muted">
-          {canList ? `${buckets.length} bucket${buckets.length === 1 ? "" : "s"}` : `${manual.length} pinned`}
+          {canList
+            ? `${buckets.length} bucket${buckets.length === 1 ? "" : "s"}${shared.length ? ` · ${shared.length} shared` : ""}`
+            : `${shared.length} added`}
         </div>
       </div>
       <div
@@ -169,6 +241,21 @@ export function Sidebar() {
         onDoubleClick={split.reset}
       />
       <RecentFiles />
+      {menu && (
+        <PopupMenu
+          x={menu.x}
+          y={menu.y}
+          label={`Actions for ${menu.b.name}`}
+          onClose={() => setMenu(null)}
+          groups={[
+            [{ label: "Open", icon: <FolderOpen size={14} />, action: () => navigate(menu.b.name, "") }],
+            [{ label: "Bucket tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "bucketTags", bucket: menu.b.name }) }],
+            menu.b.shared
+              ? [{ label: "Remove from list…", icon: <ArchiveX size={14} />, action: () => openModal({ kind: "removeBucket", name: menu.b.name }) }]
+              : [],
+          ]}
+        />
+      )}
     </aside>
   );
 }

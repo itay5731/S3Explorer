@@ -1,9 +1,12 @@
-import { useEffect, useState, type ReactNode } from "react";
-import { ChevronRight, Copy, Download, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { ChevronRight, Copy, Download, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
-import { navigate, setDetailsOpen, useApp } from "../store/app";
-import { requestDelete } from "../store/ops";
+import { navigate, openModal, setDetailsOpen, useApp } from "../store/app";
+import { requestBulkTags, requestDelete } from "../store/ops";
+import { loadObjectTags, objectTagId, useTags } from "../store/tags";
+import { isDenied, permissionText } from "../store/toasts";
+import { TagChips } from "./TagEditor";
 import { copyText, downloadObjects } from "../store/actions";
 import { getSelected, useSelectionInfo } from "../store/view";
 import { displayName, formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
@@ -21,6 +24,51 @@ function Field({ label, children, mono, copy }: { label: string; children: React
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+/** The selected object's tags, read with get_object_tags when it is selected. */
+function ObjectTagsSection({ bucket, objKey }: { bucket: string; objKey: string }) {
+  const id = objectTagId(bucket, objKey);
+  const entry = useTags((s) => s.objects[id]);
+  // Read on every new selection, and again when the store drops the entry (a job may have changed it).
+  const missing = entry === undefined;
+  const readFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (readFor.current === id && !missing) return;
+    // Debounced like the metadata, so arrowing through rows doesn't read every object's tags.
+    const t = setTimeout(() => {
+      readFor.current = id;
+      void loadObjectTags(bucket, objKey);
+    }, 150);
+    return () => clearTimeout(t);
+  }, [bucket, objKey, id, missing]);
+  const unsupported = entry?.error?.code === "NotSupported";
+  const denied = isDenied(entry?.error);
+  return (
+    <div className="dsection">
+      <div className="dsection-title dsection-title-row">
+        <span>Tags</span>
+        {!unsupported && !denied && (
+          <button type="button" className="link-btn" onClick={() => openModal({ kind: "objectTags", bucket, key: objKey })} disabled={!entry?.tags}>
+            <Tags size={12} /> Edit tags
+          </button>
+        )}
+      </div>
+      {!entry ? (
+        <div className="muted small">
+          <Loader2 size={12} className="spin" /> Loading…
+        </div>
+      ) : unsupported ? (
+        <div className="muted small">This server doesn’t support tags.</div>
+      ) : entry.error ? (
+        <div className="inline-error">
+          <AlertCircle size={13} /> {denied ? `${permissionText("read tags")}.` : entry.error.message}
+        </div>
+      ) : (
+        <TagChips tags={entry.tags ?? []} />
+      )}
     </div>
   );
 }
@@ -101,6 +149,7 @@ export function DetailsPanel() {
             {obj.key}
           </Field>
         </div>
+        <ObjectTagsSection bucket={bucket} objKey={obj.key} />
         <div className="dsection">
           <button type="button" className="disclosure" onClick={() => setShowMore((v) => !v)} aria-expanded={showMore}>
             <ChevronRight size={14} className={showMore ? "rot90" : ""} /> More details
@@ -168,6 +217,11 @@ export function DetailsPanel() {
             <Trash2 size={14} /> Delete
           </button>
         </div>
+        <div className="dactions">
+          <button className="btn" onClick={() => requestBulkTags()}>
+            <Tags size={14} /> Edit tags of everything inside…
+          </button>
+        </div>
         <div className="dsection">
           <Field label="Prefix" mono copy={f.prefix}>
             {f.prefix}
@@ -201,6 +255,11 @@ export function DetailsPanel() {
           </div>
         )}
         {sel.folders > 0 && <p className="muted small dnote">Folders are skipped when downloading a selection.</p>}
+        <div className="dactions">
+          <button className="btn" onClick={() => requestBulkTags()}>
+            <Tags size={14} /> Edit tags for {(sel.folders + sel.objects).toLocaleString()} items…
+          </button>
+        </div>
         <div className="dactions">
           <button className="btn btn-danger-ghost" onClick={() => requestDelete()}>
             <Trash2 size={14} /> Delete {(sel.folders + sel.objects).toLocaleString()} items…

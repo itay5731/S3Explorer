@@ -4,8 +4,8 @@
 
 import type { Backend, FileDropEvent, Unlisten } from "./api";
 import type {
+  AddedBucket,
   AppError,
-  AppSettings,
   Bucket,
   ConnectionConfig,
   ConnectionInfo,
@@ -22,12 +22,15 @@ import type {
   RecentListing,
   SaveConnectionInput,
   SavedConnection,
+  Tag,
   Transfer,
   UpdateInfo,
   UpdateProgress,
 } from "./types";
-import { DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX } from "./types";
-import { planParts, validateAppSettings } from "./settings";
+import { JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { DEFAULT_SETTINGS, planParts, validateAppSettings, type Settings } from "./settings";
+import { parseBucketInput } from "./buckets";
+import { sameTagSet, validateTags } from "./tags";
 
 // ---- deterministic randomness ----------------------------------------------
 
@@ -71,12 +74,19 @@ interface MockObject {
   contentType: string;
   metadata: Record<string, string>;
   versionId: string | null;
+  tags?: Tag[];
 }
 
 interface MockBucket {
   creationDate: string;
   objects: Map<string, MockObject>;
   sorted: string[] | null; // cache, invalidated on mutation
+  /** Not returned by list_buckets: reachable only when added by name (a bucket shared from another account). */
+  hidden?: boolean;
+  /** Writes (uploads, new folders, copies into it, deletes, tag edits) are denied, like a read-only share. */
+  readOnly?: boolean;
+  /** Bucket tag set; undefined = no tag set. */
+  tags?: Tag[];
 }
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -95,8 +105,8 @@ function contentTypeFor(key: string): string {
 
 const buckets = new Map<string, MockBucket>();
 
-function addBucket(name: string, created: string): MockBucket {
-  const b: MockBucket = { creationDate: created, objects: new Map(), sorted: null };
+function createMockBucket(name: string, created: string, opts: { hidden?: boolean; readOnly?: boolean } = {}): MockBucket {
+  const b: MockBucket = { creationDate: created, objects: new Map(), sorted: null, ...opts };
   buckets.set(name, b);
   return b;
 }
@@ -105,7 +115,7 @@ function put(
   b: MockBucket,
   key: string,
   size: number,
-  opts: { ageDays?: number; storageClass?: string; metadata?: Record<string, string> } = {},
+  opts: { ageDays?: number; storageClass?: string; metadata?: Record<string, string>; tags?: Tag[] } = {},
 ) {
   const age = opts.ageDays ?? rand() * 400;
   b.objects.set(key, {
@@ -116,13 +126,16 @@ function put(
     contentType: key.endsWith("/") ? "application/x-directory" : contentTypeFor(key),
     metadata: opts.metadata ?? {},
     versionId: rand() > 0.6 ? hex(32) : null,
+    ...(opts.tags ? { tags: opts.tags } : {}),
   });
   b.sorted = null;
 }
 
+const tagList = (o: Record<string, string>): Tag[] => Object.entries(o).map(([key, value]) => ({ key, value }));
+
 function seed() {
   // 1. acme-prod-assets: mixed media, unicode names, nested folders
-  const assets = addBucket("acme-prod-assets", "2021-03-14T09:12:44Z");
+  const assets = createMockBucket("acme-prod-assets", "2021-03-14T09:12:44Z");
   for (const f of ["index.html", "robots.txt", "favicon.ico", "manifest.json"]) put(assets, f, between(300, 40 * KB));
   const products = ["sneaker", "backpack", "jacket", "watch", "headphones", "lamp", "mug", "notebook"];
   for (let i = 0; i < 140; i++) {
@@ -168,7 +181,7 @@ function seed() {
   put(assets, "staging/batch-2/new-2.txt", 222, { ageDays: 1 });
 
   // 2. acme-logs: the 5,000-object folder (virtualization stress test)
-  const logs = addBucket("acme-logs", "2022-07-01T00:00:00Z");
+  const logs = createMockBucket("acme-logs", "2022-07-01T00:00:00Z");
   for (let i = 0; i < 5000; i++) {
     const day = String(1 + Math.floor(i / 200)).padStart(2, "0");
     const hour = String(Math.floor((i % 200) / 8.4)).padStart(2, "0");
@@ -195,7 +208,7 @@ function seed() {
   put(logs, "cloudfront/2026-10/", 0, { ageDays: 31 });
 
   // 3. data-lake-raw: partitioned parquet
-  const lake = addBucket("data-lake-raw", "2023-02-10T15:30:00Z");
+  const lake = createMockBucket("data-lake-raw", "2023-02-10T15:30:00Z");
   for (const month of ["07", "08", "09", "10"]) {
     for (let i = 0; i < 48; i++) {
       put(lake, `events/year=2026/month=${month}/part-${String(i).padStart(5, "0")}-${hex(8)}.snappy.parquet`, between(20 * MB, 260 * MB), {
@@ -207,14 +220,14 @@ function seed() {
   put(lake, "exports/customers 2026-09.csv", 412_888_123, { ageDays: 8 });
 
   // 4. website-static
-  const web = addBucket("website-static", "2020-11-02T08:00:00Z");
+  const web = createMockBucket("website-static", "2020-11-02T08:00:00Z");
   for (const f of ["index.html", "about.html", "pricing.html", "404.html", "sitemap.xml"]) put(web, f, between(2 * KB, 80 * KB));
   for (let i = 0; i < 18; i++) put(web, `assets/js/chunk-${hex(8)}.js`, between(10 * KB, 900 * KB));
   for (let i = 0; i < 6; i++) put(web, `assets/css/style-${hex(8)}.css`, between(5 * KB, 120 * KB));
   for (const f of ["inter-var.woff2", "jetbrains-mono.woff2"]) put(web, `assets/fonts/${f}`, between(80 * KB, 400 * KB));
 
   // 5. backups-archive: cold storage
-  const backups = addBucket("backups-archive", "2019-05-20T22:10:00Z");
+  const backups = createMockBucket("backups-archive", "2019-05-20T22:10:00Z");
   for (let i = 0; i < 26; i++) {
     put(backups, `postgres/prod/pg_dump_2026-${String(1 + (i % 9)).padStart(2, "0")}-${String(1 + i).padStart(2, "0")}.sql.gz`, between(2 * GB, 14 * GB), {
       storageClass: i < 20 ? "DEEP_ARCHIVE" : "GLACIER",
@@ -222,8 +235,38 @@ function seed() {
     });
   }
   for (let i = 0; i < 12; i++) put(backups, `configs/etc-${2025 + Math.floor(i / 6)}-${i}.tar`, between(1 * MB, 30 * MB), { storageClass: "GLACIER_IR" });
+
+  // ---- v0.4.0: tags, shared buckets, a server without tagging ----
+  assets.tags = tagList({ team: "web", env: "prod", "cost-center": "4410" });
+  logs.tags = tagList({ team: "platform", retention: "90d" });
+  const tagged = (key: string, t: Record<string, string>) => {
+    const o = assets.objects.get(key);
+    if (o) o.tags = tagList(t);
+  };
+  tagged("docs/quarterly report Q3 2026.pdf", { project: "q3-report", owner: "finance", confidential: "yes" });
+  tagged("docs/brand guidelines v4.pdf", { owner: "design" });
+  tagged("images/logo.svg", { owner: "design", usage: "public" });
+  // Nine tags: a bulk merge that adds two new keys pushes it over the limit of ten.
+  tagged("mixed/ok-1.txt", { a: "1", b: "2", c: "3", d: "4", e: "5", f: "6", g: "7", h: "8", i: "9" });
+
+  // Shared from other accounts: not in list_buckets, reachable once added by name.
+  const shared = createMockBucket("partner-shared-data", "2024-04-02T10:00:00Z", { hidden: true });
+  for (let i = 0; i < 14; i++) put(shared, `exchange/inbound/batch-${String(i + 1).padStart(3, "0")}.csv`, between(20 * KB, 4 * MB), { ageDays: i });
+  for (let i = 0; i < 6; i++) put(shared, `exchange/outbound/report-${i + 1}.pdf`, between(100 * KB, 2 * MB), { ageDays: 2 + i });
+  put(shared, "exchange/", 0, { ageDays: 300 });
+  put(shared, "README.md", 2_380, { ageDays: 300, tags: tagList({ owner: "partner" }) });
+  const feed = createMockBucket("vendor-readonly-feed", "2023-09-15T06:30:00Z", { hidden: true, readOnly: true });
+  for (let i = 0; i < 20; i++) put(feed, `prices/2026-10-${String(1 + (i % 6)).padStart(2, "0")}/prices-${i}.json`, between(5 * KB, 300 * KB), { ageDays: 6 - (i % 6) });
+  put(feed, "LICENSE.txt", 1_100, { ageDays: 700 });
+
+  // A bucket on a server that doesn't implement tagging (MinIO-style): tags return NotSupported.
+  const legacy = createMockBucket("legacy-minio-backups", "2018-02-01T12:00:00Z");
+  for (let i = 0; i < 8; i++) put(legacy, `nightly/backup-${i + 1}.tar.gz`, between(10 * MB, 400 * MB), { ageDays: 8 - i });
 }
 seed();
+
+/** Mock switch for tags: buckets whose name starts with "legacy-" behave like a server without tagging. */
+const tagsUnsupported = (bucket: string) => bucket.startsWith("legacy-");
 
 function sortedKeys(b: MockBucket): string[] {
   if (!b.sorted) b.sorted = [...b.objects.keys()].sort();
@@ -253,6 +296,8 @@ const profiles: ProfileInfo[] = [
 ];
 
 let connection: ConnectionInfo | null = null;
+/** The connection identity added buckets are stored under (see "Shared buckets" in docs/CONTRACT.md). */
+let connectionKey: string | null = null;
 
 const withScheme = (e: string | null | undefined) =>
   !e ? null : /^[a-z][a-z0-9+.-]*:\/\//i.test(e) ? e : `https://${e}`;
@@ -269,6 +314,64 @@ function requireBucket(name: string): MockBucket {
   return b;
 }
 
+const DENIED_WRITE = "AccessDenied: Access Denied. These credentials can read this bucket but not change it (mock: read-only share).";
+
+function requireWritable(name: string): MockBucket {
+  const b = requireBucket(name);
+  if (b.readOnly) throw fail("AccessDenied", DENIED_WRITE.slice("AccessDenied: ".length));
+  return b;
+}
+
+// ---- shared buckets (added by name) ------------------------------------------------------
+// The backend keeps added-buckets.json keyed by connection identity; the mock keeps the same map in
+// localStorage. Mock switches for add_bucket: a name containing "missing" → NoSuchBucket, one
+// containing "denied" → AccessDenied. Any other valid name that the mock doesn't know yet is
+// created as a small hidden bucket, so every name can be tried.
+
+const MOCK_ADDED_KEY = "s3x.mock.addedBuckets";
+
+function loadAdded(): Record<string, AddedBucket[]> {
+  try {
+    const raw = localStorage.getItem(MOCK_ADDED_KEY);
+    const v: unknown = raw ? JSON.parse(raw) : {};
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, AddedBucket[]>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveAdded(all: Record<string, AddedBucket[]>) {
+  try {
+    localStorage.setItem(MOCK_ADDED_KEY, JSON.stringify(all));
+  } catch {
+    /* in memory only */
+  }
+}
+
+function addedForConnection(): AddedBucket[] {
+  requireConnection();
+  return [...(loadAdded()[connectionKey ?? ""] ?? [])].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// ---- tags --------------------------------------------------------------------------------
+
+/** Every tag write the mock received, verbatim, for test inspection. */
+const tagCallLog: { cmd: string; bucket: string; key: string | null; tags: Tag[]; expected: Tag[]; at: string }[] = [];
+
+function checkTagWrite(tags: Tag[], expected: Tag[], max: number) {
+  if (!Array.isArray(tags) || !Array.isArray(expected)) throw fail("InvalidInput", "tags and expected must be lists");
+  const v = validateTags(tags, max);
+  if (!v.valid) {
+    const i = v.rows.findIndex((r) => r.key || r.value);
+    const msg = v.set ?? (i >= 0 ? `tags[${i}]: ${v.rows[i].key ?? v.rows[i].value}` : "invalid tags");
+    throw fail("InvalidInput", msg);
+  }
+}
+
+const notSupported = () => fail("NotSupported", "This server does not support tagging (NotImplemented).");
+const conflict = () => fail("Conflict", "The tags were changed by someone else since they were loaded. Nothing was saved.");
+const copyTags = (tags: Tag[] | undefined): Tag[] => (tags ?? []).map((t) => ({ ...t }));
+
 // ---- settings ------------------------------------------------------------------
 // The real backend persists settings.json in the app config dir; the mock keeps them in
 // localStorage (mock-only key) so a page reload behaves like an app restart.
@@ -276,20 +379,20 @@ function requireBucket(name: string): MockBucket {
 const MOCK_SETTINGS_KEY = "s3x.mock.settings";
 
 /** Like the backend: missing fields (e.g. a v0.2.0 three-field value) take their defaults. */
-function loadMockSettings(): AppSettings {
+function loadMockSettings(): Settings {
   try {
     const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
     if (raw) {
-      const merged = { ...DEFAULT_APP_SETTINGS, ...(JSON.parse(raw) as Partial<AppSettings>) };
+      const merged = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<Settings>) };
       if (!validateAppSettings(merged)) return merged;
     }
   } catch {
     /* fall back to defaults */
   }
-  return { ...DEFAULT_APP_SETTINGS };
+  return { ...DEFAULT_SETTINGS };
 }
 
-let settings: AppSettings = loadMockSettings();
+let settings: Settings = loadMockSettings();
 
 // ---- saved connections ---------------------------------------------------------------
 // Metadata is kept in localStorage (mock-only key) like the backend's connections.json.
@@ -554,6 +657,19 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
 // Test hook (mock only): inspect requests and the in-memory tree from a driver script.
 (globalThis as Record<string, unknown>).__s3xMock = {
   jobCalls: jobCallLog,
+  tagCalls: tagCallLog,
+  objectTags: (bucket: string, key: string) => copyTags(buckets.get(bucket)?.objects.get(key)?.tags),
+  bucketTags: (bucket: string) => copyTags(buckets.get(bucket)?.tags),
+  /** Change tags behind the UI's back (simulates another client), to exercise Conflict. */
+  setObjectTags: (bucket: string, key: string, tags: Tag[]) => {
+    const o = buckets.get(bucket)?.objects.get(key);
+    if (o) o.tags = tags.length ? copyTags(tags) : undefined;
+  },
+  setBucketTags: (bucket: string, tags: Tag[]) => {
+    const b = buckets.get(bucket);
+    if (b) b.tags = tags.length ? copyTags(tags) : undefined;
+  },
+  added: () => loadAdded(),
   has: (bucket: string, key: string) => !!buckets.get(bucket)?.objects.has(key),
   size: (bucket: string, key: string) => buckets.get(bucket)?.objects.get(key)?.size ?? null,
   keys: (bucket: string, prefix: string) => {
@@ -578,8 +694,20 @@ const invalid = (message: string) => fail("InvalidInput", message);
 /** Contract validation. Throws InvalidInput (nothing is changed). */
 function validateJobRequest(req: JobRequest) {
   requireConnection();
-  if (!req || (req.kind !== "delete" && req.kind !== "copy" && req.kind !== "move")) {
-    throw invalid("kind must be one of delete, copy, move");
+  if (!req || (req.kind !== "delete" && req.kind !== "copy" && req.kind !== "move" && req.kind !== "tag")) {
+    throw invalid("kind must be one of delete, copy, move, tag");
+  }
+  if (req.kind === "tag") {
+    const op = req.tags;
+    if (!op) throw invalid("tags is required for kind tag");
+    if (op.mode !== "merge" && op.mode !== "replace") throw invalid("tags.mode must be merge or replace");
+    if (!Array.isArray(op.set) || !Array.isArray(op.remove)) throw invalid("tags.set and tags.remove must be lists");
+    const v = validateTags(op.set, TAG_LIMITS.objectMaxTags);
+    if (!v.valid) throw invalid(`tags.set: ${v.set ?? v.rows.map((r) => r.key ?? r.value).find(Boolean)}`);
+    if (op.mode === "replace" && op.remove.length) throw invalid("tags.remove must be empty for replace");
+    if (op.remove.some((k) => typeof k !== "string" || !k)) throw invalid("tags.remove: keys must not be empty");
+  } else if (req.tags != null) {
+    throw invalid(`tags is only allowed for kind tag`);
   }
   if (!Array.isArray(req.items) || req.items.length === 0) throw invalid("items must not be empty");
   if (req.items.length > JOB_MAX_ITEMS) {
@@ -587,12 +715,12 @@ function validateJobRequest(req: JobRequest) {
   }
   if (req.onConflict !== "overwrite" && req.onConflict !== "skip") throw invalid("onConflict must be overwrite or skip");
   requireBucket(req.srcBucket);
-  const transfer = req.kind !== "delete";
+  const transfer = req.kind === "copy" || req.kind === "move";
   if (transfer) {
     if (!req.destBucket) throw invalid(`destBucket is required for ${req.kind}`);
     requireBucket(req.destBucket);
   } else if (req.destBucket != null) {
-    throw invalid("destBucket must be null for delete");
+    throw invalid(`destBucket must be null for ${req.kind}`);
   }
   const sameBucket = transfer && req.destBucket === req.srcBucket;
   const dests: { to: string; isPrefix: boolean; i: number }[] = [];
@@ -604,7 +732,7 @@ function validateJobRequest(req: JobRequest) {
       if (!it.from.endsWith("/")) throw invalid(`${at}.from must end with "/" when isPrefix is true`);
     }
     if (!transfer) {
-      if (it.to != null) throw invalid(`${at}.to must be null for delete`);
+      if (it.to != null) throw invalid(`${at}.to must be null for ${req.kind}`);
       return;
     }
     if (it.to == null) throw invalid(`${at}.to is required for ${req.kind}`);
@@ -650,7 +778,7 @@ const destKeyOf = (it: JobItem, key: string): string | null =>
 function previewJobSync(req: JobRequest): JobPreview {
   validateJobRequest(req);
   const src = buckets.get(req.srcBucket)!;
-  const dest = req.kind === "delete" ? null : buckets.get(req.destBucket!)!;
+  const dest = req.kind === "copy" || req.kind === "move" ? buckets.get(req.destBucket!)! : null;
   let objects = 0;
   let bytes = 0;
   let conflicts = 0;
@@ -690,6 +818,7 @@ function jobLabel(req: JobRequest): string {
   const first = req.items[0];
   const what = n === 1 ? leafOf(first.from) || first.from : `${n.toLocaleString("en-US")} items`;
   if (req.kind === "delete") return `Delete ${what}`;
+  if (req.kind === "tag") return `${req.tags?.mode === "replace" ? "Replace tags of" : "Edit tags of"} ${what}`;
   if (n === 1 && req.kind === "move" && req.destBucket === req.srcBucket && first.to && parentOf(first.to) === parentOf(first.from)) {
     return `Rename ${what} to ${leafOf(first.to)}`;
   }
@@ -706,7 +835,7 @@ function startJobSync(req: JobRequest): string {
     id,
     kind: req.kind,
     srcBucket: req.srcBucket,
-    destBucket: req.kind === "delete" ? null : req.destBucket,
+    destBucket: req.kind === "copy" || req.kind === "move" ? req.destBucket : null,
     label: jobLabel(req),
     phase: "listing",
     totalItems: 0,
@@ -762,7 +891,8 @@ function listStep(sim: JobSim, budget: number): boolean {
     sim.seenSrc.add(key);
     sim.work.push({ src: key, dest: destKeyOf(it, key) });
     sim.job.totalItems++;
-    sim.job.totalBytes += src.objects.get(key)?.size ?? 0;
+    // A tag job moves no data: its byte counters stay 0.
+    if (sim.req.kind !== "tag") sim.job.totalBytes += src.objects.get(key)?.size ?? 0;
   };
   while (budget > 0) {
     if (sim.listing) {
@@ -811,10 +941,40 @@ function workOne(sim: JobSim, w: JobWork) {
     return;
   }
   if (sim.req.kind === "delete") {
+    if (src.readOnly) {
+      jobError(sim, w.src, DENIED_WRITE);
+      return;
+    }
     src.objects.delete(w.src);
     src.sorted = null;
     j.doneItems++;
     j.doneBytes += o.size;
+    return;
+  }
+  if (sim.req.kind === "tag") {
+    const op = sim.req.tags!;
+    if (tagsUnsupported(sim.req.srcBucket)) {
+      jobError(sim, w.src, "NotSupported: This server does not support object tagging.");
+      return;
+    }
+    if (src.readOnly) {
+      jobError(sim, w.src, "AccessDenied: Access Denied for s3:PutObjectTagging on this key.");
+      return;
+    }
+    let next: Tag[];
+    if (op.mode === "replace") next = copyTags(op.set);
+    else {
+      const m = new Map((o.tags ?? []).map((t) => [t.key, t.value]));
+      for (const k of op.remove) m.delete(k);
+      for (const t of op.set) m.set(t.key, t.value);
+      next = [...m].map(([key, value]) => ({ key, value }));
+    }
+    if (next.length > TAG_LIMITS.objectMaxTags) {
+      jobError(sim, w.src, `would have ${next.length} tags; the limit is ${TAG_LIMITS.objectMaxTags}`);
+      return;
+    }
+    o.tags = next.length ? next : undefined;
+    j.doneItems++;
     return;
   }
   if (w.src.includes("fail-copy")) {
@@ -826,6 +986,10 @@ function workOne(sim: JobSim, w: JobWork) {
     return;
   }
   const dest = buckets.get(sim.req.destBucket!)!;
+  if (dest.readOnly) {
+    jobError(sim, w.src, DENIED_WRITE);
+    return;
+  }
   if (dest.objects.has(w.dest!) && sim.req.onConflict === "skip") {
     // Left untouched; in a move the source is NOT deleted.
     j.skippedItems++;
@@ -834,6 +998,8 @@ function workOne(sim: JobSim, w: JobWork) {
   dest.objects.set(w.dest!, {
     ...o,
     metadata: { ...o.metadata },
+    // Tags are carried over by a copy.
+    tags: o.tags ? copyTags(o.tags) : undefined,
     lastModified: new Date().toISOString(),
     etag: hex(32),
     versionId: null,
@@ -841,6 +1007,11 @@ function workOne(sim: JobSim, w: JobWork) {
   dest.sorted = null;
   // Move: the source is deleted only after its own copy succeeded, object by object.
   if (sim.req.kind === "move") {
+    if (src.readOnly) {
+      j.doneBytes += o.size;
+      jobError(sim, w.src, "AccessDenied: The copy exists, but the original remains: deleting it was denied.");
+      return;
+    }
     src.objects.delete(w.src);
     src.sorted = null;
   }
@@ -902,6 +1073,7 @@ export const mockBackend: Backend = {
       const p = profiles.find((x) => x.name === config.profile);
       if (!p) throw fail("InvalidInput", `Profile “${config.profile}” not found in ~/.aws/config.`);
       if (!p.hasCredentials) throw fail("Auth", `Profile “${p.name}” has no credentials. Run “aws sso login --profile ${p.name}”.`);
+      connectionKey = `profile:${p.name}@${withScheme(config.endpoint) ?? (p.name === "minio-local" ? "http://localhost:9000" : "aws")}`;
       connection = {
         label: p.name,
         region: config.region || p.region || "us-east-1",
@@ -913,6 +1085,7 @@ export const mockBackend: Backend = {
         throw fail("InvalidInput", "Access key ID and secret access key are required.");
       }
       if (config.secretAccessKey === "bad") throw fail("Auth", "The AWS access key ID or signature you provided is invalid.");
+      connectionKey = `static:${config.accessKeyId.trim()}@${withScheme(config.endpoint) ?? "aws"}`;
       connection = {
         label: config.accessKeyId.slice(0, 4) + "…" + config.accessKeyId.slice(-4),
         region: config.region || "us-east-1",
@@ -926,6 +1099,7 @@ export const mockBackend: Backend = {
   async disconnect() {
     await delay(60);
     connection = null;
+    connectionKey = null;
   },
 
   async connectionStatus() {
@@ -937,7 +1111,93 @@ export const mockBackend: Backend = {
     await latency();
     const c = requireConnection();
     if (!c.canListBuckets) throw fail("AccessDenied", "Access Denied: s3:ListAllMyBuckets is not allowed for this identity.");
-    return [...buckets.entries()].map(([name, b]) => ({ name, creationDate: b.creationDate }));
+    return [...buckets.entries()].filter(([, b]) => !b.hidden).map(([name, b]) => ({ name, creationDate: b.creationDate }));
+  },
+
+  async listAddedBuckets() {
+    await latency();
+    return addedForConnection();
+  },
+
+  async addBucket(input) {
+    await delay(300 + rand() * 300);
+    requireConnection();
+    const parsed = parseBucketInput(typeof input === "string" ? input : "");
+    if (!parsed.ok) throw fail("InvalidInput", parsed.error);
+    const name = parsed.name;
+    const all = loadAdded();
+    const list = all[connectionKey ?? ""] ?? [];
+    const existing = list.find((a) => a.name === name);
+    if (existing) return { ...existing };
+    if (name.includes("missing")) throw fail("NoSuchBucket", `The bucket “${name}” does not exist (HeadBucket returned 404).`);
+    if (name.includes("denied")) {
+      throw fail("AccessDenied", `The bucket “${name}” exists, but these credentials can’t list it (s3:ListBucket was denied).`);
+    }
+    if (!buckets.has(name)) {
+      // Unknown to the mock: make it exist, with a few files, as if it were shared from elsewhere.
+      const b = createMockBucket(name, new Date(NOW - 40 * DAY).toISOString(), { hidden: true });
+      for (let i = 0; i < 5; i++) put(b, `shared/file-${i + 1}.txt`, between(1 * KB, 90 * KB), { ageDays: i });
+    }
+    const added: AddedBucket = {
+      name,
+      region: connection?.endpoint ? null : name.startsWith("vendor-") ? "eu-central-1" : (connection?.region ?? "us-east-1"),
+      addedAt: new Date().toISOString(),
+    };
+    all[connectionKey ?? ""] = [...list, added];
+    saveAdded(all);
+    return { ...added };
+  },
+
+  async removeAddedBucket(name) {
+    await delay(80);
+    requireConnection();
+    const all = loadAdded();
+    const key = connectionKey ?? "";
+    all[key] = (all[key] ?? []).filter((a) => a.name !== name);
+    saveAdded(all);
+  },
+
+  async getBucketTags(bucket) {
+    await latency();
+    const b = requireBucket(bucket);
+    if (tagsUnsupported(bucket)) throw notSupported();
+    if (b.hidden) throw fail("AccessDenied", "Access Denied: s3:GetBucketTagging is not allowed on a bucket shared with you.");
+    return copyTags(b.tags);
+  },
+
+  async putBucketTags(bucket, tags, expected) {
+    await latency();
+    tagCallLog.push({ cmd: "put_bucket_tags", bucket, key: null, tags: copyTags(tags), expected: copyTags(expected), at: new Date().toISOString() });
+    const b = requireBucket(bucket);
+    if (tagsUnsupported(bucket)) throw notSupported();
+    if (b.hidden) throw fail("AccessDenied", "Access Denied: s3:PutBucketTagging is not allowed on a bucket shared with you.");
+    checkTagWrite(tags, expected, TAG_LIMITS.bucketMaxTags);
+    if (!sameTagSet(b.tags ?? [], expected)) throw conflict();
+    b.tags = tags.length ? copyTags(tags) : undefined;
+    return copyTags(b.tags);
+  },
+
+  async getObjectTags(bucket, key) {
+    await latency();
+    const b = requireBucket(bucket);
+    if (tagsUnsupported(bucket)) throw notSupported();
+    const o = b.objects.get(key);
+    if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
+    return copyTags(o.tags);
+  },
+
+  async putObjectTags(bucket, key, tags, expected) {
+    await latency();
+    tagCallLog.push({ cmd: "put_object_tags", bucket, key, tags: copyTags(tags), expected: copyTags(expected), at: new Date().toISOString() });
+    const b = requireBucket(bucket);
+    if (tagsUnsupported(bucket)) throw notSupported();
+    const o = b.objects.get(key);
+    if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
+    if (b.readOnly) throw fail("AccessDenied", "Access Denied: s3:PutObjectTagging is not allowed on this bucket.");
+    checkTagWrite(tags, expected, TAG_LIMITS.objectMaxTags);
+    if (!sameTagSet(o.tags ?? [], expected)) throw conflict();
+    o.tags = tags.length ? copyTags(tags) : undefined;
+    return copyTags(o.tags);
   },
 
   async listObjects(bucket, prefix, continuationToken, pageSize): Promise<ListPage> {
@@ -1026,7 +1286,7 @@ export const mockBackend: Backend = {
 
   async createFolder(bucket, prefix) {
     await latency();
-    const b = requireBucket(bucket);
+    const b = requireWritable(bucket);
     if (!prefix || prefix === "/") throw fail("InvalidInput", "Folder prefix must not be empty.");
     const p = prefix.endsWith("/") ? prefix : prefix + "/";
     put(b, p, 0, { ageDays: 0 });
@@ -1047,8 +1307,9 @@ export const mockBackend: Backend = {
   async startUpload(bucket, key, srcPath) {
     await delay(40);
     if (!key || key.endsWith("/")) throw fail("InvalidInput", "Key must name an object, not a folder.");
-    requireBucket(bucket);
-    return startSim("upload", bucket, key, srcPath, fakeSize(srcPath));
+    const b = requireBucket(bucket);
+    // Like S3: the upload is accepted and then fails when PutObject is denied.
+    return startSim("upload", bucket, key, srcPath, fakeSize(srcPath), b.readOnly ? DENIED_WRITE : undefined);
   },
 
   async cancelTransfer(id) {
@@ -1131,7 +1392,8 @@ export const mockBackend: Backend = {
 
   async updateSettings(next) {
     await delay(120);
-    const candidate: AppSettings = {
+    const n = next as Partial<Settings>;
+    const candidate: Settings = {
       partSizeMib: next.partSizeMib,
       maxConcurrentParts: next.maxConcurrentParts,
       maxConcurrentTransfers: next.maxConcurrentTransfers,
@@ -1141,6 +1403,8 @@ export const mockBackend: Backend = {
       textSize: next.textSize,
       textWeight: next.textWeight,
       accent: next.accent,
+      // Required like every other field (the real backend rejects a request without it).
+      confirmCopyMove: n.confirmCopyMove as boolean,
     };
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
@@ -1247,6 +1511,7 @@ export const mockBackend: Backend = {
     c.lastUsedAt = new Date().toISOString();
     persistConnections();
     connection = { ...info, label: c.name };
+    connectionKey = c.id;
     return { ...connection };
   },
 

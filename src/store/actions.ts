@@ -1,10 +1,10 @@
 // User-level operations that combine API calls, state and toasts.
 
 import * as api from "../lib/api";
-import type { AppError, ObjectEntry } from "../lib/types";
+import type { AppError, ObjectEntry, Transfer } from "../lib/types";
 import { basename, joinKey, sanitizeFileName, uniqueFileName } from "../lib/format";
 import { refresh, setTransfersOpen, useApp, upsertListedFolder, upsertListedObject } from "./app";
-import { toast } from "./toasts";
+import { isDenied, toast, toastDenied, toastFailure } from "./toasts";
 import { notifyInBackground } from "./notify";
 import { scheduleTransferResync, onTransferFinished, selectActiveCount, useTransfers } from "./transfers";
 
@@ -22,7 +22,7 @@ export async function uploadPaths(paths: string[]) {
       await api.startUpload(bucket, key, path);
       started++;
     } catch (e) {
-      toast.error(`Could not upload ${basename(path)}`, e as AppError);
+      toastFailure(`Could not upload ${basename(path)}`, e as AppError, "upload files");
     }
   }
   if (started) {
@@ -63,7 +63,7 @@ export async function downloadObjects(objects: ObjectEntry[]) {
           await api.startDownload(bucket, obj.key, await api.joinPath(dir, local));
         } catch (e) {
           failed++;
-          toast.error(`Could not download ${obj.name}`, e as AppError);
+          toastFailure(`Could not download ${obj.name}`, e as AppError, "download files");
         }
       }
       if (failed < objects.length) toast.info(`Downloading ${objects.length - failed} files`, dir);
@@ -71,7 +71,7 @@ export async function downloadObjects(objects: ObjectEntry[]) {
     setTransfersOpen(true);
     scheduleTransferResync();
   } catch (e) {
-    toast.error("Download failed", e as AppError);
+    toastFailure("Download failed", e as AppError, "download files");
   }
 }
 
@@ -85,7 +85,7 @@ export async function createFolder(name: string): Promise<boolean> {
     refresh();
     return true;
   } catch (e) {
-    toast.error("Could not create folder", e as AppError);
+    toastFailure("Could not create folder", e as AppError, "create folders");
     return false;
   }
 }
@@ -106,15 +106,38 @@ export async function copyText(text: string, what: string) {
   toast.success(`${what} copied`, text);
 }
 
+/**
+ * Transfers that finished since the queue last drained, reported in one OS notification. Several
+ * transfers often finish in the same frame; each would otherwise see an empty queue and notify.
+ */
+let drained: Transfer[] = [];
+let drainScheduled = false;
+
+function notifyDrained() {
+  drainScheduled = false;
+  const done = drained;
+  drained = [];
+  if (!done.length || selectActiveCount(useTransfers.getState()) > 0) return;
+  const failed = done.filter((t) => t.status === "failed").length;
+  const title = failed ? (failed === 1 ? "Transfer failed" : `${failed} transfers failed`) : "Transfers finished";
+  const body = done.length === 1 ? basename(done[0].key) : `${done.length} transfers${failed ? `, ${failed} failed` : ""}`;
+  notifyInBackground(title, body);
+}
+
 /** Keep the listing in sync with finished uploads and surface failures. */
 export function installTransferEffects(): () => void {
   return onTransferFinished((t) => {
     // One notification when the queue drains, not one per file.
-    if (t.status !== "cancelled" && selectActiveCount(useTransfers.getState()) === 0) {
-      notifyInBackground(t.status === "failed" ? "Transfer failed" : "Transfers finished", basename(t.key));
+    if (t.status !== "cancelled") {
+      drained.push(t);
+      if (selectActiveCount(useTransfers.getState()) === 0 && !drainScheduled) {
+        drainScheduled = true;
+        queueMicrotask(notifyDrained);
+      }
     }
     if (t.status === "failed") {
-      toast.error(`${t.kind === "upload" ? "Upload" : "Download"} failed: ${basename(t.key)}`, t.error ?? undefined);
+      if (isDenied(t.error)) toastDenied(t.kind === "upload" ? "upload files" : "download files", t.error ?? undefined);
+      else toast.error(`${t.kind === "upload" ? "Upload" : "Download"} failed: ${basename(t.key)}`, t.error ?? undefined);
       return;
     }
     if (t.status !== "completed" || t.kind !== "upload") return;

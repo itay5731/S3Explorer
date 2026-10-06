@@ -1,8 +1,11 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { AlertCircle, AlertTriangle, ArrowRight, ClipboardPaste, FolderPlus, Loader2, PencilLine, RotateCw, Trash2 } from "lucide-react";
+import { AlertCircle, AlertTriangle, ArrowRight, ClipboardPaste, FolderPlus, Loader2, LogOut, PencilLine, RotateCw, Trash2 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ConflictPolicy, JobPreview, JobRequest } from "../lib/types";
-import { openModal, useApp, type RenameTarget } from "../store/app";
+import { BUCKETLESS_MODALS, disconnect, openModal, useApp, type RenameTarget } from "../store/app";
+import { isDenied, permissionText } from "../store/toasts";
+import { AddBucketModal, RemoveBucketModal } from "./BucketDialogs";
+import { BucketTagsModal, BulkTagsModal, ObjectTagsModal } from "./TagDialogs";
 import { createFolder } from "../store/actions";
 import { startConfirmedJob } from "../store/ops";
 import { joinKey, s3Uri, validateFolderName } from "../lib/format";
@@ -14,7 +17,7 @@ const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([
  * Dialog frame: Esc / backdrop close (unless busy), focus trapped inside, focus restored to
  * the element that opened it. The first element marked `data-autofocus` gets initial focus.
  */
-function ModalShell({
+export function ModalShell({
   children,
   onClose,
   busy,
@@ -161,7 +164,7 @@ const PREVIEW_LOADING: PreviewState = { status: "loading" };
  * until the result for the current `request` arrives this returns "loading", never the result
  * of a previous request (state set by an effect lags the render that changed `request`).
  */
-function usePreview(request: JobRequest | null, delayMs = 0): [PreviewState | null, () => void] {
+export function usePreview(request: JobRequest | null, delayMs = 0): [PreviewState | null, () => void] {
   const [tagged, setTagged] = useState<{ request: JobRequest; attempt: number; state: PreviewState } | null>(null);
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
@@ -186,8 +189,15 @@ function usePreview(request: JobRequest | null, delayMs = 0): [PreviewState | nu
   return [state, () => setAttempt((n) => n + 1)];
 }
 
+const PREVIEW_ACTION: Record<string, string> = {
+  delete: "delete files",
+  copy: "copy files",
+  move: "move files",
+  tag: "change tags",
+};
+
 /** The preview line: spinner while counting, the error (with retry), or "N objects, X GiB". */
-function PreviewLine({ state, retry, verb }: { state: PreviewState | null; retry: () => void; verb: string }) {
+export function PreviewLine({ state, retry, verb }: { state: PreviewState | null; retry: () => void; verb: string }) {
   if (!state) return null;
   if (state.status === "loading") {
     return (
@@ -202,7 +212,10 @@ function PreviewLine({ state, retry, verb }: { state: PreviewState | null; retry
         <AlertCircle size={14} />
         <div className="grow">
           <div>
-            <strong>Couldn’t check what this would {verb}.</strong> Nothing has been changed.
+            <strong>
+              {isDenied(state.error) ? `${permissionText(PREVIEW_ACTION[verb] ?? `${verb} files`)}.` : `Couldn’t check what this would ${verb}.`}
+            </strong>{" "}
+            Nothing has been changed.
           </div>
           <div>{state.error.message}</div>
         </div>
@@ -216,7 +229,8 @@ function PreviewLine({ state, retry, verb }: { state: PreviewState | null; retry
   return (
     <div className="preview-line" role="status">
       <span>
-        This will {verb} <strong>{previewSummary(p)}</strong>
+        This will {verb}{" "}
+        <strong>{verb === "tag" ? `${p.truncated ? "at least " : ""}${plural(p.objects, "object")}` : previewSummary(p)}</strong>
         {p.truncated ? <span className="muted"> (counting stopped there)</span> : null}.
       </span>
     </div>
@@ -224,8 +238,8 @@ function PreviewLine({ state, retry, verb }: { state: PreviewState | null; retry
 }
 
 /** Exact keys/prefixes as they will be sent: monospace, untruncated, selectable. */
-function KeyList({ request, label }: { request: JobRequest; label: string }) {
-  const withDest = request.kind !== "delete";
+export function KeyList({ request, label }: { request: JobRequest; label: string }) {
+  const withDest = request.kind === "copy" || request.kind === "move";
   return (
     <div className="key-list-wrap">
       <div className="key-list-head">
@@ -467,12 +481,14 @@ function PasteModal({
   srcPrefix,
   destPrefix,
   renamed,
+  clearCut,
 }: {
   request: JobRequest;
   mode: "copy" | "cut";
   srcPrefix: string;
   destPrefix: string;
   renamed: boolean;
+  clearCut: boolean;
 }) {
   const [state, retry] = usePreview(request);
   const [policy, setPolicy] = useState<ConflictPolicy | null>(null);
@@ -494,7 +510,7 @@ function PasteModal({
   const confirm = async () => {
     if (!canStart) return;
     setBusy(true);
-    const id = await startConfirmedJob(finalRequest, { clearCut: move });
+    const id = await startConfirmedJob(finalRequest, { clearCut });
     setBusy(false);
     if (id) close();
   };
@@ -571,11 +587,62 @@ function PasteModal({
   );
 }
 
+// ---- disconnect while work is running ------------------------------------------------------
+
+function DisconnectModal({ running }: { running: number }) {
+  const titleId = useId();
+  const close = () => openModal(null);
+  return (
+    <ModalShell onClose={close} labelledBy={titleId}>
+      <div className="modal-head">
+        <div className="modal-icon danger">
+          <LogOut size={18} />
+        </div>
+        <div>
+          <h2 id={titleId}>
+            {running === 1 ? "1 operation is" : `${running.toLocaleString()} operations are`} still running. Disconnect anyway?
+          </h2>
+          <p className="muted small">Transfers and file operations are listed in the Activity panel.</p>
+        </div>
+      </div>
+      <div className="modal-actions">
+        <button type="button" className="btn" onClick={close} data-autofocus>
+          Stay connected
+        </button>
+        <button
+          type="button"
+          className="btn btn-danger"
+          onClick={() => {
+            close();
+            void disconnect();
+          }}
+        >
+          Disconnect
+        </button>
+      </div>
+    </ModalShell>
+  );
+}
+
 export function Modals() {
   const modal = useApp((s) => s.modal);
   const bucket = useApp((s) => s.bucket);
-  if (!modal || !bucket) return null;
+  if (!modal) return null;
+  // Most dialogs act on the open bucket; these don't need one.
+  if (!bucket && !BUCKETLESS_MODALS.has(modal.kind)) return null;
   switch (modal.kind) {
+    case "addBucket":
+      return <AddBucketModal />;
+    case "removeBucket":
+      return <RemoveBucketModal name={modal.name} />;
+    case "bucketTags":
+      return <BucketTagsModal key={modal.bucket} bucket={modal.bucket} />;
+    case "objectTags":
+      return <ObjectTagsModal key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} />;
+    case "bulkTags":
+      return <BulkTagsModal bucket={modal.bucket} prefix={modal.prefix} items={modal.items} />;
+    case "disconnect":
+      return <DisconnectModal running={modal.running} />;
     case "newFolder":
       return <NewFolderModal />;
     case "delete":
@@ -590,6 +657,7 @@ export function Modals() {
           srcPrefix={modal.srcPrefix}
           destPrefix={modal.destPrefix}
           renamed={modal.renamed}
+          clearCut={modal.clearCut}
         />
       );
   }

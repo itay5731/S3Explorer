@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
-import { disconnect, readPref, useApp, writePref } from "../store/app";
+import { readPref, requestDisconnect, useApp, writePref } from "../store/app";
 import { installTransferEffects, uploadPaths } from "../store/actions";
 import { installJobEffects } from "../store/ops";
+import { installTagEffects } from "../store/tags";
+import { DragBadge } from "./RowDrag";
 import { Sidebar } from "./Sidebar";
 import { Breadcrumbs, Toolbar } from "./Toolbar";
 import { ObjectTable } from "./ObjectTable";
@@ -64,7 +66,7 @@ function ConnectionChip() {
             className="btn btn-danger-ghost popover-action"
             onClick={() => {
               setOpen(false);
-              void disconnect();
+              requestDisconnect();
             }}
           >
             <LogOut size={14} /> Disconnect
@@ -153,11 +155,12 @@ export function Explorer() {
 
   useEffect(() => installTransferEffects(), []);
   useEffect(() => installJobEffects(), []);
+  useEffect(() => installTagEffects(), []);
 
   return (
     <div className="app">
       <header className="titlebar">
-        <button type="button" className="brand brand-link" onClick={() => void disconnect()} title="Back to connections">
+        <button type="button" className="brand brand-link" onClick={requestDisconnect} title="Back to connections">
           <Logo size={26} />
           <span>S3 Explorer</span>
         </button>
@@ -198,6 +201,7 @@ export function Explorer() {
       <ActivityPanel />
       <ContextMenu />
       <Modals />
+      <DragBadge />
     </div>
   );
 }

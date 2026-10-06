@@ -43,3 +43,9 @@ export async function loadRecent(bucket: string): Promise<void> {
     if (seq === scanSeq) useRecent.setState({ loading: false, error: e as AppError });
   }
 }
+
+/** Forget the list (on disconnect / a new connection), and drop any scan still running. */
+export function clearRecent() {
+  scanSeq++;
+  useRecent.setState({ bucket: null, objects: [], truncated: false, loading: false, error: null });
+}

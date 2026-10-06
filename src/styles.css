@@ -69,6 +69,8 @@
   --thumb: #ffffff;
   --thumb-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
   --notice: #f2b84b;
+  /* Drag and drop: a copy is shown in a colour no accent uses, so it never looks like a move. */
+  --drop-copy: #b48cff;
   /* Text on the primary button: white in the dark theme, the accent's own text colour in light. */
   --btn-primary-fg: #ffffff;
   /* Start-screen backdrop: grid lines, and the line art of the servers. */
@@ -149,6 +151,7 @@
   --thumb: #ffffff;
   --thumb-shadow: 0 1px 3px rgba(15, 23, 42, 0.3);
   --notice: #e08a00;
+  --drop-copy: #7c4ddb;
   --btn-primary-fg: var(--accent-fg);
   --backdrop-line: rgba(24, 24, 27, 0.08);
   --backdrop-ink: rgba(24, 24, 27, 0.16);
@@ -200,6 +203,7 @@
     --thumb: #ffffff;
     --thumb-shadow: 0 1px 3px rgba(15, 23, 42, 0.3);
     --notice: #e08a00;
+    --drop-copy: #7c4ddb;
     --btn-primary-fg: var(--accent-fg);
     --backdrop-line: rgba(24, 24, 27, 0.08);
     --backdrop-ink: rgba(24, 24, 27, 0.16);
@@ -3869,4 +3873,367 @@ input[type="checkbox"].switch:disabled {
 }
 .toast-warning .toast-icon {
   color: var(--warning);
+}
+
+/* ==========================================================================
+   v0.4.0: shared buckets, tags, drag and drop
+   ========================================================================== */
+.busy-cursor,
+.busy-cursor * {
+  cursor: progress !important;
+}
+
+/* Sidebar: "Shared with me" and the bucket actions */
+.bucket-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 12px 0 2px;
+  padding: 8px 8px 0;
+  border-top: 1px solid var(--border);
+  flex: none;
+}
+.bucket-note {
+  display: flex;
+  gap: 7px;
+  align-items: flex-start;
+  margin: 0 4px 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px dashed var(--border-strong);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.45;
+  flex: none;
+}
+.bucket-note svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--accent-text);
+}
+.bucket-add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  flex: none;
+  margin: 2px 0;
+  transition: color 0.12s, border-color 0.12s, background 0.12s;
+}
+.bucket-add:hover {
+  color: var(--accent-text);
+  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
+  background: var(--accent-soft);
+}
+.bucket-add:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.bucket-more {
+  opacity: 0;
+}
+.bucket-item:hover .bucket-more,
+.bucket-item:focus-within .bucket-more,
+.bucket-item.selected .bucket-more {
+  opacity: 1;
+}
+.bucket-tagged {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  color: var(--muted);
+}
+.bucket-item.selected .bucket-tagged {
+  color: var(--accent-text);
+}
+
+/* Add-a-bucket dialog: the bucket name as parsed */
+.parsed-bucket {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  min-width: 0;
+}
+.parsed-label {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* Tag editor */
+.tag-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tag-editor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  overflow: auto;
+  padding: 1px;
+}
+.tag-editor-head,
+.tag-editor-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr) 22px;
+  gap: 6px;
+  align-items: center;
+}
+.tag-editor-head {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.tag-editor-row input {
+  height: 28px;
+  font-size: 12.5px;
+}
+.tag-editor-err {
+  grid-column: 1 / -1;
+  font-size: 11.5px;
+  margin: -2px 0 2px;
+}
+.tag-editor-empty {
+  padding: 6px 2px;
+}
+.tag-editor-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tag-count {
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.tag-count.at-limit {
+  color: var(--warning);
+}
+.tags-unsupported {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+}
+.tags-unsupported > svg {
+  flex: none;
+  color: var(--muted);
+  margin-top: 1px;
+}
+.tags-unsupported p {
+  margin-top: 2px;
+}
+
+/* Tag chips: "key value" */
+.tag-chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.tag-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  min-width: 0;
+  height: 22px;
+  border-radius: 11px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  font-size: 11.5px;
+  overflow: hidden;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.tag-chip-key,
+.tag-chip-value {
+  padding: 0 7px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.tag-chip-key {
+  color: var(--text);
+  font-weight: 500;
+}
+.tag-chip-value {
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-2);
+  background: var(--bg-active);
+  border-left: 1px solid var(--border);
+}
+.tag-chip.removing {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  background: var(--danger-soft);
+  padding-right: 2px;
+}
+.tag-chip.removing .tag-chip-key {
+  color: var(--danger);
+  text-decoration: line-through;
+}
+.tag-chip.invalid {
+  border-style: solid;
+}
+.tag-chip .icon-btn {
+  width: 18px;
+  height: 18px;
+}
+.dsection-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dsection-title-row .link-btn {
+  font-family: var(--font);
+  font-weight: 500;
+}
+.link-btn:disabled {
+  opacity: 0.45;
+  text-decoration: none;
+}
+.dsection .muted.small .spin {
+  vertical-align: -2px;
+}
+
+/* Bulk tags */
+.bulk-mode {
+  max-width: 280px;
+}
+.remove-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.remove-keys .input-affix input {
+  height: 28px;
+}
+.xdir.job-tag {
+  color: var(--ic-data);
+  background: color-mix(in srgb, var(--ic-data) 14%, transparent);
+}
+
+/* Drag rows to move (or, with Ctrl / Option, copy) */
+body.row-dragging,
+body.row-dragging * {
+  cursor: grabbing !important;
+}
+body.row-dragging.drag-copy,
+body.row-dragging.drag-copy * {
+  cursor: copy !important;
+}
+body.row-dragging.drag-refused,
+body.row-dragging.drag-refused * {
+  cursor: no-drop !important;
+}
+body.row-dragging .bucket-more {
+  opacity: 0;
+}
+.trow.dragged .name-text,
+.trow.dragged .ficon,
+.trow.dragged .cell:not(.col-name) {
+  opacity: 0.45;
+}
+.trow[data-drop-target="move"],
+.crumb[data-drop-target="move"],
+.bucket-item[data-drop-target="move"] {
+  background: var(--sel-strong);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+  color: var(--text);
+}
+.trow[data-drop-target="copy"],
+.crumb[data-drop-target="copy"],
+.bucket-item[data-drop-target="copy"] {
+  background: color-mix(in srgb, var(--drop-copy) 18%, transparent);
+  box-shadow: inset 0 0 0 1.5px var(--drop-copy);
+  color: var(--text);
+}
+.trow[data-drop-target="refused"],
+.crumb[data-drop-target="refused"],
+.bucket-item[data-drop-target="refused"] {
+  background: var(--danger-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 60%, transparent);
+}
+.drag-badge {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 320px;
+  padding: 6px 10px 6px 6px;
+  border-radius: 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+  will-change: transform;
+}
+.drag-badge-icon {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  flex: none;
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+.drag-badge.copy .drag-badge-icon {
+  background: var(--drop-copy);
+  color: #ffffff;
+}
+.drag-badge.refused .drag-badge-icon {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.drag-badge-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.drag-badge-title {
+  font-weight: 600;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.drag-badge-sub {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.drag-badge.refused .drag-badge-sub {
+  color: var(--danger);
+}
+.drag-badge.copy .drag-badge-title {
+  color: var(--drop-copy);
 }

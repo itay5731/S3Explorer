@@ -19,6 +19,8 @@ import { Welcome } from "./Welcome";
 import { pickAndUpload } from "../store/actions";
 import { useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
+import { isDenied, permissionText } from "../store/toasts";
+import { useRowDrag, useRowDragView } from "./RowDrag";
 
 const ROW_H = 28;
 
@@ -36,6 +38,8 @@ const RowView = memo(function RowView({
   selected,
   focused,
   cut,
+  dragged,
+  bucket,
 }: {
   row: Row;
   index: number;
@@ -43,16 +47,21 @@ const RowView = memo(function RowView({
   selected: boolean;
   focused: boolean;
   cut: boolean;
+  dragged: boolean;
+  bucket: string;
 }) {
   const obj = row.kind === "object" ? row.object : null;
   const sc = obj?.storageClass ?? null;
+  // Folder rows are drop targets for dragged rows (see RowDrag.tsx); the prefix is the server's own.
+  const drop = row.kind === "folder" ? { "data-drop-bucket": bucket, "data-drop-prefix": row.folder.prefix } : {};
   return (
     <div
-      className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""} ${cut ? "cut" : ""}`}
+      className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""} ${cut ? "cut" : ""} ${dragged ? "dragged" : ""}`}
       data-index={index}
       role="row"
       aria-selected={selected}
       style={{ transform: `translateY(${start}px)` }}
+      {...drop}
     >
       <div className="cell col-name" title={row.kind === "folder" ? row.folder.prefix : row.object.key}>
         <FileIcon name={row.name} folder={row.kind === "folder"} />
@@ -96,6 +105,9 @@ export function ObjectTable() {
   const cutIds = useClipboard((s) => (s.clip && s.clip.mode === "cut" && s.clip.bucket === bucket ? s.clip.ids : null));
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const drag = useRowDrag(scrollRef);
+  const dragIds = useRowDragView((s) => s.ids);
+  const scrollTo = useApp((s) => s.scrollTo);
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -108,6 +120,13 @@ export function ObjectTable() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [bucket, prefix, sort]);
+
+  // Bring a revealed row (a newest file opened from the sidebar) into view once it is loaded.
+  useEffect(() => {
+    if (!scrollTo) return;
+    const index = getViewRows().findIndex((r) => r.id === scrollTo.id);
+    if (index >= 0) requestAnimationFrame(() => virtualizer.scrollToIndex(index, { align: "center" }));
+  }, [scrollTo, virtualizer]);
 
   // Infinite scroll (only without a filter, otherwise we'd page through everything looking for matches).
   const items = virtualizer.getVirtualItems();
@@ -312,6 +331,9 @@ export function ObjectTable() {
         ref={scrollRef}
         tabIndex={0}
         onClick={onClick}
+        onClickCapture={drag.onClickCapture}
+        onPointerDown={drag.onPointerDown}
+        onDragStart={(e) => e.preventDefault()}
         onDoubleClick={onDoubleClick}
         onContextMenu={onContextMenu}
       >
@@ -332,7 +354,7 @@ export function ObjectTable() {
         ) : error && !hasRows ? (
           <div className="table-empty">
             <AlertCircle size={32} strokeWidth={1.25} className="err-icon" />
-            <div className="empty-title">Couldn’t list this folder</div>
+            <div className="empty-title">{isDenied(error) ? `${permissionText("list objects")}` : "Couldn’t list this folder"}</div>
             <div className="muted">{error.message}</div>
             <button className="btn" onClick={() => refresh()}>
               <RefreshCw size={14} /> Try again
@@ -363,6 +385,8 @@ export function ObjectTable() {
                     selected={selection.has(row.id)}
                     focused={focus === row.id}
                     cut={!!cutIds && cutIds.has(row.id)}
+                    dragged={dragIds.has(row.id)}
+                    bucket={bucket}
                   />
                 );
               })}

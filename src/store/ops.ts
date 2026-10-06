@@ -4,15 +4,17 @@
 import * as api from "../lib/api";
 import { JOB_MAX_ITEMS, type AppError, type Job, type JobItem, type JobRequest } from "../lib/types";
 import { copyName, isJobActive, KIND_VERB, plural, touchesPrefix } from "../lib/ops";
+import { s3Uri } from "../lib/format";
 import { openModal, refreshInPlace, setTransfersOpen, useApp } from "./app";
 import { clearClipboard, setClipboard, useClipboard, type ClipItem } from "./clipboard";
 import { jobRequest, onJobUpdate, rememberJobRequest, useJobs } from "./jobs";
 import { notifyInBackground } from "./notify";
-import { toast } from "./toasts";
+import { useSettings } from "./settings";
+import { toast, toastFailure } from "./toasts";
 import { getSelected } from "./view";
 
 /** The current selection as clip items (exact keys/prefixes), folders first. */
-function selectedItems(): ClipItem[] {
+export function selectedItems(): ClipItem[] {
   const { folders, objects } = getSelected();
   return [
     ...folders.map((f) => ({ key: f.prefix, isPrefix: true, name: f.name })),
@@ -20,7 +22,7 @@ function selectedItems(): ClipItem[] {
   ];
 }
 
-function tooMany(count: number, what: string): boolean {
+export function tooMany(count: number, what: string): boolean {
   if (count <= JOB_MAX_ITEMS) return false;
   toast.error(
     `Too many items to ${what}`,
@@ -46,6 +48,23 @@ export function requestDelete() {
     onConflict: "skip",
   };
   openModal({ kind: "delete", request });
+}
+
+// ---- tags -----------------------------------------------------------------------------------
+
+/** Edit the tags of the selection: one object opens its tag editor; anything else a bulk tag job. */
+export function requestBulkTags() {
+  const { bucket, prefix } = useApp.getState();
+  const items = selectedItems();
+  if (!bucket || !items.length) return;
+  if (tooMany(items.length, "tag")) return;
+  openModal({
+    kind: "bulkTags",
+    bucket,
+    prefix,
+    // Verbatim: never normalize a server-provided key or prefix.
+    items: items.map((i) => ({ from: i.key, to: null, isPrefix: i.isPrefix })),
+  });
 }
 
 // ---- rename -------------------------------------------------------------------------------
@@ -79,71 +98,177 @@ export function copySelection(mode: "copy" | "cut") {
   );
 }
 
-/** Build the paste request for the current folder, or explain why it can't be done. */
+/** Items to copy or move: where they come from (exact keys, as listed) and how. */
+export interface TransferSource {
+  mode: "copy" | "cut";
+  bucket: string;
+  /** The folder the items were listed in. */
+  prefix: string;
+  items: ClipItem[];
+}
+
+/** The folder the items go to. `taken` = names already in it, to suggest "(copy)" names (paste only). */
+export interface TransferDest {
+  bucket: string;
+  prefix: string;
+  taken?: { objects: Set<string>; folders: Set<string> };
+}
+
+/**
+ * The copy/move request for `src` into `dest`, built the same way for paste and for drag and drop:
+ * `to = dest.prefix + name` (folders with a trailing "/"), keys passed through verbatim. Returns the
+ * reason when it can't be done; nothing is sent then.
+ */
+export function buildTransferRequest(
+  src: TransferSource,
+  dest: TransferDest,
+): { ok: true; request: JobRequest; renamed: boolean } | { ok: false; title: string; detail?: string; info?: boolean } {
+  const sameBucket = src.bucket === dest.bucket;
+  const sameFolder = sameBucket && src.prefix === dest.prefix;
+  if (sameFolder && (src.mode === "cut" || !dest.taken)) {
+    return { ok: false, info: true, title: src.mode === "cut" ? "Nothing to move" : "Nothing to copy", detail: "The items are already in this folder." };
+  }
+  // A folder can't go into itself or anything inside it.
+  if (sameBucket) {
+    const into = src.items.find((i) => i.isPrefix && dest.prefix.startsWith(i.key));
+    if (into) {
+      return {
+        ok: false,
+        // `taken` is only passed by paste, which keeps its own wording.
+        title: `Can’t ${dest.taken ? "paste" : src.mode === "cut" ? "move" : "copy"} a folder into itself`,
+        detail: `“${into.key}” would be ${src.mode === "cut" ? "moved" : "copied"} into ${dest.prefix === into.key ? "itself" : `its own subfolder “${dest.prefix}”`}.`,
+      };
+    }
+  }
+  let renamed = false;
+  const items: JobItem[] = [];
+  if (sameFolder && dest.taken) {
+    // Copy into the same folder: suggest "name (copy).ext" so the request is valid.
+    const takenObjects = new Set(dest.taken.objects);
+    const takenFolders = new Set(dest.taken.folders);
+    for (const it of src.items) {
+      const taken = it.isPrefix ? takenFolders : takenObjects;
+      const name = copyName(it.name, it.isPrefix, taken);
+      taken.add(name);
+      renamed = true;
+      items.push({ from: it.key, to: dest.prefix + name + (it.isPrefix ? "/" : ""), isPrefix: it.isPrefix });
+    }
+  } else {
+    for (const it of src.items) {
+      items.push({ from: it.key, to: dest.prefix + it.name + (it.isPrefix ? "/" : ""), isPrefix: it.isPrefix });
+    }
+  }
+  const request: JobRequest = {
+    kind: src.mode === "cut" ? "move" : "copy",
+    srcBucket: src.bucket,
+    destBucket: dest.bucket,
+    items,
+    onConflict: "skip",
+  };
+  return { ok: true, request, renamed };
+}
+
+/** Build the paste request for the current folder, or explain why it can’t be done. */
 export function requestPaste() {
   const { bucket, prefix, listing } = useApp.getState();
   const clip = useClipboard.getState().clip;
   if (!bucket || !clip || !clip.items.length) return;
   if (tooMany(clip.items.length, "paste")) return;
-
-  const sameBucket = clip.bucket === bucket;
-  const sameFolder = sameBucket && clip.prefix === prefix;
-  if (sameFolder && clip.mode === "cut") {
-    toast.info("Nothing to move", "The items are already in this folder.");
+  const built = buildTransferRequest(clip, {
+    bucket,
+    prefix,
+    taken: { objects: new Set(listing.objects.map((o) => o.name)), folders: new Set(listing.folders.map((f) => f.name)) },
+  });
+  if (!built.ok) {
+    if (built.info) toast.info(built.title, built.detail);
+    else toast.error(built.title, built.detail);
     return;
   }
-  // A folder can't be pasted into itself or anything inside it.
-  if (sameBucket) {
-    const into = clip.items.find((i) => i.isPrefix && prefix.startsWith(i.key));
-    if (into) {
-      toast.error(
-        `Can’t paste a folder into itself`,
-        `“${into.key}” would be ${clip.mode === "cut" ? "moved" : "copied"} into ${prefix === into.key ? "itself" : `its own subfolder “${prefix}”`}.`,
-      );
+  void confirmOrStart({
+    request: built.request,
+    mode: clip.mode,
+    srcPrefix: clip.prefix,
+    destPrefix: prefix,
+    renamed: built.renamed,
+    clearCut: clip.mode === "cut",
+  });
+}
+
+let checking = false;
+
+/**
+ * Show the copy/move confirmation, or (with "Ask before copying or moving" off) start right away
+ * when the preview finds nothing in the way. Conflicts, an empty preview or a preview error always
+ * open the dialog, which shows them; the request started is exactly the one previewed.
+ */
+export async function confirmOrStart(p: {
+  request: JobRequest;
+  mode: "copy" | "cut";
+  srcPrefix: string;
+  destPrefix: string;
+  renamed: boolean;
+  /** Empty the in-app clipboard once the job starts (a paste of cut items; not a drag). */
+  clearCut: boolean;
+}) {
+  const confirm = useSettings.getState().settings?.confirmCopyMove ?? true;
+  const dialog = () => openModal({ kind: "paste", ...p });
+  if (confirm || p.renamed) {
+    dialog();
+    return;
+  }
+  if (checking) return;
+  checking = true;
+  document.body.classList.add("busy-cursor");
+  try {
+    let preview;
+    try {
+      preview = await api.previewJob(p.request);
+    } catch {
+      dialog(); // shows the error, with Retry
       return;
     }
-  }
-
-  let renamed = false;
-  const items: JobItem[] = [];
-  if (sameFolder) {
-    // Copy into the same folder: suggest "name (copy).ext" so the request is valid.
-    const takenObjects = new Set(listing.objects.map((o) => o.name));
-    const takenFolders = new Set(listing.folders.map((f) => f.name));
-    for (const it of clip.items) {
-      const taken = it.isPrefix ? takenFolders : takenObjects;
-      const name = copyName(it.name, it.isPrefix, taken);
-      taken.add(name);
-      renamed = true;
-      items.push({ from: it.key, to: prefix + name + (it.isPrefix ? "/" : ""), isPrefix: it.isPrefix });
+    if (preview.conflicts > 0 || preview.objects === 0) {
+      dialog();
+      return;
     }
-  } else {
-    for (const it of clip.items) {
-      items.push({ from: it.key, to: prefix + it.name + (it.isPrefix ? "/" : ""), isPrefix: it.isPrefix });
-    }
+    // Nothing in the way: "skip" is sent, so anything that appears at the destination meanwhile is kept.
+    const request: JobRequest = { ...p.request, onConflict: "skip" };
+    const id = await startConfirmedJob(request, { clearCut: p.clearCut, openPanel: false });
+    if (!id) return;
+    const n = p.request.items.length;
+    toast.info(
+      `${p.mode === "cut" ? "Moving" : "Copying"} ${plural(n, "item")} to ${s3Uri(request.destBucket ?? "", p.destPrefix)}`,
+      `${plural(preview.objects, "object")}${preview.truncated ? " or more" : ""}. Nothing at the destination is overwritten.`,
+      { label: "View", run: () => openJobDetails(id) },
+    );
+  } finally {
+    checking = false;
+    document.body.classList.remove("busy-cursor");
   }
-  const request: JobRequest = {
-    kind: clip.mode === "cut" ? "move" : "copy",
-    srcBucket: clip.bucket,
-    destBucket: bucket,
-    items,
-    onConflict: "skip",
-  };
-  openModal({ kind: "paste", request, mode: clip.mode, srcPrefix: clip.prefix, destPrefix: prefix, renamed });
 }
 
 // ---- starting jobs -------------------------------------------------------------------------
 
+const PERMISSION_ACTION: Record<JobRequest["kind"], string> = {
+  delete: "delete files",
+  copy: "copy files",
+  move: "move files",
+  tag: "change tags",
+};
+
 /** Start a confirmed job. Returns the job id, or null after showing the error. */
-export async function startConfirmedJob(request: JobRequest, opts: { clearCut?: boolean } = {}): Promise<string | null> {
+export async function startConfirmedJob(
+  request: JobRequest,
+  opts: { clearCut?: boolean; openPanel?: boolean } = {},
+): Promise<string | null> {
   try {
     const id = await api.startJob(request);
     rememberJobRequest(id, request);
     if (opts.clearCut) clearClipboard();
-    setTransfersOpen(true);
+    if (opts.openPanel !== false) setTransfersOpen(true);
     return id;
   } catch (e) {
-    toast.error(`Couldn’t start the ${KIND_VERB[request.kind].noun}`, e as AppError);
+    toastFailure(`Couldn’t start the ${KIND_VERB[request.kind].noun}`, e as AppError, PERMISSION_ACTION[request.kind]);
     return null;
   }
 }

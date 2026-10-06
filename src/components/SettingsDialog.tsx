@@ -8,6 +8,7 @@ import {
   FileStack,
   Info,
   Loader2,
+  MousePointer2,
   Network,
   Palette,
   RefreshCcw,
@@ -18,15 +19,22 @@ import {
 } from "lucide-react";
 import {
   AUTO_PART_SIZE_MIB,
-  DEFAULT_APP_SETTINGS,
   MIN_UPLOAD_PART_MIB,
   TRANSFER_SETTINGS_LIMITS,
   type AppError,
   type AccentColor,
-  type AppSettings,
   type ThemeMode,
 } from "../lib/types";
-import { GIB, MIB, planParts, sameAppSettings, validateInteger, worstCasePartMib } from "../lib/settings";
+import {
+  DEFAULT_SETTINGS,
+  GIB,
+  MIB,
+  planParts,
+  sameAppSettings,
+  validateInteger,
+  worstCasePartMib,
+  type Settings,
+} from "../lib/settings";
 import { formatBytes } from "../lib/format";
 import { applyAccent, applyTheme } from "../lib/theme";
 import {
@@ -41,6 +49,7 @@ import {
 import { toast } from "../store/toasts";
 import { useUpdates } from "../store/updates";
 import { AppearanceTab } from "./AppearanceTab";
+import { BehaviorTab } from "./BehaviorTab";
 import { NotificationsTab } from "./NotificationsTab";
 import { UpdatesTab } from "./UpdatesTab";
 
@@ -65,11 +74,12 @@ interface Draft {
   textSize: number;
   textWeight: number;
   accent: AccentColor;
+  confirmCopyMove: boolean;
 }
 
 type TransferErrors = Record<"partSize" | "parts" | "transfers", string | null>;
 
-const toDraft = (s: AppSettings): Draft => ({
+const toDraft = (s: Settings): Draft => ({
   transfers: {
     partMode: s.partSizeMib === null ? "auto" : "custom",
     partSize: String(s.partSizeMib ?? AUTO_PART_SIZE_MIB.standard),
@@ -82,6 +92,7 @@ const toDraft = (s: AppSettings): Draft => ({
   textSize: s.textSize,
   textWeight: s.textWeight,
   accent: s.accent,
+  confirmCopyMove: s.confirmCopyMove,
 });
 
 function transferErrors(d: TransferDraft): TransferErrors {
@@ -93,7 +104,7 @@ function transferErrors(d: TransferDraft): TransferErrors {
 }
 
 /** The settings a draft describes, or null while any field is invalid. */
-function toSettings(d: Draft): AppSettings | null {
+function toSettings(d: Draft): Settings | null {
   const t = d.transfers;
   const errs = transferErrors(t);
   if (errs.partSize || errs.parts || errs.transfers) return null;
@@ -107,10 +118,11 @@ function toSettings(d: Draft): AppSettings | null {
     textSize: d.textSize,
     textWeight: d.textWeight,
     accent: d.accent,
+    confirmCopyMove: d.confirmCopyMove,
   };
 }
 
-const DEFAULT_DRAFT = toDraft(DEFAULT_APP_SETTINGS);
+const DEFAULT_DRAFT = toDraft(DEFAULT_SETTINGS);
 const sameTransferDraft = (a: TransferDraft, b: TransferDraft) => {
   const x = toSettings({ ...DEFAULT_DRAFT, transfers: a });
   const y = toSettings({ ...DEFAULT_DRAFT, transfers: b });
@@ -154,6 +166,20 @@ const TABS: SettingsTab[] = [
     ),
     reset: (d) => ({ ...d, transfers: DEFAULT_DRAFT.transfers }),
     atDefaults: (d) => sameTransferDraft(d.transfers, DEFAULT_DRAFT.transfers),
+  },
+  {
+    id: "behavior",
+    label: "Behavior",
+    icon: MousePointer2,
+    render: (ctx) => (
+      <BehaviorTab
+        confirmCopyMove={ctx.draft.confirmCopyMove}
+        disabled={ctx.disabled}
+        onConfirmCopyMoveChange={(confirmCopyMove) => ctx.update({ ...ctx.draft, confirmCopyMove })}
+      />
+    ),
+    reset: (d) => ({ ...d, confirmCopyMove: DEFAULT_DRAFT.confirmCopyMove }),
+    atDefaults: (d) => d.confirmCopyMove === DEFAULT_DRAFT.confirmCopyMove,
   },
   {
     id: "appearance",

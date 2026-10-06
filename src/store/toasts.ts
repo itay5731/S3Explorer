@@ -53,3 +53,35 @@ export const toast = {
       action,
     }),
 };
+
+/** "You don't have permission to <action> on this bucket" (see "Shared buckets" in docs/CONTRACT.md). */
+export const permissionText = (action: string) => `You don’t have permission to ${action} on this bucket`;
+
+/** True for an AccessDenied error, or an error text (e.g. a failed transfer's) that says access was denied. */
+export function isDenied(e: AppError | string | null | undefined): boolean {
+  if (!e) return false;
+  if (typeof e === "string") return /\bAccessDenied\b|\bAccess Denied\b/i.test(e);
+  return e.code === "AccessDenied";
+}
+
+const recentDenied = new Map<string, number>();
+/** How long an identical permission toast is suppressed: one toast per problem, not one per file. */
+const DENIED_QUIET_MS = 6000;
+
+/**
+ * Report a permission error once: the same message within a few seconds (e.g. several files of one
+ * upload) shows a single toast. Nothing is retried.
+ */
+export function toastDenied(action: string, err?: AppError | string) {
+  const title = permissionText(action);
+  const now = Date.now();
+  if (now - (recentDenied.get(title) ?? 0) < DENIED_QUIET_MS) return;
+  recentDenied.set(title, now);
+  toast.error(title, err);
+}
+
+/** `toast.error`, except that a permission error gets the plain permission message (once). */
+export function toastFailure(title: string, err: AppError | string | undefined, action: string) {
+  if (isDenied(err)) toastDenied(action, err);
+  else toast.error(title, err);
+}

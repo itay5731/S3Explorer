@@ -15,6 +15,7 @@ import {
   JOB_PROGRESS_EVENT,
   TRANSFER_PROGRESS_EVENT,
   UPDATE_PROGRESS_EVENT,
+  type AddedBucket,
   type AppError,
   type AppSettings,
   type Bucket,
@@ -30,6 +31,7 @@ import {
   type RecentListing,
   type SaveConnectionInput,
   type SavedConnection,
+  type Tag,
   type Transfer,
   type UpdateInfo,
   type UpdateProgress,
@@ -54,6 +56,15 @@ export interface Backend {
   listRecent(bucket: string, prefix: string): Promise<RecentListing>;
   headObject(bucket: string, key: string): Promise<ObjectMeta>;
   createFolder(bucket: string, prefix: string): Promise<void>;
+  // Shared buckets (added by name)
+  listAddedBuckets(): Promise<AddedBucket[]>;
+  addBucket(input: string): Promise<AddedBucket>;
+  removeAddedBucket(name: string): Promise<void>;
+  // Tags
+  getBucketTags(bucket: string): Promise<Tag[]>;
+  putBucketTags(bucket: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
+  getObjectTags(bucket: string, key: string): Promise<Tag[]>;
+  putObjectTags(bucket: string, key: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
   // Object operations (jobs)
   previewJob(request: JobRequest): Promise<JobPreview>;
   startJob(request: JobRequest): Promise<string>;
@@ -96,7 +107,7 @@ export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in
 
 const ERROR_CODES: readonly string[] = [
   "NotConnected", "Auth", "NoSuchBucket", "NoSuchKey", "AccessDenied",
-  "Network", "Io", "Cancelled", "InvalidInput", "Keychain", "Unknown",
+  "Network", "Io", "Cancelled", "InvalidInput", "Keychain", "Conflict", "NotSupported", "Unknown",
 ];
 
 /** Turn whatever `invoke` (or a plugin) rejected with into an `AppError`. */
@@ -127,6 +138,13 @@ const tauriBackend: Backend = {
   listRecent: (bucket, prefix) => invoke<RecentListing>("list_recent", { bucket, prefix }),
   headObject: (bucket, key) => invoke<ObjectMeta>("head_object", { bucket, key }),
   createFolder: (bucket, prefix) => invoke<void>("create_folder", { bucket, prefix }),
+  listAddedBuckets: () => invoke<AddedBucket[]>("list_added_buckets"),
+  addBucket: (input) => invoke<AddedBucket>("add_bucket", { input }),
+  removeAddedBucket: (name) => invoke<void>("remove_added_bucket", { name }),
+  getBucketTags: (bucket) => invoke<Tag[]>("get_bucket_tags", { bucket }),
+  putBucketTags: (bucket, tags, expected) => invoke<Tag[]>("put_bucket_tags", { bucket, tags, expected }),
+  getObjectTags: (bucket, key) => invoke<Tag[]>("get_object_tags", { bucket, key }),
+  putObjectTags: (bucket, key, tags, expected) => invoke<Tag[]>("put_object_tags", { bucket, key, tags, expected }),
   previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
   startJob: (request) => invoke<string>("start_job", { request }),
   cancelJob: (id) => invoke<void>("cancel_job", { id }),
@@ -226,6 +244,18 @@ export const listObjects = (bucket: string, prefix: string, continuationToken?: 
 export const listRecent = (bucket: string, prefix: string) => call("listRecent", bucket, prefix);
 export const headObject = (bucket: string, key: string) => call("headObject", bucket, key);
 export const createFolder = (bucket: string, prefix: string) => call("createFolder", bucket, prefix);
+export const listAddedBuckets = () => call("listAddedBuckets");
+/** `input` is a bucket name, an `s3://` URI or an ARN, as typed (trimmed). */
+export const addBucket = (input: string) => call("addBucket", input);
+/** Forget a bucket added by name. Never touches the bucket itself. */
+export const removeAddedBucket = (name: string) => call("removeAddedBucket", name);
+export const getBucketTags = (bucket: string) => call("getBucketTags", bucket);
+/** Replace the bucket's tag set; fails with `Conflict` when the current set differs from `expected`. */
+export const putBucketTags = (bucket: string, tags: Tag[], expected: Tag[]) => call("putBucketTags", bucket, tags, expected);
+export const getObjectTags = (bucket: string, key: string) => call("getObjectTags", bucket, key);
+/** Replace the object's tag set; fails with `Conflict` when the current set differs from `expected`. */
+export const putObjectTags = (bucket: string, key: string, tags: Tag[], expected: Tag[]) =>
+  call("putObjectTags", bucket, key, tags, expected);
 export const previewJob = (request: JobRequest) => call("previewJob", request);
 export const startJob = (request: JobRequest) => call("startJob", request);
 export const cancelJob = (id: string) => call("cancelJob", id);

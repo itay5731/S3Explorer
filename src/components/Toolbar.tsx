@@ -158,14 +158,26 @@ export function Breadcrumbs() {
   return (
     <div className="breadcrumbs">
       <nav className="crumbs" aria-label="Path">
-        <button className={`crumb ${segs.length === 0 ? "current" : ""}`} onClick={() => navigate(bucket, "")} title={`s3://${bucket}/`}>
+        <button
+          className={`crumb ${segs.length === 0 ? "current" : ""}`}
+          onClick={() => navigate(bucket, "")}
+          title={`s3://${bucket}/`}
+          data-drop-bucket={bucket}
+          data-drop-prefix=""
+        >
           <Archive size={13} />
           {bucket}
         </button>
         {segs.map((s, i) => (
           <Fragment key={s.prefix}>
             <ChevronRight size={13} className="crumb-sep" />
-            <button className={`crumb ${i === segs.length - 1 ? "current" : ""}`} onClick={() => navigate(bucket, s.prefix)} title={`s3://${bucket}/${s.prefix}`}>
+            <button
+              className={`crumb ${i === segs.length - 1 ? "current" : ""}`}
+              onClick={() => navigate(bucket, s.prefix)}
+              title={`s3://${bucket}/${s.prefix}`}
+              data-drop-bucket={bucket}
+              data-drop-prefix={s.prefix}
+            >
               {displayName(s.name)}
             </button>
           </Fragment>

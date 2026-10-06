@@ -2,9 +2,12 @@
 
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AppError, Bucket, ConnectionInfo, FolderEntry, JobRequest, ObjectEntry } from "../lib/types";
+import type { AddedBucket, AppError, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
 import { clearClipboard } from "./clipboard";
+import { selectActiveJobCount, useJobs } from "./jobs";
+import { clearRecent } from "./recent";
+import { selectActiveCount, useTransfers } from "./transfers";
 
 export type SortKey = "name" | "size" | "modified" | "class";
 export interface SortState {
@@ -38,8 +41,22 @@ export type Modal =
   | { kind: "delete"; request: JobRequest }
   | { kind: "rename"; target: RenameTarget }
   /** Confirm a paste (copy or move job). `renamed` = names got a "(copy)" suffix. */
-  | { kind: "paste"; request: JobRequest; mode: "copy" | "cut"; srcPrefix: string; destPrefix: string; renamed: boolean }
+  /** `clearCut` = empty the in-app clipboard once started (pasting cut items; a drag leaves it alone). */
+  | { kind: "paste"; request: JobRequest; mode: "copy" | "cut"; srcPrefix: string; destPrefix: string; renamed: boolean; clearCut: boolean }
+  /** Add a bucket by name ("Shared with me"). */
+  | { kind: "addBucket" }
+  /** Forget an added bucket (never touches the bucket). */
+  | { kind: "removeBucket"; name: string }
+  | { kind: "bucketTags"; bucket: string }
+  | { kind: "objectTags"; bucket: string; key: string }
+  /** Tag several objects at once (a "tag" job). `items` are exact keys/prefixes from the selection. */
+  | { kind: "bulkTags"; bucket: string; prefix: string; items: JobItem[] }
+  /** Disconnect while transfers or jobs are still running. */
+  | { kind: "disconnect"; running: number }
   | null;
+
+/** Modals that make sense without an open bucket. */
+export const BUCKETLESS_MODALS: ReadonlySet<NonNullable<Modal>["kind"]> = new Set(["addBucket", "removeBucket", "bucketTags", "disconnect"]);
 
 export interface ContextMenuState {
   x: number;
@@ -51,8 +68,10 @@ interface AppState {
   buckets: Bucket[];
   bucketsLoading: boolean;
   bucketsError: AppError | null;
-  /** Buckets typed by hand when ListBuckets is denied. */
-  manualBuckets: string[];
+  /** Buckets added by name for this connection ("Shared with me"; the whole list when ListBuckets is denied). */
+  addedBuckets: AddedBucket[];
+  addedLoading: boolean;
+  addedError: AppError | null;
 
   bucket: string | null;
   prefix: string;
@@ -64,6 +83,11 @@ interface AppState {
 
   sort: SortState;
   filter: string;
+
+  /** An object to select once the page that holds it is loaded (opening a newest file). */
+  reveal: string | null;
+  /** Ask the table to scroll a row into view; `seq` makes repeated requests distinct. */
+  scrollTo: { id: string; seq: number } | null;
 
   detailsOpen: boolean;
   transfersOpen: boolean;
@@ -104,7 +128,9 @@ export const useApp = create<AppState>(() => ({
   buckets: [],
   bucketsLoading: false,
   bucketsError: null,
-  manualBuckets: [],
+  addedBuckets: [],
+  addedLoading: false,
+  addedError: null,
   bucket: null,
   prefix: "",
   listing: emptyListing,
@@ -113,6 +139,8 @@ export const useApp = create<AppState>(() => ({
   focus: null,
   sort: readPref<SortState>("s3x.sort", { key: "name", dir: 1 }),
   filter: "",
+  reveal: null,
+  scrollTo: null,
   detailsOpen: readPref("s3x.detailsOpen", true),
   transfersOpen: false,
   modal: null,
@@ -142,18 +170,22 @@ async function fetchPage(bucket: string, prefix: string, token: string | null, s
 
 export function setConnected(info: ConnectionInfo) {
   clearClipboard();
+  clearRecent();
   set({
     connection: info,
     buckets: [],
     bucketsError: null,
-    manualBuckets: info.canListBuckets ? [] : readPref<string[]>(`s3x.manualBuckets.${info.label}`, []),
+    addedBuckets: [],
+    addedError: null,
     bucket: null,
     prefix: "",
     listing: emptyListing,
     selection: new Set(),
     filter: "",
+    reveal: null,
   });
   if (info.canListBuckets) void loadBuckets();
+  void loadAddedBuckets();
 }
 
 export async function disconnect() {
@@ -164,7 +196,26 @@ export async function disconnect() {
   }
   listSeq++;
   clearClipboard();
-  set({ connection: null, buckets: [], bucket: null, prefix: "", listing: emptyListing, selection: new Set(), modal: null, contextMenu: null });
+  clearRecent();
+  set({
+    connection: null,
+    buckets: [],
+    addedBuckets: [],
+    bucket: null,
+    prefix: "",
+    listing: emptyListing,
+    selection: new Set(),
+    reveal: null,
+    modal: null,
+    contextMenu: null,
+  });
+}
+
+/** Disconnect, but ask first while transfers or file operations are still running. */
+export function requestDisconnect() {
+  const running = selectActiveCount(useTransfers.getState()) + selectActiveJobCount(useJobs.getState());
+  if (running > 0) openModal({ kind: "disconnect", running });
+  else void disconnect();
 }
 
 export async function loadBuckets() {
@@ -178,22 +229,39 @@ export async function loadBuckets() {
   }
 }
 
-export function addManualBucket(name: string) {
-  const n = name.trim();
-  if (!n) return;
-  const { manualBuckets, connection } = get();
-  const next = manualBuckets.includes(n) ? manualBuckets : [...manualBuckets, n];
-  set({ manualBuckets: next });
-  if (connection) writePref(`s3x.manualBuckets.${connection.label}`, next);
-  navigate(n, "");
+// ---- buckets added by name ("Shared with me") ----------------------------------------------
+
+const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name);
+
+export async function loadAddedBuckets() {
+  set({ addedLoading: true, addedError: null });
+  try {
+    const added = await api.listAddedBuckets();
+    set({ addedBuckets: [...added].sort(byName), addedLoading: false });
+  } catch (e) {
+    set({ addedLoading: false, addedError: e as AppError });
+  }
 }
 
-export function removeManualBucket(name: string) {
-  const { manualBuckets, connection, bucket } = get();
-  const next = manualBuckets.filter((b) => b !== name);
-  set({ manualBuckets: next });
-  if (connection) writePref(`s3x.manualBuckets.${connection.label}`, next);
-  if (bucket === name) set({ bucket: null, prefix: "", listing: emptyListing });
+/** Add a bucket by name, `s3://` URI or ARN. Rejects with the backend's `AppError` (nothing is stored then). */
+export async function addSharedBucket(input: string): Promise<AddedBucket> {
+  const added = await api.addBucket(input.trim());
+  set((s) => ({
+    addedBuckets: [...s.addedBuckets.filter((b) => b.name !== added.name), added].sort(byName),
+  }));
+  return added;
+}
+
+/** Forget an added bucket. Only the local list changes; the bucket and its contents are untouched. */
+export async function removeSharedBucket(name: string): Promise<void> {
+  await api.removeAddedBucket(name);
+  const { bucket, buckets } = get();
+  set((s) => ({ addedBuckets: s.addedBuckets.filter((b) => b.name !== name) }));
+  // Close it if it was open and is not also in the regular list.
+  if (bucket === name && !buckets.some((b) => b.name === name)) {
+    listSeq++;
+    set({ bucket: null, prefix: "", listing: emptyListing, selection: new Set(), anchor: null, focus: null, reveal: null });
+  }
 }
 
 // ---- navigation / listing ------------------------------------------------------------
@@ -209,8 +277,45 @@ export function navigate(bucket: string, prefix: string) {
     focus: null,
     filter: "",
     contextMenu: null,
+    reveal: null,
   });
   void loadFirstPage();
+}
+
+let scrollSeq = 0;
+
+/**
+ * Open the folder that holds `key` with the object selected and scrolled into view. The object may
+ * be beyond the first page of a large folder, so pages are loaded until it is found.
+ */
+export function revealObject(bucket: string, key: string, name: string) {
+  navigate(bucket, key.slice(0, key.length - name.length));
+  set({ reveal: key, selection: new Set([key]), anchor: key, focus: key });
+}
+
+/** At most this many extra pages are loaded looking for a revealed object. */
+const REVEAL_MAX_PAGES = 30;
+
+async function continueReveal() {
+  for (let pages = 0; pages <= REVEAL_MAX_PAGES; ) {
+    const s = get();
+    const key = s.reveal;
+    if (!key) return;
+    if (s.listing.objects.some((o) => o.key === key)) {
+      set({ reveal: null, selection: new Set([key]), anchor: key, focus: key, scrollTo: { id: key, seq: ++scrollSeq } });
+      return;
+    }
+    if (s.listing.loading || s.listing.loadingMore) {
+      // A page is on its way (e.g. infinite scroll asked first): wait for it.
+      await new Promise((r) => setTimeout(r, 80));
+      continue;
+    }
+    if (!s.listing.truncated || !s.listing.token || s.listing.error) break;
+    pages++;
+    await loadMore();
+  }
+  // Not found (deleted meanwhile, or too far down): don't leave an invisible selection behind.
+  if (get().reveal) set({ reveal: null, selection: new Set(), anchor: null, focus: null });
 }
 
 export function refresh() {
@@ -230,9 +335,9 @@ async function loadFirstPage(keepSelection = false) {
     const page = await fetchPage(bucket, prefix, null, seq);
     if (seq !== listSeq) return;
     set((s) => {
-      // Keep only selected ids that still exist.
+      // Keep only selected ids that still exist (and an object being revealed, which may be on a later page).
       const ids = new Set<string>([...page.folders.map((f) => f.prefix), ...page.objects.map((o) => o.key)]);
-      const selection = new Set([...s.selection].filter((id) => ids.has(id)));
+      const selection = new Set([...s.selection].filter((id) => ids.has(id) || id === s.reveal));
       return {
         listing: {
           folders: page.folders,
@@ -246,6 +351,7 @@ async function loadFirstPage(keepSelection = false) {
         selection,
       };
     });
+    if (get().reveal) void continueReveal();
   } catch (e) {
     if (seq !== listSeq) return;
     set({ listing: { ...emptyListing, error: e as AppError } });
@@ -361,7 +467,8 @@ export function upsertListedFolder(bucket: string, folder: FolderEntry) {
 // ---- selection / view -----------------------------------------------------------------
 
 export function setSelection(selection: Set<string>, anchor: string | null, focus: string | null) {
-  set({ selection, anchor, focus });
+  // The user chose something else: stop looking for an object that was being revealed.
+  set({ selection, anchor, focus, reveal: null });
 }
 
 export function setSort(key: SortKey) {

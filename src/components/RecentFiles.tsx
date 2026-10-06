@@ -3,9 +3,11 @@ import { Download, RefreshCw, Search, X } from "lucide-react";
 import type { ObjectEntry } from "../lib/types";
 import { extension, formatExact, formatRelative } from "../lib/format";
 import { downloadObjects } from "../store/actions";
-import { navigate, readPref, setSelection, useApp, writePref } from "../store/app";
+import { readPref, revealObject, useApp, writePref } from "../store/app";
+import { onJobUpdate } from "../store/jobs";
 import { loadRecent, useRecent } from "../store/recent";
 import { onTransferFinished } from "../store/transfers";
+import { isJobActive } from "../lib/ops";
 import { ExtensionFilter } from "./ExtensionFilter";
 import { FileIcon } from "./FileIcon";
 
@@ -35,30 +37,43 @@ export function RecentFiles() {
   const [types, setTypes] = useState<Set<string>>(new Set());
 
   useEffect(() => {
+    // Search and type filters belong to the bucket they were set in.
+    setFilter("");
+    setTypes(new Set());
     if (bucket) void loadRecent(bucket);
   }, [bucket]);
 
-  // An upload into the open bucket is new by definition: look again when one finishes. Uploads
-  // often finish in bursts, so wait a moment and scan once for all of them.
+  // An upload into the open bucket is new by definition, and a copy, move, delete or tag job there
+  // changes what is newest: look again when one finishes. These often finish in bursts, so wait a
+  // moment and scan once for all of them.
   useEffect(() => {
     if (!bucket) return;
     let timer = 0;
-    const stop = onTransferFinished((t) => {
-      if (t.kind !== "upload" || t.status !== "completed" || t.bucket !== bucket) return;
+    const rescan = () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => void loadRecent(bucket), RESCAN_DELAY_MS);
+    };
+    const stopTransfers = onTransferFinished((t) => {
+      if (t.kind === "upload" && t.status === "completed" && t.bucket === bucket) rescan();
+    });
+    const stopJobs = onJobUpdate((j, prev) => {
+      const finished = !isJobActive(j) && (!prev || isJobActive(prev));
+      // A cancelled job may still have changed some objects.
+      if (finished && (j.srcBucket === bucket || j.destBucket === bucket)) rescan();
     });
     return () => {
       window.clearTimeout(timer);
-      stop();
+      stopTransfers();
+      stopJobs();
     };
   }, [bucket]);
 
-  /** Go to the file's folder with the file selected. The key is the server's own and is used unchanged. */
+  /**
+   * Go to the file's folder with the file selected and scrolled into view, even when it is beyond the
+   * first page of a large folder. The key is the server's own and is used unchanged.
+   */
   const show = (o: ObjectEntry) => {
-    if (!bucket) return;
-    navigate(bucket, o.key.slice(0, o.key.length - o.name.length));
-    setSelection(new Set([o.key]), o.key, o.key);
+    if (bucket) revealObject(bucket, o.key, o.name);
   };
 
   // A scan for another bucket may still be on screen for a moment after switching.
