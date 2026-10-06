@@ -5,6 +5,8 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-06
+
 The buckets update. Manage buckets, not only the files in them: shared buckets from other accounts, tags on buckets and objects, a full editor for lifecycle rules, drag and drop, and a new look.
 
 ### New
