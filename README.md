@@ -1,10 +1,25 @@
-<p align="center"><img src="src-tauri/icons/128x128@2x.png" width="112" alt="S3 Explorer icon"></p>
+<p align="center"><img src="src-tauri/icons/128x128@2x.png" width="110" alt="S3 Explorer"></p>
 
-# S3 Explorer
+<h1 align="center">S3 Explorer</h1>
 
-A fast desktop file manager for Amazon S3 and S3-compatible storage. One small native executable, no Electron, no subscription.
+<p align="center"><strong>Your buckets, on your desktop.</strong></p>
 
-![A bucket open, with a copy and a download running in the Activity panel](docs/screenshots/explorer.png)
+<p align="center">
+  <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/yonatand/S3Explorer?label=latest&color=ffb81f&style=for-the-badge" alt="Latest version"></a>
+  <img src="https://img.shields.io/badge/Windows%20%7C%20macOS%20%7C%20Linux-18181b?style=for-the-badge" alt="Windows, macOS and Linux">
+</p>
+
+<h3 align="center">A fast desktop file manager for Amazon S3 and S3-compatible storage.<br>One small native executable, no Electron, no subscription.</h3>
+
+<p align="center"><a href="../../releases/latest"><strong>Download the latest release</strong></a></p>
+
+<p align="center">
+  <img src="docs/screenshots/banner.svg" alt="Files moving between a computer and an S3 bucket in parallel parts" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/showcase.png" alt="S3 Explorer: the start screen with saved connections, a bucket open, Settings and Newest files" width="100%">
+</p>
 
 ## Why this exists
 
@@ -27,11 +42,21 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Light, dark or system theme.**
 - **Updates from inside the app.** Check for a new version, read its patch notes, install it. Only updates signed by this project are installed.
 
-![Moving files: the exact keys, the totals, and an explicit choice for files that already exist](docs/screenshots/move.png)
+<p align="center">
+  <img src="docs/screenshots/explorer.png" alt="A bucket open, with a copy and a download running in the Activity panel" width="100%">
+</p>
 
-| | |
-|---|---|
-| ![Saved connections on the connect screen](docs/screenshots/connections.png) | ![The explorer in the light theme](docs/screenshots/light.png) |
+<p align="center">
+  <img src="docs/screenshots/transfers.png" alt="The Activity panel: three large downloads in parallel parts and an upload, with speed, parts done and time remaining" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/newest-files.png" alt="Newest files in the sidebar: what changed in the bucket last, filtered by age, type or a search" width="100%">
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/safety.png" alt="Before a move or a delete: the exact keys, the totals, and nothing overwritten unless you choose it" width="100%">
+</p>
 
 ### What it does not do (yet)
 
@@ -62,6 +87,10 @@ With the default settings:
 Up to 8 parts of a file are in flight at once, and up to 4 transfers run at the same time while the rest wait in a queue. Each part is written straight to its offset in a pre-sized temp file, which is renamed when the last part lands. Every request carries the object's ETag, so a file that changes mid-download fails instead of being stitched together from two versions. A part that fails resumes from where it stopped.
 
 All three numbers are yours to change in Settings (the gear button): part size from 1 to 256 MiB, 1 to 32 parallel parts, and 1 to 10 simultaneous transfers. An object no larger than one part is fetched in a single request. Uploads always use parts of at least 5 MiB because S3 requires it. Parts larger than 16 MiB are streamed straight to disk, so a bigger part size does not cost more memory; more parallel parts do, and the dialog tells you roughly how much.
+
+<p align="center">
+  <img src="docs/screenshots/accents.png" alt="The accent colour: yellow, green, blue or red" width="100%">
+</p>
 
 ## Get it
 

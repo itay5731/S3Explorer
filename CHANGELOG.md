@@ -15,7 +15,7 @@ The section for a version becomes the text of its GitHub Release.
 - **The window title shows the connection** you are in.
 - **A hidden game.** Click a server on the start screen five times: your first connection moves to the middle and the servers defend it against bugs, power surges, worms, ransomware and a DDoS boss. Esc leaves.
 - **Resizable sidebar.** Drag its right edge to set the width, and the divider between the buckets and Newest files to set how the height is shared. Double-click either to reset.
-- **Accent colour** in Settings under Appearance: yellow, green, blue or red.
+- **Accent colour** in Settings under Appearance: yellow, green, blue or red. Folder icons follow it.
 - **Size and text weight** sliders in Settings under Appearance. Size scales the whole window, text and icons together.
 
 ### Improved
