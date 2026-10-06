@@ -19,12 +19,15 @@ import {
   type AppError,
   type AppSettings,
   type Bucket,
+  type BucketVersioning,
   type ConnectionConfig,
   type ConnectionInfo,
   type ErrorCode,
   type Job,
   type JobPreview,
   type JobRequest,
+  type LifecycleConfiguration,
+  type LifecycleIssue,
   type ListPage,
   type ObjectMeta,
   type ProfileInfo,
@@ -65,6 +68,11 @@ export interface Backend {
   putBucketTags(bucket: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
   getObjectTags(bucket: string, key: string): Promise<Tag[]>;
   putObjectTags(bucket: string, key: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
+  // Lifecycle configuration
+  getLifecycle(bucket: string): Promise<LifecycleConfiguration | null>;
+  validateLifecycle(config: LifecycleConfiguration): Promise<LifecycleIssue[]>;
+  putLifecycle(bucket: string, config: LifecycleConfiguration, expected: LifecycleConfiguration | null): Promise<LifecycleConfiguration | null>;
+  getBucketVersioning(bucket: string): Promise<BucketVersioning>;
   // Object operations (jobs)
   previewJob(request: JobRequest): Promise<JobPreview>;
   startJob(request: JobRequest): Promise<string>;
@@ -145,6 +153,10 @@ const tauriBackend: Backend = {
   putBucketTags: (bucket, tags, expected) => invoke<Tag[]>("put_bucket_tags", { bucket, tags, expected }),
   getObjectTags: (bucket, key) => invoke<Tag[]>("get_object_tags", { bucket, key }),
   putObjectTags: (bucket, key, tags, expected) => invoke<Tag[]>("put_object_tags", { bucket, key, tags, expected }),
+  getLifecycle: (bucket) => invoke<LifecycleConfiguration | null>("get_lifecycle", { bucket }),
+  validateLifecycle: (config) => invoke<LifecycleIssue[]>("validate_lifecycle", { config }),
+  putLifecycle: (bucket, config, expected) => invoke<LifecycleConfiguration | null>("put_lifecycle", { bucket, config, expected }),
+  getBucketVersioning: (bucket) => invoke<BucketVersioning>("get_bucket_versioning", { bucket }),
   previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
   startJob: (request) => invoke<string>("start_job", { request }),
   cancelJob: (id) => invoke<void>("cancel_job", { id }),
@@ -256,6 +268,17 @@ export const getObjectTags = (bucket: string, key: string) => call("getObjectTag
 /** Replace the object's tag set; fails with `Conflict` when the current set differs from `expected`. */
 export const putObjectTags = (bucket: string, key: string, tags: Tag[], expected: Tag[]) =>
   call("putObjectTags", bucket, key, tags, expected);
+/** `null` when the bucket has no lifecycle configuration; `NotSupported` when the server has no lifecycle. */
+export const getLifecycle = (bucket: string) => call("getLifecycle", bucket);
+/** Every problem with `config`, placed by rule index and field; `[]` = valid. Local, no network. */
+export const validateLifecycle = (config: LifecycleConfiguration) => call("validateLifecycle", config);
+/**
+ * Replace the bucket's whole lifecycle configuration (no rules: delete it). Fails with `Conflict` when
+ * the stored configuration differs from `expected` (the one the editor loaded, or null).
+ */
+export const putLifecycle = (bucket: string, config: LifecycleConfiguration, expected: LifecycleConfiguration | null) =>
+  call("putLifecycle", bucket, config, expected);
+export const getBucketVersioning = (bucket: string) => call("getBucketVersioning", bucket);
 export const previewJob = (request: JobRequest) => call("previewJob", request);
 export const startJob = (request: JobRequest) => call("startJob", request);
 export const cancelJob = (id: string) => call("cancelJob", id);

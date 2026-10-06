@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { AlertCircle, AlertTriangle, ArrowRight, ClipboardPaste, FolderPlus, Loader2, LogOut, PencilLine, RotateCw, Trash2 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ConflictPolicy, JobPreview, JobRequest } from "../lib/types";
@@ -10,6 +10,9 @@ import { createFolder } from "../store/actions";
 import { startConfirmedJob } from "../store/ops";
 import { joinKey, s3Uri, validateFolderName } from "../lib/format";
 import { plural, previewSummary, splitExt, validateNewName } from "../lib/ops";
+
+// The lifecycle editor is large and rarely opened: load it on first use.
+const LifecycleDialog = lazy(() => import("./LifecycleDialog").then((m) => ({ default: m.LifecycleDialog })));
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
@@ -637,6 +640,12 @@ export function Modals() {
       return <RemoveBucketModal name={modal.name} />;
     case "bucketTags":
       return <BucketTagsModal key={modal.bucket} bucket={modal.bucket} />;
+    case "lifecycle":
+      return (
+        <Suspense fallback={null}>
+          <LifecycleDialog key={modal.bucket} bucket={modal.bucket} />
+        </Suspense>
+      );
     case "objectTags":
       return <ObjectTagsModal key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} />;
     case "bulkTags":

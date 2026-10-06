@@ -7,7 +7,6 @@ import {
   ACCENT_COLORS,
   TEXT_SETTINGS_LIMITS,
   TRANSFER_SETTINGS_LIMITS,
-  DEFAULT_APP_SETTINGS,
   type AppSettings,
   type TransferKind,
   type TransferSettings, DOWNLOAD_BUFFER_CAP_MIB } from "./types";
@@ -79,19 +78,8 @@ export function planParts(kind: TransferKind, partSizeMib: number | null, size: 
 export const worstCasePartMib = (partSizeMib: number | null) =>
   Math.min(partSizeMib ?? AUTO_PART_SIZE_MIB.large, DOWNLOAD_BUFFER_CAP_MIB);
 
-/**
- * AppSettings including v0.4.0's `confirmCopyMove` (see "Confirmations for copy and move" in
- * docs/CONTRACT.md). types.ts does not mirror that field yet; once it does, this is AppSettings itself.
- */
-export type Settings = AppSettings & { confirmCopyMove: boolean };
-
-export const DEFAULT_SETTINGS: Settings = { ...DEFAULT_APP_SETTINGS, confirmCopyMove: true };
-
-/** Settings as received; a value without a newer field gets that field's default. */
-export const withDefaults = (s: AppSettings): Settings => ({ ...DEFAULT_SETTINGS, ...s });
-
 /** Full settings comparison (every field). */
-export const sameAppSettings = (a: Settings, b: Settings) =>
+export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
   sameSettings(a, b) &&
   a.theme === b.theme &&
   a.checkUpdatesOnStartup === b.checkUpdatesOnStartup &&
@@ -102,7 +90,7 @@ export const sameAppSettings = (a: Settings, b: Settings) =>
   a.confirmCopyMove === b.confirmCopyMove;
 
 /** Like `validateSettings`, checking every field of the settings object. */
-export function validateAppSettings(s: Settings): { field: keyof Settings; message: string } | null {
+export function validateAppSettings(s: AppSettings): { field: keyof AppSettings; message: string } | null {
   const transfer = validateSettings(s);
   if (transfer) return transfer;
   if (s.theme !== "system" && s.theme !== "light" && s.theme !== "dark") {

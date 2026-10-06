@@ -5,8 +5,10 @@
 import type { Backend, FileDropEvent, Unlisten } from "./api";
 import type {
   AddedBucket,
+  AppSettings,
   AppError,
   Bucket,
+  BucketVersioning,
   ConnectionConfig,
   ConnectionInfo,
   ErrorCode,
@@ -15,6 +17,8 @@ import type {
   JobItem,
   JobPreview,
   JobRequest,
+  LifecycleConfiguration,
+  LifecycleRule,
   ListPage,
   ObjectEntry,
   ObjectMeta,
@@ -27,10 +31,12 @@ import type {
   UpdateInfo,
   UpdateProgress,
 } from "./types";
-import { JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
-import { DEFAULT_SETTINGS, planParts, validateAppSettings, type Settings } from "./settings";
+import { DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { planParts, validateAppSettings } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { sameTagSet, validateTags } from "./tags";
+import { validateLifecycleConfig } from "./lifecycleCheck";
+import { sameConfiguration } from "./lifecycle";
 
 // ---- deterministic randomness ----------------------------------------------
 
@@ -372,6 +378,168 @@ const notSupported = () => fail("NotSupported", "This server does not support ta
 const conflict = () => fail("Conflict", "The tags were changed by someone else since they were loaded. Nothing was saved.");
 const copyTags = (tags: Tag[] | undefined): Tag[] => (tags ?? []).map((t) => ({ ...t }));
 
+// ---- lifecycle -----------------------------------------------------------------------------
+// One configuration per bucket, kept in localStorage (mock-only key) so a reload keeps edits. A
+// bucket missing from the stored map gets its seed (below); a bucket stored as null has none.
+// Mock switches: "legacy-…" buckets → NotSupported (a server without lifecycle); buckets shared
+// with you (added by name) → AccessDenied, like a real cross-account share.
+
+const MOCK_LIFECYCLE_KEY = "s3x.mock.lifecycle";
+
+const lcRule = ({ id, ...r }: Partial<LifecycleRule> & { id: string }): LifecycleRule => ({
+  id,
+  status: "Enabled",
+  filter: { prefix: null, tags: [], objectSizeGreaterThan: null, objectSizeLessThan: null },
+  transitions: [],
+  expiration: null,
+  noncurrentVersionTransitions: [],
+  noncurrentVersionExpiration: null,
+  abortIncompleteMultipartUpload: null,
+  ...r,
+});
+
+const lcPrefix = (prefix: string) => ({ prefix, tags: [], objectSizeGreaterThan: null, objectSizeLessThan: null });
+
+/** Realistic starting configurations. */
+const LIFECYCLE_SEEDS: Record<string, LifecycleConfiguration> = {
+  // A logs bucket: prefix rules with transitions and expirations.
+  "acme-logs": {
+    rules: [
+      lcRule({
+        id: "cloudfront-logs",
+        filter: lcPrefix("cloudfront/"),
+        transitions: [
+          { days: 30, date: null, storageClass: "STANDARD_IA" },
+          { days: 90, date: null, storageClass: "GLACIER_IR" },
+        ],
+        expiration: { days: 365, date: null, expiredObjectDeleteMarker: false },
+      }),
+      lcRule({
+        id: "app-logs-90d",
+        filter: lcPrefix("app/"),
+        expiration: { days: 90, date: null, expiredObjectDeleteMarker: false },
+        abortIncompleteMultipartUpload: { daysAfterInitiation: 7 },
+      }),
+      lcRule({
+        id: "firehose-cleanup",
+        status: "Disabled",
+        filter: lcPrefix("firehose/"),
+        expiration: { days: 14, date: null, expiredObjectDeleteMarker: false },
+      }),
+      lcRule({ id: "abort-stale-uploads", abortIncompleteMultipartUpload: { daysAfterInitiation: 7 } }),
+    ],
+  },
+  // Versioned: tag filters, an And filter (prefix + tag + size), noncurrent-version actions.
+  "data-lake-raw": {
+    rules: [
+      lcRule({
+        id: "archive-cold-partitions",
+        filter: { prefix: "events/", tags: [{ key: "tier", value: "cold" }], objectSizeGreaterThan: 1_048_576, objectSizeLessThan: null },
+        transitions: [
+          { days: 30, date: null, storageClass: "GLACIER_IR" },
+          { days: 180, date: null, storageClass: "DEEP_ARCHIVE" },
+        ],
+        noncurrentVersionExpiration: { noncurrentDays: 30, newerNoncurrentVersions: 2 },
+      }),
+      lcRule({
+        id: "temporary-exports",
+        filter: {
+          prefix: null,
+          tags: [
+            { key: "temporary", value: "true" },
+            { key: "team", value: "analytics" },
+          ],
+          objectSizeGreaterThan: null,
+          objectSizeLessThan: null,
+        },
+        expiration: { days: 7, date: null, expiredObjectDeleteMarker: false },
+      }),
+      lcRule({
+        id: "noncurrent-cleanup",
+        expiration: { days: null, date: null, expiredObjectDeleteMarker: true },
+        noncurrentVersionTransitions: [{ noncurrentDays: 30, newerNoncurrentVersions: null, storageClass: "GLACIER" }],
+        noncurrentVersionExpiration: { noncurrentDays: 365, newerNoncurrentVersions: null },
+      }),
+    ],
+  },
+  // Read from a legacy rule with a top-level Prefix (no Filter): represented as filter.prefix.
+  "backups-archive": {
+    rules: [
+      lcRule({
+        id: "postgres-dumps",
+        filter: lcPrefix("postgres/"),
+        transitions: [
+          { days: 1, date: null, storageClass: "GLACIER" },
+          { days: 90, date: null, storageClass: "DEEP_ARCHIVE" },
+        ],
+        expiration: { days: 2555, date: null, expiredObjectDeleteMarker: false },
+      }),
+    ],
+  },
+};
+
+/** Bucket versioning: one Enabled, one Suspended, the rest Off. */
+const mockVersioning: Record<string, BucketVersioning> = { "data-lake-raw": "Enabled", "backups-archive": "Suspended" };
+
+function cloneLc<T>(v: T): T {
+  return v === null || v === undefined ? v : (JSON.parse(JSON.stringify(v)) as T);
+}
+
+function loadLifecycleStore(): Record<string, LifecycleConfiguration | null> {
+  try {
+    const raw = localStorage.getItem(MOCK_LIFECYCLE_KEY);
+    const v: unknown = raw ? JSON.parse(raw) : null;
+    if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, LifecycleConfiguration | null>;
+  } catch {
+    /* fall back to the seeds */
+  }
+  return {};
+}
+
+function storedLifecycle(bucket: string): LifecycleConfiguration | null {
+  const all = loadLifecycleStore();
+  const c = bucket in all ? all[bucket] : (LIFECYCLE_SEEDS[bucket] ?? null);
+  return c && c.rules.length ? cloneLc(c) : null;
+}
+
+/** Like S3 reading it back: an empty prefix is no prefix, dates in the full midnight-UTC form. */
+function asStored(c: LifecycleConfiguration): LifecycleConfiguration {
+  const date = (d: string | null) => (d && /^\d{4}-\d{2}-\d{2}$/.test(d.trim()) ? `${d.trim()}T00:00:00Z` : d);
+  return {
+    rules: c.rules.map((r) => ({
+      ...cloneLc(r),
+      filter: { ...cloneLc(r.filter), prefix: r.filter.prefix ? r.filter.prefix : null },
+      transitions: r.transitions.map((t) => ({ ...t, date: date(t.date) })),
+      expiration: r.expiration ? { ...r.expiration, date: date(r.expiration.date) } : null,
+    })),
+  };
+}
+
+function writeLifecycle(bucket: string, c: LifecycleConfiguration | null) {
+  const all = loadLifecycleStore();
+  all[bucket] = c && c.rules.length ? cloneLc(c) : null;
+  try {
+    localStorage.setItem(MOCK_LIFECYCLE_KEY, JSON.stringify(all));
+  } catch {
+    /* in memory only: the mock has no other place */
+  }
+}
+
+const lifecycleUnsupported = (bucket: string) => bucket.startsWith("legacy-");
+// More mock switches, for buckets added by name (they are not denied like other shared buckets):
+// "notrans-…" refuses any rule with a transition (as SeaweedFS does: NotImplemented); "partial-…"
+// accepts noncurrent-version actions but doesn't store them (the previous configuration is put
+// back); "newclass-…" holds a configuration this version can't represent (a storage class it
+// doesn't know), so it can't be shown or changed.
+const lifecycleSwitch = (bucket: string) =>
+  bucket.startsWith("notrans-") ? "notrans" : bucket.startsWith("partial-") ? "partial" : bucket.startsWith("newclass-") ? "newclass" : null;
+const lifecycleDenied = (bucket: string, b: { hidden?: boolean; readOnly?: boolean }) => (!!b.hidden || !!b.readOnly) && !lifecycleSwitch(bucket);
+const ruleLabel = (i: number, id: string) => (id ? `rule ${i + 1} (“${id}”)` : `rule ${i + 1}`);
+const lifecycleNotSupported = () => fail("NotSupported", "This server does not support lifecycle configuration (NotImplemented).");
+
+/** Every lifecycle write the mock received, verbatim (deep-cloned), for test inspection. */
+const lifecycleCallLog: { cmd: string; bucket: string; config: unknown; expected: unknown; at: string }[] = [];
+
 // ---- settings ------------------------------------------------------------------
 // The real backend persists settings.json in the app config dir; the mock keeps them in
 // localStorage (mock-only key) so a page reload behaves like an app restart.
@@ -379,20 +547,20 @@ const copyTags = (tags: Tag[] | undefined): Tag[] => (tags ?? []).map((t) => ({ 
 const MOCK_SETTINGS_KEY = "s3x.mock.settings";
 
 /** Like the backend: missing fields (e.g. a v0.2.0 three-field value) take their defaults. */
-function loadMockSettings(): Settings {
+function loadMockSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
     if (raw) {
-      const merged = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<Settings>) };
+      const merged = { ...DEFAULT_APP_SETTINGS, ...(JSON.parse(raw) as Partial<AppSettings>) };
       if (!validateAppSettings(merged)) return merged;
     }
   } catch {
     /* fall back to defaults */
   }
-  return { ...DEFAULT_SETTINGS };
+  return { ...DEFAULT_APP_SETTINGS };
 }
 
-let settings: Settings = loadMockSettings();
+let settings: AppSettings = loadMockSettings();
 
 // ---- saved connections ---------------------------------------------------------------
 // Metadata is kept in localStorage (mock-only key) like the backend's connections.json.
@@ -670,6 +838,13 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
     if (b) b.tags = tags.length ? copyTags(tags) : undefined;
   },
   added: () => loadAdded(),
+  lifecycleCalls: lifecycleCallLog,
+  lifecycle: (bucket: string) => storedLifecycle(bucket),
+  /** Replace a bucket's lifecycle configuration behind the UI's back (another client; no validation). */
+  setLifecycle: (bucket: string, config: LifecycleConfiguration | null) => writeLifecycle(bucket, config),
+  setVersioning: (bucket: string, v: BucketVersioning) => {
+    mockVersioning[bucket] = v;
+  },
   has: (bucket: string, key: string) => !!buckets.get(bucket)?.objects.has(key),
   size: (bucket: string, key: string) => buckets.get(bucket)?.objects.get(key)?.size ?? null,
   keys: (bucket: string, prefix: string) => {
@@ -1200,6 +1375,71 @@ export const mockBackend: Backend = {
     return copyTags(o.tags);
   },
 
+  async getLifecycle(bucket) {
+    await latency();
+    const b = requireBucket(bucket);
+    if (lifecycleUnsupported(bucket)) throw lifecycleNotSupported();
+    if (lifecycleDenied(bucket, b)) throw fail("AccessDenied", "Access Denied: s3:GetLifecycleConfiguration is not allowed on a bucket shared with you.");
+    if (lifecycleSwitch(bucket) === "newclass") {
+      throw fail(
+        "Unknown",
+        "This bucket's lifecycle configuration uses the storage class “GLACIER_NEXT” in rule 2 (“move-to-next”), which this version of S3 Explorer does not understand. To avoid losing it, the configuration can't be shown or changed here; use the AWS console or CLI.",
+      );
+    }
+    return storedLifecycle(bucket);
+  },
+
+  async validateLifecycle(config) {
+    await delay(15);
+    return validateLifecycleConfig(cloneLc(config));
+  },
+
+  async putLifecycle(bucket, config, expected) {
+    await latency();
+    lifecycleCallLog.push({ cmd: "put_lifecycle", bucket, config: cloneLc(config), expected: cloneLc(expected), at: new Date().toISOString() });
+    const b = requireBucket(bucket);
+    if (lifecycleUnsupported(bucket)) throw lifecycleNotSupported();
+    if (lifecycleDenied(bucket, b)) throw fail("AccessDenied", "Access Denied: s3:PutLifecycleConfiguration is not allowed on a bucket shared with you.");
+    const issues = validateLifecycleConfig(config);
+    if (issues.length) {
+      const parts = issues.slice(0, 10).map((i) => (i.ruleIndex === null ? i.message : `Rule ${i.ruleIndex + 1}: ${i.message}`));
+      throw fail("InvalidInput", `The lifecycle configuration was not saved because it has ${issues.length} problem${issues.length === 1 ? "" : "s"}: ${parts.join(" ")}`);
+    }
+    const current = storedLifecycle(bucket);
+    if (!sameConfiguration(current, expected)) {
+      throw fail("Conflict", "The bucket's lifecycle configuration was changed by someone else since it was loaded. Nothing was saved. Reload to see the current rules.");
+    }
+    if (sameConfiguration(current, config)) return current;
+    const mode = lifecycleSwitch(bucket);
+    if (mode === "notrans" && config.rules.some((r) => r.transitions.length || r.noncurrentVersionTransitions.length)) {
+      throw fail(
+        "NotSupported",
+        "The server refused this lifecycle configuration because it does not implement something in it (NotImplemented: A header or query you provided requested a function that is not implemented: lifecycle transitions). Nothing was changed.",
+      );
+    }
+    if (mode === "partial") {
+      const dropped = config.rules.flatMap((r, i) =>
+        r.noncurrentVersionTransitions.length || r.noncurrentVersionExpiration ? [`${ruleLabel(i, r.id)}: noncurrent-version actions`] : [],
+      );
+      if (dropped.length) {
+        throw fail(
+          "NotSupported",
+          `The server accepted the lifecycle configuration but did not store all of it (${dropped.join("; ")}); it probably does not support those features. The previous configuration was put back, so nothing changed.`,
+        );
+      }
+    }
+    writeLifecycle(bucket, config.rules.length ? asStored(config) : null);
+    return storedLifecycle(bucket);
+  },
+
+  async getBucketVersioning(bucket) {
+    await latency();
+    const b = requireBucket(bucket);
+    if (lifecycleDenied(bucket, b)) throw fail("AccessDenied", "Access Denied: s3:GetBucketVersioning is not allowed on a bucket shared with you.");
+    return mockVersioning[bucket] ?? "Off";
+  },
+
+
   async listObjects(bucket, prefix, continuationToken, pageSize): Promise<ListPage> {
     await latency();
     const b = requireBucket(bucket);
@@ -1392,8 +1632,7 @@ export const mockBackend: Backend = {
 
   async updateSettings(next) {
     await delay(120);
-    const n = next as Partial<Settings>;
-    const candidate: Settings = {
+    const candidate: AppSettings = {
       partSizeMib: next.partSizeMib,
       maxConcurrentParts: next.maxConcurrentParts,
       maxConcurrentTransfers: next.maxConcurrentTransfers,
@@ -1403,8 +1642,7 @@ export const mockBackend: Backend = {
       textSize: next.textSize,
       textWeight: next.textWeight,
       accent: next.accent,
-      // Required like every other field (the real backend rejects a request without it).
-      confirmCopyMove: n.confirmCopyMove as boolean,
+      confirmCopyMove: next.confirmCopyMove,
     };
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);

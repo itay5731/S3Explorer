@@ -48,6 +48,8 @@ export type Modal =
   /** Forget an added bucket (never touches the bucket). */
   | { kind: "removeBucket"; name: string }
   | { kind: "bucketTags"; bucket: string }
+  /** The bucket's lifecycle rules (load, edit, confirm, save the whole configuration). */
+  | { kind: "lifecycle"; bucket: string }
   | { kind: "objectTags"; bucket: string; key: string }
   /** Tag several objects at once (a "tag" job). `items` are exact keys/prefixes from the selection. */
   | { kind: "bulkTags"; bucket: string; prefix: string; items: JobItem[] }
@@ -56,7 +58,7 @@ export type Modal =
   | null;
 
 /** Modals that make sense without an open bucket. */
-export const BUCKETLESS_MODALS: ReadonlySet<NonNullable<Modal>["kind"]> = new Set(["addBucket", "removeBucket", "bucketTags", "disconnect"]);
+export const BUCKETLESS_MODALS: ReadonlySet<NonNullable<Modal>["kind"]> = new Set(["addBucket", "removeBucket", "bucketTags", "lifecycle", "disconnect"]);
 
 export interface ContextMenuState {
   x: number;

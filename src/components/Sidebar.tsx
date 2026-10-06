@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Archive, ArchiveX, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
+import { Archive, ArchiveX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
 import { loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, writePref } from "../store/app";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
@@ -249,7 +249,10 @@ export function Sidebar() {
           onClose={() => setMenu(null)}
           groups={[
             [{ label: "Open", icon: <FolderOpen size={14} />, action: () => navigate(menu.b.name, "") }],
-            [{ label: "Bucket tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "bucketTags", bucket: menu.b.name }) }],
+            [
+              { label: "Bucket tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "bucketTags", bucket: menu.b.name }) },
+              { label: "Lifecycle rules…", icon: <CalendarClock size={14} />, action: () => openModal({ kind: "lifecycle", bucket: menu.b.name }) },
+            ],
             menu.b.shared
               ? [{ label: "Remove from list…", icon: <ArchiveX size={14} />, action: () => openModal({ kind: "removeBucket", name: menu.b.name }) }]
               : [],
