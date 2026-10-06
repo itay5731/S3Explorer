@@ -35,6 +35,8 @@ function useBatchPreviews(
   const [seedUsed, setSeedUsed] = useState(false);
   // The seed was made just before the dialog opened.
   const [seedAt] = useState(() => Date.now());
+  // One backend preview id per dialog row: a newer preview of the same row stops the older one.
+  const slot = useId();
   const seeded =
     !seedUsed && !!seed && !!requests && requests.length === 1 && attempt === 0 && sameRequest(requests[0], seed.request);
   // The seed answers the first request only: once the request changes, always ask again.
@@ -49,7 +51,7 @@ function useBatchPreviews(
     const t = setTimeout(() => {
       requests.forEach((r, i) => {
         api
-          .previewBatch(r)
+          .previewBatch(r, `${slot}:${i}`)
           .then((preview) => ({ status: "ok", preview, at: Date.now() }) as const)
           .catch((error: AppError) => ({ status: "error", error }) as const)
           .then((st) => {

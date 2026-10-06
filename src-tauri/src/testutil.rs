@@ -237,3 +237,32 @@ impl Drop for ScratchDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Makes `link` a junction (Windows) or symbolic link (elsewhere) to the folder `target`.
+pub fn dir_link(link: &std::path::Path, target: &std::path::Path) {
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd").arg("/C").arg("mklink").arg("/J").arg(link).arg(target).output().expect("mklink");
+        assert!(out.status.success(), "mklink /J failed: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("symlink");
+}
+
+/// Every file below `dir` as (relative path, content), sorted.
+pub fn tree(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn rec(base: &std::path::Path, d: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+        for e in std::fs::read_dir(d).expect("read_dir").flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rec(base, &p, out);
+            } else {
+                out.push((p.strip_prefix(base).expect("below").display().to_string(), std::fs::read(&p).expect("read")));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    rec(dir, dir, &mut out);
+    out.sort();
+    out
+}

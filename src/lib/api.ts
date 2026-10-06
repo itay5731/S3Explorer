@@ -89,7 +89,8 @@ export interface Backend {
   listJobs(): Promise<Job[]>;
   onJobProgress(cb: (j: Job) => void): Promise<Unlisten>;
   // Folder transfers (batches)
-  previewBatch(request: BatchPlanRequest): Promise<BatchPreview>;
+  /** `previewId`: a newer preview with the same id cancels the one still running (it rejects `Cancelled`). */
+  previewBatch(request: BatchPlanRequest, previewId?: string): Promise<BatchPreview>;
   startBatch(request: BatchPlanRequest): Promise<string>;
   cancelBatch(id: string): Promise<void>;
   removeBatch(id: string): Promise<void>;
@@ -189,7 +190,7 @@ const tauriBackend: Backend = {
   removeJob: (id) => invoke<void>("remove_job", { id }),
   listJobs: () => invoke<Job[]>("list_jobs"),
   onJobProgress: (cb) => listen<Job>(JOB_PROGRESS_EVENT, (e) => cb(e.payload)),
-  previewBatch: (request) => invoke<BatchPreview>("preview_batch", { request }),
+  previewBatch: (request, previewId) => invoke<BatchPreview>("preview_batch", { request, previewId: previewId ?? null }),
   startBatch: (request) => invoke<string>("start_batch", { request }),
   cancelBatch: (id) => invoke<void>("cancel_batch", { id }),
   removeBatch: (id) => invoke<void>("remove_batch", { id }),
@@ -330,7 +331,7 @@ export const removeJob = (id: string) => call("removeJob", id);
 export const listJobs = () => call("listJobs");
 export const onJobProgress = (cb: (j: Job) => void) => call("onJobProgress", cb);
 /** Walk the local folder (upload) or list the prefix (download) and report what would happen. Changes nothing. */
-export const previewBatch = (request: BatchPlanRequest) => call("previewBatch", request);
+export const previewBatch = (request: BatchPlanRequest, previewId?: string) => call("previewBatch", request, previewId);
 /** Plan again and start the folder transfer; returns the batch id. */
 export const startBatch = (request: BatchPlanRequest) => call("startBatch", request);
 export const cancelBatch = (id: string) => call("cancelBatch", id);

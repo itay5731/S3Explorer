@@ -7,6 +7,7 @@
 //! (`src/lib/format.ts`), applied to every segment of the key below the batch prefix.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 /// One key segment as a safe local file or folder name: `\ / : * ? " < > |` and control
 /// characters become `_`, trailing dots and spaces are removed (Windows drops them silently),
@@ -32,14 +33,73 @@ pub fn sanitize_segment(name: &str) -> String {
     n
 }
 
-/// `^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$`, case-insensitive (ASCII), as in the frontend.
+/// Windows device names (ASCII case-insensitive), as in the frontend's `sanitizeFileName`:
+/// `con prn aux nul conin$ conout$`, and `com` / `lpt` followed by exactly one of `1-9 ¹ ² ³`.
+/// The stem is the text before the first `.`, with trailing spaces removed (Windows ignores
+/// them: `CON .txt` is the console); leading spaces are kept.
+pub const RESERVED_NAMES: [&str; 6] = ["con", "prn", "aux", "nul", "conin$", "conout$"];
+pub const RESERVED_PORT_DIGITS: [char; 12] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '\u{b9}', '\u{b2}', '\u{b3}'];
+
 fn is_reserved(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
-    match stem.as_bytes() {
-        b"con" | b"prn" | b"aux" | b"nul" => true,
-        [b'c', b'o', b'm', d] | [b'l', b'p', b't', d] => (b'1'..=b'9').contains(d),
-        _ => false,
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ').to_ascii_lowercase();
+    if RESERVED_NAMES.contains(&stem.as_str()) {
+        return true;
     }
+    let Some(rest) = stem.strip_prefix("com").or_else(|| stem.strip_prefix("lpt")) else {
+        return false;
+    };
+    let mut chars = rest.chars();
+    matches!((chars.next(), chars.next()), (Some(d), None) if RESERVED_PORT_DIGITS.contains(&d))
+}
+
+/// The message for a download target behind (or at) a link.
+pub fn link_message(link: &Path) -> String {
+    format!("Not downloaded: {} is a link to another location", link.display())
+}
+
+/// Finds a symbolic link or junction on the way from `root` to `path`: every existing folder
+/// below `root` and `path` itself (`root` is the user's choice and is not checked). Writing
+/// through one would put the file outside `root`. Stops at the first component that does not
+/// exist (nothing below it can be a link yet). `cache` remembers folders already looked at.
+///
+/// Uses `FileType::is_symlink`, which on Windows means a name-surrogate reparse point (symbolic
+/// links and junctions), not every reparse point: OneDrive / cloud placeholder folders are
+/// reparse points too and are ordinary folders here.
+pub fn link_below(root: &Path, path: &Path, cache: &mut HashMap<PathBuf, LinkState>) -> Option<PathBuf> {
+    let rel = path.strip_prefix(root).ok()?;
+    let mut cur = root.to_path_buf();
+    let n = rel.components().count();
+    for (i, c) in rel.components().enumerate() {
+        cur.push(c);
+        let last = i + 1 == n;
+        let state = match cache.get(&cur) {
+            Some(s) => *s,
+            None => {
+                let s = match std::fs::symlink_metadata(&cur) {
+                    Ok(m) if m.file_type().is_symlink() => LinkState::Link,
+                    Ok(_) => LinkState::Plain,
+                    Err(_) => LinkState::Absent,
+                };
+                if !last {
+                    cache.insert(cur.clone(), s);
+                }
+                s
+            }
+        };
+        match state {
+            LinkState::Link => return Some(cur),
+            LinkState::Absent => return None,
+            LinkState::Plain => {}
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkState {
+    Link,
+    Plain,
+    Absent,
 }
 
 /// The local path components for `rel` (a key with the batch prefix removed): split on `/` and
@@ -51,12 +111,34 @@ pub fn local_components(rel: &str) -> Vec<String> {
 /// Whether local paths compare without case on this OS (Windows and macOS by default).
 const CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
 
+/// macOS file systems (APFS, HFS+) also treat NFC and NFD spellings as one name.
+const NORMALIZATION_INSENSITIVE: bool = cfg!(target_os = "macos");
+
 fn fold(path: &str) -> String {
-    if CASE_INSENSITIVE {
-        path.to_lowercase()
-    } else {
-        path.to_string()
+    fold_with(path, CASE_INSENSITIVE, NORMALIZATION_INSENSITIVE)
+}
+
+/// The form two paths share when the file system sees them as the same file. Case is folded
+/// per character with simple (one-to-one) uppercase mapping, like NTFS's upcase table, so
+/// `ΣΣ`, `σσ` and `σς` collide (`str::to_lowercase` turns a final `Σ` into `ς` and misses it).
+/// A character whose uppercase is several characters (`ß`) is kept as it is. With `nfc`
+/// (macOS) the path is NFC-normalized first.
+pub fn fold_with(path: &str, case_insensitive: bool, nfc: bool) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let normalized: String = if nfc { path.nfc().collect() } else { path.to_string() };
+    if !case_insensitive {
+        return normalized;
     }
+    normalized
+        .chars()
+        .map(|c| {
+            let mut up = c.to_uppercase();
+            match (up.next(), up.next()) {
+                (Some(u), None) => u,
+                _ => c,
+            }
+        })
+        .collect()
 }
 
 /// Why a key cannot be written locally.
@@ -150,6 +232,14 @@ mod tests {
         for n in ["com0", "COM10", "console", "con-1.txt", "nul_", "lpt", "auxiliary.txt"] {
             assert_eq!(sanitize_segment(n), n, "{n:?}");
         }
+        // The exact rule shared with the frontend: stem before the first ".", trailing spaces
+        // removed; con prn aux nul conin$ conout$; com/lpt + one of 1-9 ¹ ² ³.
+        for n in ["CON .txt", "nul   .tar.gz", "COM\u{b9}", "lpt\u{b2}.x", "CONIN$", "conout$.txt", "CONIN$ .log", "com\u{b3}"] {
+            assert_eq!(sanitize_segment(n), format!("_{n}"), "{n:?} is reserved");
+        }
+        for n in [" CON.txt", "COM\u{2074}", "COM\u{b9}\u{b9}", "CONIN", "CONOUT$$", "CONIN$x", "COM0"] {
+            assert_eq!(sanitize_segment(n), n, "{n:?} is not reserved");
+        }
         // Reserved after trimming: "CON." -> "CON" -> "_CON".
         assert_eq!(sanitize_segment("CON."), "_CON");
         // Spaces and unicode are kept as they are.
@@ -169,6 +259,30 @@ mod tests {
         assert_eq!(local_components("sub dir/ünï cødé.txt"), ["sub dir", "ünï cødé.txt"]);
         for comps in [local_components("../a"), local_components("a/./b"), local_components("C:/x")] {
             assert!(comps.iter().all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains(['/', '\\', ':'])));
+        }
+    }
+
+    #[test]
+    fn folding_matches_the_file_systems() {
+        // NTFS-like simple case folding: sigma forms collide, ß is not expanded.
+        assert_eq!(fold_with("\u{3a3}\u{3a3}", true, false), fold_with("\u{3c3}\u{3c3}", true, false));
+        assert_eq!(fold_with("\u{3c3}\u{3c2}", true, false), fold_with("\u{3a3}\u{3a3}", true, false));
+        assert_ne!("\u{3a3}\u{3a3}".to_lowercase(), "\u{3c3}\u{3c3}".to_lowercase(), "why str::to_lowercase was wrong");
+        assert_eq!(fold_with("stra\u{df}e", true, false), "STRA\u{df}E");
+        assert_eq!(fold_with("A/b.TXT", true, false), fold_with("a/B.txt", true, false));
+        // macOS: NFD and NFC spellings of é are one name (after case folding too).
+        let (nfc, nfd) = ("caf\u{e9}.txt", "cafe\u{301}.txt");
+        assert_eq!(fold_with(nfc, true, true), fold_with(nfd, true, true));
+        assert_eq!(fold_with("CAF\u{c9}.TXT", true, true), fold_with(nfd, true, true));
+        // Without normalization (Windows, Linux) they are different names.
+        assert_ne!(fold_with(nfc, true, false), fold_with(nfd, true, false));
+        assert_ne!(fold_with(nfc, false, false), fold_with(nfd, false, false));
+        // Case-sensitive systems keep case.
+        assert_ne!(fold_with("A", false, false), fold_with("a", false, false));
+        if CASE_INSENSITIVE {
+            let mut t = LocalTree::default();
+            assert!(t.claim(&local_components("\u{3a3}\u{3a3}.txt"), "p/1").is_ok());
+            assert!(t.claim(&local_components("\u{3c3}\u{3c3}.txt"), "p/2").is_err(), "sigma pair collides");
         }
     }
 

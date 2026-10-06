@@ -82,18 +82,25 @@ export const selectActiveBatchCount = (s: BatchState) => {
  */
 export function upsertBatchFiles(ts: Transfer[]) {
   if (!ts.length) return;
-  const files = { ...useBatches.getState().files };
+  // A batch can queue thousands of files in one burst, all delivered in one frame: copy the store
+  // and each batch's map at most once per call (copying per event was quadratic and froze the UI).
+  const prev = useBatches.getState().files;
+  let files: Record<string, Record<string, Transfer>> | null = null;
+  const copied = new Set<string>();
   for (const t of ts) {
     const bid = t.batchId!;
-    const cur = files[bid] ?? {};
+    const cur = (files ?? prev)[bid];
     const active = t.status === "running" || t.status === "queued";
-    if (!active && !cur[t.id]) continue;
-    const next = { ...cur };
-    if (active) next[t.id] = t;
-    else delete next[t.id];
-    files[bid] = next;
+    if (!active && !cur?.[t.id]) continue;
+    if (!files) files = { ...prev };
+    if (!copied.has(bid)) {
+      files[bid] = { ...(cur ?? {}) };
+      copied.add(bid);
+    }
+    if (active) files[bid][t.id] = t;
+    else delete files[bid][t.id];
   }
-  useBatches.setState({ files });
+  if (files) useBatches.setState({ files });
 }
 
 /** The request each batch was started with, by batch id (this session only). */

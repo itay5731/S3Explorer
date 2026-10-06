@@ -161,7 +161,8 @@ enum Job {
     /// `no_replace`: fail instead of replacing a file that already exists at `dest` (batch
     /// downloads under `onConflict: skip`); the single-file command replaces it.
     /// `version_id`: download that version instead of the current one (`download_object_version`).
-    Download { dest: PathBuf, no_replace: bool, version_id: Option<String> },
+    /// `within`: a folder download's root; the file must stay inside it (no links on the way).
+    Download { dest: PathBuf, no_replace: bool, version_id: Option<String>, within: Option<PathBuf> },
     Upload { src: PathBuf },
 }
 
@@ -219,12 +220,12 @@ fn validate_download_dest(dest: &Path) -> AppResult<()> {
 }
 
 /// Comparison key for "same local file" (case-insensitive and separator-agnostic on Windows).
+/// One form per local file, with the same folding as folder downloads use
+/// ([`crate::batches::localname::fold_with`]): case-insensitive on Windows and macOS (NTFS-like
+/// per-character mapping), NFC-normalized on macOS.
 fn dest_key(path: &str) -> String {
-    if cfg!(windows) {
-        path.replace('/', "\\").to_lowercase()
-    } else {
-        path.to_string()
-    }
+    let path = if cfg!(windows) { path.replace('/', "\\") } else { path.to_string() };
+    crate::batches::localname::fold_with(&path, cfg!(any(windows, target_os = "macos")), cfg!(target_os = "macos"))
 }
 
 impl TransferManager {
@@ -287,7 +288,7 @@ impl TransferManager {
     /// Rejects (`InvalidInput`) a relative destination, one containing `..`, and one that an
     /// active (queued/running) download already targets.
     pub fn start_download(self: &Arc<Self>, client: Client, bucket: &str, key: &str, dest: PathBuf) -> AppResult<String> {
-        self.queue_download(client, bucket, key, dest, false, None, None)
+        self.queue_download(client, bucket, key, dest, false, None, None, None)
     }
 
     /// Queues a download of one version of `bucket/key` (every request carries `versionId`).
@@ -303,22 +304,24 @@ impl TransferManager {
         if version_id.is_empty() {
             return Err(AppError::invalid("versionId is required"));
         }
-        self.queue_download(client, bucket, key, dest, false, Some(version_id.to_string()), None)
+        self.queue_download(client, bucket, key, dest, false, Some(version_id.to_string()), None, None)
     }
 
     /// Queues one file of a folder download. With `no_replace` the transfer fails (and leaves
     /// the file untouched) when something already exists at `dest`, checked before the first
     /// request and again atomically at the final rename. Otherwise as [`Self::start_download`].
+    #[allow(clippy::too_many_arguments)]
     pub fn start_batch_download(
         self: &Arc<Self>,
         client: Client,
         bucket: &str,
         key: &str,
         dest: PathBuf,
+        root: &Path,
         no_replace: bool,
         link: BatchLink,
     ) -> AppResult<String> {
-        self.queue_download(client, bucket, key, dest, no_replace, None, Some(link))
+        self.queue_download(client, bucket, key, dest, no_replace, None, Some(link), Some(root.to_path_buf()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -331,17 +334,20 @@ impl TransferManager {
         no_replace: bool,
         version_id: Option<String>,
         link: Option<BatchLink>,
+        within: Option<PathBuf>,
     ) -> AppResult<String> {
         validate_download_dest(&dest)?;
         let local = dest.to_string_lossy().into_owned();
-        let mut active = self.active_dests.lock().unwrap_or_else(|p| p.into_inner());
-        if !active.insert(dest_key(&local)) {
+        // Claim the destination, then release the lock before `start`: holding it across the
+        // entry insert (a DashMap shard lock) closed a lock cycle with `run_job` (record lock, then
+        // this lock) and `list`/`cancel_active` (shard lock, then record lock) that froze the app.
+        // The claim alone keeps a second download out; it is released when the transfer ends.
+        if !self.active_dests.lock().unwrap_or_else(|p| p.into_inner()).insert(dest_key(&local)) {
             return Err(AppError::invalid(format!(
                 "Another download is already writing to {local}. Wait for it to finish or cancel it first."
             )));
         }
-        // Still under the lock: the entry exists before another start can check this destination.
-        Ok(self.start(client, TransferKind::Download, bucket, key, local, Job::Download { dest, no_replace, version_id }, link))
+        Ok(self.start(client, TransferKind::Download, bucket, key, local, Job::Download { dest, no_replace, version_id, within }, link))
     }
 
     /// Queues an upload of `src` to `bucket/key`. Must be called within a Tokio runtime.
@@ -437,12 +443,12 @@ impl TransferManager {
                 let fault = self.tuning.fault.clone();
                 let body = async {
                     match job {
-                        Job::Download { dest, no_replace, version_id } => {
+                        Job::Download { dest, no_replace, version_id, within } => {
                             if let Some(f) = &fault {
                                 f("download");
                             }
                             let src = download::Source { bucket: &bucket, key: &key, version_id: version_id.as_deref() };
-                            download::run(&client, &entry, cfg, &id, src, &dest, no_replace).await
+                            download::run(&client, &entry, cfg, &id, src, &dest, no_replace, within.as_deref()).await
                         }
                         Job::Upload { src } => {
                             if let Some(f) = &fault {
@@ -455,14 +461,16 @@ impl TransferManager {
                 // A panic must not leave the transfer "running" forever (and the updater blocked):
                 // it becomes a failure and the final event below is still sent. Release builds
                 // use `panic = "abort"`, so there a panic still ends the whole process.
-                let r = AssertUnwindSafe(body).catch_unwind().await.unwrap_or_else(|p| Err(AppError::from_panic(&*p)));
+                // Boxed: a queued task (a folder transfer queues thousands at once) then holds a
+                // pointer, not the whole download/upload state machine (about 20 KB each).
+                let r = Box::pin(AssertUnwindSafe(body).catch_unwind()).await.unwrap_or_else(|p| Err(AppError::from_panic(&*p)));
                 stop.cancel();
                 let _ = ticker.await;
                 r
             }
         };
 
-        {
+        let released = {
             let mut rec = entry.lock();
             rec.bytes_per_sec = 0;
             rec.finished_at = Some(now_iso());
@@ -480,9 +488,11 @@ impl TransferManager {
                     rec.error = Some(e.message);
                 }
             }
-            if rec.kind == TransferKind::Download {
-                self.active_dests.lock().unwrap_or_else(|p| p.into_inner()).remove(&dest_key(&rec.local_path));
-            }
+            // Lock order: never take `active_dests` while holding a record lock (see `queue_download`).
+            (rec.kind == TransferKind::Download).then(|| dest_key(&rec.local_path))
+        };
+        if let Some(dest) = released {
+            self.active_dests.lock().unwrap_or_else(|p| p.into_inner()).remove(&dest);
         }
         let last = entry.snapshot();
         self.sink.emit(&last);
@@ -1029,7 +1039,7 @@ mod tests {
         std::fs::write(&dest, b"keep me").expect("write");
         let obs = Arc::new(CountingObserver(Mutex::new(Vec::new())));
         let link = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs.clone() };
-        let id = tm.start_batch_download(s3.client(), "b", "k", dest.clone(), true, link.clone()).expect("start");
+        let id = tm.start_batch_download(s3.client(), "b", "k", dest.clone(), &dir.0, true, link.clone()).expect("start");
         let t = finished(&tm, &id, Duration::from_secs(30)).await;
         assert_eq!(t.status, TransferStatus::Failed);
         assert!(t.error.as_deref().unwrap_or_default().starts_with("A file already exists at "), "{:?}", t.error);
@@ -1042,7 +1052,7 @@ mod tests {
         assert_eq!(seen, vec![(id.clone(), TransferStatus::Running), (id.clone(), TransferStatus::Failed)]);
         // A free destination downloads normally in the same mode.
         let free = dir.0.join("free.bin");
-        let id = tm.start_batch_download(s3.client(), "b", "k", free.clone(), true, link.clone()).expect("start");
+        let id = tm.start_batch_download(s3.client(), "b", "k", free.clone(), &dir.0, true, link.clone()).expect("start");
         assert_eq!(finished(&tm, &id, Duration::from_secs(30)).await.status, TransferStatus::Completed);
         assert_eq!(std::fs::read(&free).expect("read"), expected(1000));
         // The single-file command (and no_replace = false) keeps replacing.
@@ -1053,9 +1063,135 @@ mod tests {
         assert_eq!(std::fs::read(&dest).expect("read"), expected(1000));
         // Cancelling the batch token cancels a file started after the cancel.
         link.cancel.cancel();
-        let id = tm.start_batch_download(s3.client(), "b", "k", dir.0.join("late.bin"), false, link).expect("start");
+        let id = tm.start_batch_download(s3.client(), "b", "k", dir.0.join("late.bin"), &dir.0, false, link).expect("start");
         assert_eq!(finished(&tm, &id, Duration::from_secs(30)).await.status, TransferStatus::Cancelled);
         assert!(!dir.0.join("late.bin").exists());
+    }
+
+    /// Regression (v0.5.0 e2e): starting downloads held `active_dests` across the entry insert
+    /// while a finishing transfer held its record lock and waited for `active_dests`, and a
+    /// listing held a shard lock and waited for that record lock: all three blocked forever (the
+    /// app froze when "Cancel them and disconnect" ran during a folder download). Starts, ends,
+    /// listings and cancels race here; a watchdog turns a deadlock into a failure.
+    #[test]
+    fn starting_finishing_and_listing_downloads_never_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("runtime");
+            rt.block_on(async {
+                let dir = ScratchDir::new("dl-lock-order");
+                let s3 = object_server(16, |_, _| None, false).await;
+                let tm = manager(TransferSettings { max_concurrent_transfers: 8, ..TransferSettings::default() }, TransferTuning::default());
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let listers: Vec<_> = (0..3)
+                    .map(|i| {
+                        let (tm, stop) = (tm.clone(), stop.clone());
+                        std::thread::spawn(move || {
+                            while !stop.load(Ordering::Relaxed) {
+                                let _ = tm.list();
+                                let _ = tm.has_active();
+                                if i == 0 {
+                                    let _ = tm.cancel_active();
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+                let mut ids = Vec::new();
+                for n in 0..3000 {
+                    ids.push(tm.start_download(s3.client(), "b", "k", dir.0.join(format!("f{n}.bin"))).expect("start"));
+                    if n % 64 == 63 {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                for id in &ids {
+                    tm.wait(id).await;
+                }
+                stop.store(true, Ordering::Relaxed);
+                for l in listers {
+                    l.join().expect("lister");
+                }
+            });
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(120)).expect("starts, finishes and listings deadlocked");
+    }
+
+    /// M3 (review): a 50,000-file batch queues 50,000 tasks at once. A queued task must stay
+    /// small: the download/upload state machine is boxed and only allocated once it runs.
+    #[tokio::test]
+    async fn a_queued_transfer_task_is_small() {
+        let s3 = FakeS3::start(|_| Reply::status(500)).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let entry = Arc::new(TransferEntry {
+            seq: 0,
+            record: Mutex::new(Transfer {
+                id: "t".into(),
+                kind: TransferKind::Download,
+                batch_id: None,
+                bucket: "b".into(),
+                key: "k".into(),
+                local_path: "x".into(),
+                total_bytes: 0,
+                transferred_bytes: 0,
+                parts_total: 0,
+                parts_done: 0,
+                bytes_per_sec: 0,
+                status: TransferStatus::Queued,
+                error: None,
+                started_at: now_iso(),
+                finished_at: None,
+            }),
+            cancel: CancellationToken::new(),
+            finished: CancellationToken::new(),
+            transferred: AtomicU64::new(0),
+            parts_done: AtomicU32::new(0),
+            parts_in_flight: AtomicUsize::new(0),
+            peak_parts_in_flight: AtomicUsize::new(0),
+            part_retries: AtomicU32::new(0),
+            discarded_bytes: AtomicU64::new(0),
+            file_syncs: AtomicU32::new(0),
+            observer: None,
+        });
+        let jobs = [
+            Job::Download { dest: PathBuf::from("x"), no_replace: false, version_id: None, within: None },
+            Job::Upload { src: PathBuf::from("x") },
+        ];
+        for job in jobs {
+            let fut = tm.clone().run_job(entry.clone(), tm.running.enqueue(), s3.client(), job);
+            let size = std::mem::size_of_val(&fut);
+            eprintln!("run_job future: {size} bytes");
+            assert!(size < 2048, "a queued transfer task holds {size} bytes");
+        }
+    }
+
+    /// L6 (review): a folder-upload file replaced by a symbolic link after planning is not
+    /// followed; a single upload of a link keeps working.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_batch_upload_does_not_follow_a_link() {
+        let dir = ScratchDir::new("up-link");
+        let target = dir.0.join("secret.txt");
+        std::fs::write(&target, b"outside").expect("target");
+        let link = dir.0.join("planned.txt");
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_file(&target, &link);
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(&target, &link);
+        if let Err(e) = made {
+            eprintln!("skipped: cannot create a file symlink here ({e})");
+            return;
+        }
+        let s3 = FakeS3::start(|_| Reply::with_headers(200, vec![h("ETag", "\"e\"")])).await;
+        let tm = TransferManager::new(Arc::new(NoopSink));
+        let obs = Arc::new(CountingObserver(Mutex::new(Vec::new())));
+        let blink = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs };
+        let id = tm.start_batch_upload(s3.client(), "b", "k", link.clone(), blink);
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Failed, "{t:?}");
+        assert!(t.error.as_deref().unwrap_or_default().contains("link"), "{:?}", t.error);
+        assert!(s3.requests().is_empty(), "nothing sent");
+        let id = tm.start_upload(s3.client(), "b", "k", link);
+        assert_eq!(finished(&tm, &id, Duration::from_secs(30)).await.status, TransferStatus::Completed);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1108,6 +1244,7 @@ mod tests {
         assert_eq!(dest_key("/a/b"), dest_key("/a/b"));
         if cfg!(windows) {
             assert_eq!(dest_key(r"C:\Dl\Report.pdf"), dest_key("c:/dl/report.PDF"));
+            assert_eq!(dest_key("C:\\dl\\\u{3a3}\u{3a3}.txt"), dest_key("c:/dl/\u{3c3}\u{3c3}.txt"), "sigma forms are one file");
         }
     }
 }

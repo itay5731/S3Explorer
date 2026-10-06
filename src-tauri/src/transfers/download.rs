@@ -51,9 +51,48 @@ pub(super) struct Source<'a> {
 /// Temp file next to `dest`, unique per transfer (`{dest}.{first 8 of id}.part`), so two
 /// downloads can never share one partially written file.
 fn part_path(dest: &Path, id: &str) -> PathBuf {
+    let suffix = format!(".{}.part", id.get(..8).unwrap_or(id));
+    let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // File names are limited to 255 units (UTF-16 on Windows, bytes elsewhere): a long name plus
+    // the suffix would not fit, so the temp file then uses a shortened name (UTF-8 bytes are an
+    // upper bound for both). The final name is unchanged.
+    if name.len() + suffix.len() > MAX_NAME_BYTES {
+        let mut cut = MAX_NAME_BYTES - suffix.len();
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        return dest.with_file_name(format!("{}{suffix}", &name[..cut]));
+    }
     let mut s: OsString = dest.as_os_str().to_owned();
-    s.push(format!(".{}.part", id.get(..8).unwrap_or(id)));
+    s.push(suffix);
     PathBuf::from(s)
+}
+
+/// The longest file name most file systems accept.
+const MAX_NAME_BYTES: usize = 255;
+
+/// `InvalidInput` when a symbolic link or junction lies between `root` and `dest` (or is `dest`).
+pub(crate) fn refuse_links(root: &Path, dest: &Path) -> AppResult<()> {
+    let mut cache = std::collections::HashMap::new();
+    match crate::batches::localname::link_below(root, dest, &mut cache) {
+        Some(link) => Err(AppError::invalid(crate::batches::localname::link_message(&link))),
+        None => Ok(()),
+    }
+}
+
+/// `InvalidInput` unless the canonical `dir` is inside the canonical `root`.
+pub(crate) fn require_inside(root: &Path, dir: &Path) -> AppResult<()> {
+    let real_root = std::fs::canonicalize(root)?;
+    let real_dir = std::fs::canonicalize(dir)?;
+    if real_dir.starts_with(&real_root) {
+        Ok(())
+    } else {
+        Err(AppError::invalid(format!(
+            "Not downloaded: {} leads outside {} (a link to another location)",
+            dir.display(),
+            root.display()
+        )))
+    }
 }
 
 /// Creates the temp file, failing if it already exists (never truncate someone else's data).
@@ -361,9 +400,16 @@ pub(super) async fn run(
     src: Source<'_>,
     dest: &Path,
     no_replace: bool,
+    within: Option<&Path>,
 ) -> AppResult<()> {
     if dest.as_os_str().is_empty() {
         return Err(AppError::invalid("Destination path is required"));
+    }
+    // A folder download's file must stay inside its root: a link created after planning on the
+    // way (or at the file itself) fails the file before anything is created or requested.
+    if let Some(root) = within {
+        let (r, d) = (root.to_path_buf(), dest.to_path_buf());
+        tokio::task::spawn_blocking(move || refuse_links(&r, &d)).await??;
     }
     // Checked before any request (no bandwidth spent on a file that will be refused) and again,
     // atomically, at the final rename (something may appear at `dest` meanwhile).
@@ -390,6 +436,11 @@ pub(super) async fn run(
 
     if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
         tokio::fs::create_dir_all(parent).await?;
+        // And once the folders exist: the real (canonical) folder must be inside the real root.
+        if let Some(root) = within {
+            let (r, p) = (root.to_path_buf(), parent.to_path_buf());
+            tokio::task::spawn_blocking(move || require_inside(&r, &p)).await??;
+        }
     }
     let tmp = part_path(dest, id);
     let tmp_owned = tmp.clone();
@@ -739,6 +790,22 @@ mod tests {
         assert!(!is_checksum_mismatch(&*io));
     }
 
+    /// L2 (review): a 250-character name still gets a temp file that can be created.
+    #[test]
+    fn part_path_fits_long_names() {
+        use crate::testutil::ScratchDir;
+        let dir = ScratchDir::new("part-long");
+        for name in ["a".repeat(250), "é".repeat(120) + ".bin", "b".repeat(241)] {
+            let dest = dir.0.join(&name);
+            let tmp = part_path(&dest, "0123456789abcdef");
+            let tmp_name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(tmp_name.len() <= 255 && tmp_name.ends_with(".01234567.part"), "{} bytes", tmp_name.len());
+            assert_eq!(tmp.parent(), dest.parent());
+            create_tmp(&tmp).expect("temp file can be created");
+            assert_ne!(part_path(&dest, "fedcba9876543210"), tmp, "still unique per transfer");
+        }
+    }
+
     #[test]
     fn part_path_is_unique_per_transfer() {
         let dest = Path::new("/tmp/report.pdf");
@@ -863,5 +930,33 @@ mod tests {
         assert_eq!(std::fs::read(&c).unwrap(), b"new");
         assert!(!a.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// H1 (review): the run-time re-check catches a link that appeared after planning, at the
+    /// file or on the way, and a parent whose real location is outside the root.
+    #[test]
+    fn run_time_link_checks() {
+        use crate::testutil::{dir_link, ScratchDir};
+        let dir = ScratchDir::new("dl-runtime-link");
+        let (root, outside) = (dir.0.join("root"), dir.0.join("outside"));
+        std::fs::create_dir_all(root.join("plain")).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        assert!(refuse_links(&root, &root.join("plain").join("f.txt")).is_ok());
+        assert!(refuse_links(&root, &root.join("not-yet").join("deeper").join("f.txt")).is_ok());
+        assert!(require_inside(&root, &root.join("plain")).is_ok());
+        dir_link(&root.join("j"), &outside);
+        let e = refuse_links(&root, &root.join("j").join("sub").join("f.txt")).expect_err("link on the way");
+        assert!(e.message.contains("is a link to another location") && e.message.contains("j"), "{}", e.message);
+        let e = refuse_links(&root, &root.join("j")).expect_err("the file itself is a link");
+        assert!(e.message.contains("is a link"), "{}", e.message);
+        let e = require_inside(&root, &root.join("j")).expect_err("real folder is outside");
+        assert!(e.message.contains("leads outside"), "{}", e.message);
+        // The root itself may be a link (the user chose it).
+        dir_link(&dir.0.join("root-link"), &root);
+        assert!(refuse_links(&dir.0.join("root-link"), &dir.0.join("root-link").join("plain").join("f")).is_ok());
+        assert!(require_inside(&dir.0.join("root-link"), &dir.0.join("root-link").join("plain")).is_ok());
+        assert!(std::fs::read_dir(&outside).expect("outside").next().is_none(), "nothing created outside");
+        std::fs::remove_dir(root.join("j")).expect("unlink");
+        std::fs::remove_dir(dir.0.join("root-link")).expect("unlink");
     }
 }

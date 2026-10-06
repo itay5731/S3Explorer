@@ -14,9 +14,9 @@
 pub mod localname;
 pub mod plan;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -213,6 +213,8 @@ pub struct BatchManager {
     transfers: Arc<TransferManager>,
     sink: Arc<dyn BatchSink>,
     seq: AtomicU64,
+    /// Running previews by caller-supplied id (see [`BatchManager::preview`]).
+    previews: Mutex<HashMap<String, CancellationToken>>,
 }
 
 /// "photos/" for `C:\Users\me\photos`; the path itself when it has no last component.
@@ -233,13 +235,37 @@ fn label(req: &BatchPlanRequest) -> String {
 
 /// Plans `req` and reports what it would do, changing nothing.
 pub async fn preview(req: &BatchPlanRequest, client: &Client) -> AppResult<BatchPreview> {
-    let plan = plan::plan(req, client, &CancellationToken::new(), true).await?;
+    preview_cancellable(req, client, &CancellationToken::new()).await
+}
+
+/// [`preview`], stopped (`Cancelled`) when `cancel` fires.
+pub async fn preview_cancellable(req: &BatchPlanRequest, client: &Client, cancel: &CancellationToken) -> AppResult<BatchPreview> {
+    let plan = plan::plan(req, client, cancel, true).await?;
     Ok(plan.preview())
 }
 
 impl BatchManager {
     pub fn new(transfers: Arc<TransferManager>, sink: Arc<dyn BatchSink>) -> Arc<Self> {
-        Arc::new(Self { entries: DashMap::new(), transfers, sink, seq: AtomicU64::new(0) })
+        Arc::new(Self { entries: DashMap::new(), transfers, sink, seq: AtomicU64::new(0), previews: Mutex::new(HashMap::new()) })
+    }
+
+    /// Runs a preview. With `preview_id` (chosen by the caller, one per dialog slot), a newer
+    /// preview with the same id cancels the one still running, which then ends `Cancelled`:
+    /// typing in the prefix field never leaves earlier listings running.
+    pub async fn preview(&self, req: &BatchPlanRequest, client: &Client, preview_id: Option<String>) -> AppResult<BatchPreview> {
+        let Some(pid) = preview_id else {
+            return preview(req, client).await;
+        };
+        let token = CancellationToken::new();
+        if let Some(old) = lock(&self.previews).insert(pid.clone(), token.clone()) {
+            old.cancel();
+        }
+        let r = preview_cancellable(req, client, &token).await;
+        // Forget the id unless a newer preview took it over (taking over cancels this token).
+        if !token.is_cancelled() {
+            lock(&self.previews).remove(&pid);
+        }
+        r
     }
 
     /// Validates `req`, creates the batch (`planning`) and returns its id; planning and the
@@ -326,6 +352,7 @@ impl BatchManager {
         // ---- transfers, in path order, into the normal queue ----
         let observer: Arc<dyn TransferObserver> = Arc::new(Observer { entry: entry.clone(), sink: self.sink.clone() });
         let batch_id = entry.lock().id.clone();
+        let root = PathBuf::from(&req.local_path);
         for (i, f) in files.into_iter().enumerate() {
             if entry.cancel.is_cancelled() {
                 break;
@@ -338,7 +365,7 @@ impl BatchManager {
                 }
                 BatchKind::Download => {
                     let no_replace = req.on_conflict == ConflictPolicy::Skip;
-                    self.transfers.start_batch_download(client.clone(), &req.bucket, &f.key, f.local, no_replace, link)
+                    self.transfers.start_batch_download(client.clone(), &req.bucket, &f.key, f.local, &root, no_replace, link)
                 }
             };
             match started {
@@ -646,5 +673,177 @@ mod tests {
         assert_eq!(label(&r(BatchKind::Upload, "", &local)), "Upload photos/");
         assert_eq!(label(&r(BatchKind::Download, "a/logs/", &local)), format!("Download logs/ to {local}"));
         assert_eq!(label(&r(BatchKind::Download, "a//", &local)), format!("Download a// to {local}"));
+    }
+
+    /// H1 (review): a junction / symlink below the download root must never be written through,
+    /// under either policy; the files behind it are per-file failures and the folder it points
+    /// to stays byte-identical with nothing new in it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_folder_download_never_writes_through_a_link_below_its_root() {
+        use crate::testutil::{dir_link, tree, FakeS3, Reply, ScratchDir};
+        let dir = ScratchDir::new("dl-link");
+        let (root, outside) = (dir.0.join("root"), dir.0.join("outside"));
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("x.txt"), b"outside original").expect("x");
+        dir_link(&root.join("a"), &outside);
+        let before = tree(&outside);
+        let s3 = FakeS3::start(|r| {
+            if r.method == "GET" && r.has_query("list-type") {
+                Reply::xml(
+                    200,
+                    r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>b</Name><IsTruncated>false</IsTruncated><Contents><Key>p/a/new.txt</Key><Size>5</Size></Contents><Contents><Key>p/a/x.txt</Key><Size>5</Size></Contents><Contents><Key>p/ok.txt</Key><Size>5</Size></Contents></ListBucketResult>"#,
+                )
+            } else if r.method == "HEAD" {
+                Reply::with_headers(200, vec![crate::testutil::h("Content-Length", "5"), crate::testutil::h("ETag", "\"e\"")])
+            } else if r.method == "GET" {
+                Reply::Full { status: 200, headers: vec![crate::testutil::h("ETag", "\"e\"")], body: b"REMOT".to_vec() }
+            } else {
+                Reply::status(500)
+            }
+        })
+        .await;
+        let tm = TransferManager::new(Arc::new(crate::transfers::NoopSink));
+        let bm = BatchManager::new(tm, Arc::new(NoopBatchSink));
+        for policy in [ConflictPolicy::Overwrite, ConflictPolicy::Skip] {
+            let req = BatchPlanRequest {
+                kind: BatchKind::Download,
+                bucket: "b".into(),
+                prefix: "p/".into(),
+                local_path: root.display().to_string(),
+                on_conflict: policy,
+            };
+            // The preview already reports both as failures (notes), not as conflicts.
+            let preview = preview(&req, &s3.client()).await.expect("preview");
+            // ok.txt: new in the first round, already downloaded (a conflict) in the second.
+            let ok_exists = u64::from(policy == ConflictPolicy::Skip);
+            assert_eq!((preview.files, preview.conflicts), (1, ok_exists), "{policy:?}: {preview:?}");
+            assert_eq!(preview.notes.iter().filter(|n| n.contains("is a link to another location")).count(), 2, "{:?}", preview.notes);
+            let id = bm.start(req, s3.client()).expect("start");
+            let b = tokio::time::timeout(Duration::from_secs(30), bm.wait(&id)).await.expect("in time").expect("known");
+            assert_eq!(b.status, BatchStatus::Failed, "{policy:?}: {b:?}");
+            assert_eq!((b.failed_files, b.done_files + b.skipped_files), (2, 1), "{b:?}");
+            assert!(b.errors.iter().all(|e| e.message.contains("is a link to another location")), "{:?}", b.errors);
+            assert_eq!(tree(&outside), before, "{policy:?}: the linked folder is untouched");
+        }
+        // Only the file outside the link was ever requested.
+        let gets: Vec<String> = s3.requests().into_iter().filter(|r| r.method != "GET" || !r.has_query("list-type")).map(|r| r.path).collect();
+        assert!(gets.iter().all(|p| p.ends_with("/p/ok.txt")), "{gets:?}");
+        std::fs::remove_dir(root.join("a")).expect("unlink");
+    }
+
+    /// A fake ListObjectsV2 over `keys` (sorted) honouring prefix, start-after and continuation
+    /// tokens (the token is the last key returned), 1,000 keys per page; HEAD answers from `keys`.
+    fn listing_server(keys: Vec<String>) -> impl Fn(&crate::testutil::Req) -> crate::testutil::Reply + Send + Sync + 'static {
+        use crate::testutil::Reply;
+        let keys = Arc::new(keys);
+        move |r| {
+            let q = |name: &str| {
+                r.query.split('&').find_map(|p| p.strip_prefix(&format!("{name}="))).map(|v| v.replace("%2F", "/"))
+            };
+            if r.method == "GET" && r.has_query("list-type") {
+                let prefix = q("prefix").unwrap_or_default();
+                let after = q("continuation-token").or_else(|| q("start-after")).unwrap_or_default();
+                let page: Vec<&String> = keys.iter().filter(|k| k.starts_with(&prefix) && k.as_str() > after.as_str()).take(1000).collect();
+                let more = page.len() == 1000 && keys.iter().any(|k| k.starts_with(&prefix) && k > page[999]);
+                let mut x = format!(r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>b</Name><IsTruncated>{more}</IsTruncated>"#);
+                if more {
+                    x.push_str(&format!("<NextContinuationToken>{}</NextContinuationToken>", page[999]));
+                }
+                for k in page {
+                    x.push_str(&format!("<Contents><Key>{k}</Key><Size>1</Size></Contents>"));
+                }
+                x.push_str("</ListBucketResult>");
+                Reply::xml(200, &x)
+            } else if r.method == "HEAD" {
+                let key = r.path.trim_start_matches("/b/").to_string();
+                if keys.contains(&key) {
+                    Reply::with_headers(200, vec![crate::testutil::h("Content-Length", "1")])
+                } else {
+                    Reply::status(404)
+                }
+            } else {
+                Reply::status(500)
+            }
+        }
+    }
+
+    fn planned(keys: &[&str]) -> Vec<PlannedFile> {
+        keys.iter().map(|k| PlannedFile { key: k.to_string(), local: k.into(), size: 1, exists: false }).collect()
+    }
+
+    /// M1 (review): a 3-file folder uploaded into a prefix holding 200,000 keys lists a page or
+    /// two around its own keys, not all 200 pages.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_conflicts_list_only_the_planned_range() {
+        use crate::testutil::FakeS3;
+        let mut keys: Vec<String> = (0..200_000).map(|i| format!("k{i:06}")).collect();
+        keys.push("dir/b".into());
+        keys.sort();
+        let s3 = FakeS3::start(listing_server(keys)).await;
+        let files = planned(&["dir/a", "dir/b", "dir/c"]);
+        let found = plan::existing_upload_keys(&s3.client(), "b", "", &files, &CancellationToken::new(), plan::UPLOAD_CONFLICT_SCAN).await.expect("ok");
+        assert_eq!(found, HashSet::from(["dir/b".to_string()]));
+        let lists = s3.count(|r| r.has_query("list-type"));
+        assert!(lists <= 2, "{lists} list requests");
+        // Keys before the range are skipped with StartAfter.
+        assert!(s3.requests()[0].query.contains("start-after=dir"), "{}", s3.requests()[0].query);
+    }
+
+    /// Past the scan cap, the remaining planned keys are checked with HeadObject.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_conflicts_fall_back_to_head_past_the_cap() {
+        use crate::testutil::FakeS3;
+        let mut keys: Vec<String> = (0..5000).map(|i| format!("b{i:04}")).collect();
+        keys.push("m".into());
+        keys.sort();
+        let s3 = FakeS3::start(listing_server(keys)).await;
+        let files = planned(&["a", "b0500", "m", "z"]);
+        let found = plan::existing_upload_keys(&s3.client(), "b", "", &files, &CancellationToken::new(), 1000).await.expect("ok");
+        assert_eq!(found, HashSet::from(["b0500".to_string(), "m".to_string()]));
+        assert_eq!(s3.count(|r| r.has_query("list-type")), 1, "stopped at the cap");
+        assert_eq!(s3.count(|r| r.method == "HEAD"), 2, "m and z asked one by one");
+    }
+
+    /// A newer preview with the same id cancels the one still running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_newer_preview_cancels_the_previous_one() {
+        use crate::testutil::{FakeS3, Reply, ScratchDir};
+        let dir = ScratchDir::new("preview-cancel");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.0.join(n), b"x").expect("write");
+        }
+        let s3 = FakeS3::start(|_| Reply::Hang).await;
+        let tm = TransferManager::new(Arc::new(crate::transfers::NoopSink));
+        let bm = BatchManager::new(tm, Arc::new(NoopBatchSink));
+        let req = BatchPlanRequest {
+            kind: BatchKind::Upload,
+            bucket: "b".into(),
+            prefix: "p/".into(),
+            local_path: dir.0.display().to_string(),
+            on_conflict: ConflictPolicy::Skip,
+        };
+        let client = s3.client();
+        let first = {
+            let (bm, req, client) = (bm.clone(), req.clone(), client.clone());
+            tokio::spawn(async move { bm.preview(&req, &client, Some("slot-1".into())).await })
+        };
+        while s3.requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let other = {
+            let (bm, req, client) = (bm.clone(), req.clone(), client.clone());
+            tokio::spawn(async move { bm.preview(&req, &client, Some("slot-2".into())).await })
+        };
+        let second = {
+            let (bm, req, client) = (bm.clone(), req.clone(), client.clone());
+            tokio::spawn(async move { bm.preview(&req, &client, Some("slot-1".into())).await })
+        };
+        let r = tokio::time::timeout(Duration::from_secs(5), first).await.expect("first stopped in time").expect("join");
+        assert!(r.as_ref().is_err_and(|e| e.is_cancelled()), "{r:?}");
+        assert!(!other.is_finished(), "another id is not affected");
+        assert!(!second.is_finished(), "the newer preview keeps running");
+        other.abort();
+        second.abort();
     }
 }

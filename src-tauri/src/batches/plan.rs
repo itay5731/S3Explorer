@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use aws_sdk_s3::Client;
 use tokio_util::sync::CancellationToken;
 
-use super::localname::{local_components, LocalTree};
+use super::localname::{link_below, link_message, local_components, LocalTree};
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::{
     BatchError, BatchKind, BatchPlanRequest, BatchPreview, BATCH_MAX_BYTES, BATCH_MAX_FILES,
@@ -25,6 +25,12 @@ use crate::ops::{listing_error, next_list_page, NextPage};
 
 /// S3's limit on the length of a key, in UTF-8 bytes.
 const MAX_KEY_BYTES: usize = 1024;
+/// Upload conflict check: at most this many listed keys are examined; past it, the planned files
+/// not yet decided are checked one by one with HeadObject (bounded by the file limit).
+pub const UPLOAD_CONFLICT_SCAN: u64 = 200_000;
+/// Parallel HeadObject requests in that fallback.
+const HEAD_PARALLEL: usize = 16;
+
 /// Local paths longer than this are noted (Windows tools such as Explorer may not open them).
 const LONG_PATH_CHARS: usize = 260;
 
@@ -170,8 +176,7 @@ pub async fn plan(req: &BatchPlanRequest, client: &Client, cancel: &Cancellation
             let c = cancel.clone();
             let mut plan = tokio::task::spawn_blocking(move || walk_upload(&root, &prefix, &c)).await??;
             if check_existing && !plan.files.is_empty() {
-                let existing = list_keys(client, &req.bucket, &req.prefix, cancel, None).await?.0;
-                let existing: HashSet<String> = existing.into_iter().map(|(k, _)| k).collect();
+                let existing = existing_upload_keys(client, &req.bucket, &req.prefix, &plan.files, cancel, UPLOAD_CONFLICT_SCAN).await?;
                 for f in &mut plan.files {
                     f.exists = existing.contains(&f.key);
                 }
@@ -191,7 +196,7 @@ pub async fn plan(req: &BatchPlanRequest, client: &Client, cancel: &Cancellation
                 plan.over_limit(BATCH_MAX_FILES + 1, plan.bytes());
             }
             let c = cancel.clone();
-            tokio::task::spawn_blocking(move || mark_existing_local(plan, &c)).await?
+            tokio::task::spawn_blocking(move || mark_existing_local(plan, &root, &c)).await?
         }
     }
 }
@@ -237,6 +242,104 @@ pub(crate) async fn list_keys(
     }
 }
 
+/// Which of the planned upload keys (sorted) already exist. Lists only the key range the plan
+/// covers: from just below the smallest planned key (`StartAfter`) until a page passes the
+/// largest, so a small folder uploaded into a huge prefix costs a page or two, not the whole
+/// prefix. After `max_examined` listed keys, the planned keys beyond the last listed one are
+/// checked with HeadObject instead.
+pub(crate) async fn existing_upload_keys(
+    client: &Client,
+    bucket: &str,
+    prefix: &str,
+    files: &[PlannedFile],
+    cancel: &CancellationToken,
+    max_examined: u64,
+) -> AppResult<HashSet<String>> {
+    let (Some(first), Some(last)) = (files.first(), files.last()) else {
+        return Ok(HashSet::new());
+    };
+    let (smallest, largest) = (first.key.as_str(), last.key.as_str());
+    let planned: HashSet<&str> = files.iter().map(|f| f.key.as_str()).collect();
+    // A string just below the smallest key: the key without its last character sorts before it,
+    // and only keys sharing that stem can fall in between (harmless extra keys).
+    let start_after = {
+        let mut s = smallest.to_string();
+        s.pop();
+        (!s.is_empty() && s.as_str() >= prefix).then_some(s)
+    };
+    let mut found = HashSet::new();
+    let mut token: Option<String> = None;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut examined = 0u64;
+    let mut last_listed: Option<String> = None;
+    loop {
+        let req = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            .set_start_after(if token.is_none() { start_after.clone() } else { None })
+            .set_continuation_token(token.clone())
+            .send();
+        let resp = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AppError::cancelled()),
+            r = req => r?,
+        };
+        for o in resp.contents() {
+            if let Some(k) = o.key() {
+                examined += 1;
+                if planned.contains(k) {
+                    found.insert(k.to_string());
+                }
+                last_listed = Some(k.to_string());
+            }
+        }
+        if last_listed.as_deref().is_some_and(|k| k >= largest) {
+            return Ok(found);
+        }
+        match next_list_page(resp.is_truncated(), resp.next_continuation_token(), |t| seen.contains(t)) {
+            NextPage::Done => return Ok(found),
+            NextPage::Continue(t) => {
+                seen.insert(t.clone());
+                token = Some(t);
+            }
+            NextPage::Error(why) => return Err(listing_error(bucket, prefix, why)),
+        }
+        if examined >= max_examined {
+            break;
+        }
+    }
+    // Too many keys in the range: ask about each remaining planned key.
+    let rest: Vec<String> =
+        files.iter().map(|f| f.key.clone()).filter(|k| last_listed.as_deref().is_none_or(|l| k.as_str() > l)).collect();
+    use futures::stream::{self, StreamExt};
+    let mut heads = stream::iter(rest)
+        .map(|key| head_exists(client.clone(), bucket.to_string(), key, cancel.clone()))
+        .buffer_unordered(HEAD_PARALLEL);
+    while let Some(r) = heads.next().await {
+        if let Some(k) = r? {
+            found.insert(k);
+        }
+    }
+    Ok(found)
+}
+
+/// `Some(key)` when the object exists, `None` on 404.
+async fn head_exists(client: Client, bucket: String, key: String, cancel: CancellationToken) -> AppResult<Option<String>> {
+    let r = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(AppError::cancelled()),
+        r = client.head_object().bucket(&bucket).key(&key).send() => r,
+    };
+    match r {
+        Ok(_) => Ok(Some(key)),
+        Err(e) if e.raw_response().is_some_and(|r| r.status().as_u16() == 404) || e.as_service_error().is_some_and(|s| s.is_not_found()) => {
+            Ok(None)
+        }
+        Err(e) => Err(AppError::from(e)),
+    }
+}
+
 /// Maps listed keys to local files under `root` (pure; see the module docs).
 pub fn map_download(prefix: &str, listed: &[(String, u64)], root: &Path) -> Plan {
     let mut plan = Plan::default();
@@ -274,12 +377,19 @@ pub fn map_download(prefix: &str, listed: &[(String, u64)], root: &Path) -> Plan
     plan
 }
 
-/// Marks download targets that exist; a folder where a file should go is a failure.
-fn mark_existing_local(mut plan: Plan, cancel: &CancellationToken) -> AppResult<Plan> {
+/// Marks download targets that exist; a folder where a file should go is a failure, and so is
+/// a target behind a symbolic link or junction below `root` (or one that is itself a link):
+/// writing there would land outside `root`, and a link is never replaced, whatever the policy.
+pub(crate) fn mark_existing_local(mut plan: Plan, root: &Path, cancel: &CancellationToken) -> AppResult<Plan> {
     let files = std::mem::take(&mut plan.files);
+    let mut links = std::collections::HashMap::new();
     for (i, mut f) in files.into_iter().enumerate() {
         if i.is_multiple_of(512) && cancel.is_cancelled() {
             return Err(AppError::cancelled());
+        }
+        if let Some(link) = link_below(root, &f.local, &mut links) {
+            plan.fail(f.key.clone(), link_message(&link));
+            continue;
         }
         match std::fs::symlink_metadata(&f.local) {
             Ok(m) if m.is_dir() => {

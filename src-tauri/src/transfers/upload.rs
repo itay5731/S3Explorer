@@ -56,6 +56,11 @@ pub(super) async fn run(
     if key.is_empty() {
         return Err(AppError::invalid("Object key is required"));
     }
+    // A folder upload planned a regular file; a link swapped in since then is not followed.
+    // (A file the user picked on its own may be a link: that keeps working.)
+    if entry.lock().batch_id.is_some() && tokio::fs::symlink_metadata(src).await?.file_type().is_symlink() {
+        return Err(AppError::invalid(format!("Not uploaded: {} is now a link to another location", src.display())));
+    }
     let meta = tokio::fs::metadata(src).await?;
     if !meta.is_file() {
         return Err(AppError::invalid(format!("Not a file: {}", src.display())));

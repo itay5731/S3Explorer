@@ -6,10 +6,10 @@ use crate::models::{Batch, BatchPlanRequest, BatchPreview};
 use crate::state::AppState;
 
 #[tauri::command]
-pub async fn preview_batch(state: State<'_, AppState>, request: BatchPlanRequest) -> AppResult<BatchPreview> {
+pub async fn preview_batch(state: State<'_, AppState>, request: BatchPlanRequest, preview_id: Option<String>) -> AppResult<BatchPreview> {
     batches::plan::validate(&request)?;
     let client = state.client_for_bucket(&request.bucket).await?;
-    batches::preview(&request, &client).await
+    state.batches.preview(&request, &client, preview_id).await
 }
 
 #[tauri::command]
