@@ -77,6 +77,7 @@ pub struct Expansion {
 
 pub const NOTHING_UNDER_PREFIX: &str = "No objects found under this prefix.";
 pub const SOURCE_MISSING: &str = "NoSuchKey: The source object does not exist.";
+pub const OBJECT_MISSING: &str = "NoSuchKey: The object does not exist.";
 
 impl Expansion {
     /// Adds one item's listing. Call in request order: the first item reaching a key wins.
@@ -86,7 +87,7 @@ impl Expansion {
                 return;
             }
             let dest = match kind {
-                JobKind::Delete => None,
+                JobKind::Delete | JobKind::Tag => None,
                 _ => match map_dest(item, &l.key) {
                     Some(d) => Some(d),
                     None => return, // not under this item: never touch it
@@ -112,7 +113,8 @@ impl Expansion {
             ItemListing::Object(Some(l)) if l.key == item.from => push(l, self),
             ItemListing::Object(_) => {
                 if !self.seen.contains(&item.from) && self.seen_missing.insert((false, item.from.clone())) {
-                    self.missing.push(JobError { key: item.from.clone(), message: SOURCE_MISSING.into() });
+                    let message = if kind == JobKind::Tag { OBJECT_MISSING } else { SOURCE_MISSING };
+                    self.missing.push(JobError { key: item.from.clone(), message: message.into() });
                 }
             }
             ItemListing::Unchecked => {
@@ -235,7 +237,7 @@ fn thousands(n: usize) -> String {
     out
 }
 
-/// The job label shown in the UI: `Delete N items`, `Copy N items to <bucket>/<prefix>`,
+/// The job label shown in the UI: `Delete N items`, `Tag N items`, `Copy N items to <bucket>/<prefix>`,
 /// `Move N items to <bucket>/<prefix>`, `Rename <old> to <new>` (single-item move within one
 /// folder). A single item is named instead of counted.
 pub fn label(req: &JobRequest) -> String {
@@ -244,6 +246,7 @@ pub fn label(req: &JobRequest) -> String {
     let what = if n == 1 { leaf(&first.from) } else { format!("{} items", thousands(n)) };
     let verb = match req.kind {
         JobKind::Delete => return format!("Delete {what}"),
+        JobKind::Tag => return format!("Tag {what}"),
         JobKind::Copy => "Copy",
         JobKind::Move => "Move",
     };
@@ -440,6 +443,7 @@ mod tests {
             dest_bucket: dest.map(Into::into),
             items,
             on_conflict: ConflictPolicy::Skip,
+            tags: None,
         }
     }
 
@@ -450,6 +454,10 @@ mod tests {
         assert_eq!(label(&req(JobKind::Delete, "b", None, vec![item("a//", None, true)])), "Delete a//");
         let many: Vec<JobItem> = (0..1234).map(|i| item(&format!("k{i}"), None, false)).collect();
         assert_eq!(label(&req(JobKind::Delete, "b", None, many)), "Delete 1,234 items");
+        assert_eq!(label(&req(JobKind::Tag, "b", None, vec![item("p/x.txt", None, false)])), "Tag x.txt");
+        assert_eq!(label(&req(JobKind::Tag, "b", None, vec![item("p/d/", None, true)])), "Tag d");
+        let two = vec![item("a", None, false), item("b/", None, true)];
+        assert_eq!(label(&req(JobKind::Tag, "b", None, two)), "Tag 2 items");
         assert_eq!(
             label(&req(JobKind::Move, "b", Some("b"), vec![item("p/old.txt", Some("p/new.txt"), false)])),
             "Rename old.txt to new.txt"

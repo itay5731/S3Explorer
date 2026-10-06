@@ -5,7 +5,9 @@
 //!
 //! Rules (each is `InvalidInput`, and nothing is changed):
 //! - `srcBucket` empty; `items` empty or more than [`JOB_MAX_ITEMS`];
-//! - delete: `destBucket` or any `to` present; copy/move: `destBucket` or any `to` missing;
+//! - delete/tag: `destBucket` or any `to` present; copy/move: `destBucket` or any `to` missing;
+//! - tag: `tags` missing or invalid (see [`crate::tags::validate_operation`]); other kinds: `tags`
+//!   present;
 //! - an empty `from`; a prefix item whose `from` (or, for copy/move, `to`) does not end in `/`
 //!   or is `""` / `"/"`; an object destination that is empty or ends in `/`;
 //! - same bucket: a destination equal to its source, or a prefix copied/moved into itself or a
@@ -107,16 +109,23 @@ pub fn validate(req: &JobRequest) -> AppResult<()> {
         JobKind::Delete => "delete",
         JobKind::Copy => "copy",
         JobKind::Move => "move",
+        JobKind::Tag => "tag",
     };
-    let transfer = req.kind != JobKind::Delete;
+    let transfer = matches!(req.kind, JobKind::Copy | JobKind::Move);
     let dest_bucket = match (&req.dest_bucket, transfer) {
-        (Some(_), false) => return Err(AppError::invalid("destBucket must be null for delete")),
+        (Some(_), false) => return Err(AppError::invalid(format!("destBucket must be null for {verb}"))),
         (None, true) => return Err(AppError::invalid(format!("destBucket is required for {verb}"))),
         (Some(b), true) if b.trim().is_empty() => {
             return Err(AppError::invalid(format!("destBucket is required for {verb}")))
         }
         (d, _) => d.as_deref(),
     };
+    match (&req.tags, req.kind) {
+        (None, JobKind::Tag) => return Err(AppError::invalid("tags is required for tag")),
+        (Some(op), JobKind::Tag) => crate::tags::validate_operation(op)?,
+        (Some(_), _) => return Err(AppError::invalid(format!("tags must be absent for {verb} (it is only used by tag)"))),
+        (None, _) => {}
+    }
     let same_bucket = dest_bucket == Some(req.src_bucket.as_str());
 
     for (i, it) in req.items.iter().enumerate() {
@@ -132,7 +141,7 @@ pub fn validate(req: &JobRequest) -> AppResult<()> {
         }
         if !transfer {
             if it.to.is_some() {
-                return Err(AppError::invalid(format!("{at}.to must be null for delete")));
+                return Err(AppError::invalid(format!("{at}.to must be null for {verb}")));
             }
             continue;
         }
@@ -219,6 +228,7 @@ mod tests {
             dest_bucket: dest.map(Into::into),
             items,
             on_conflict: ConflictPolicy::Skip,
+            tags: None,
         }
     }
     fn ok(r: &JobRequest) {
@@ -240,6 +250,75 @@ mod tests {
     }
     fn mv(items: Vec<JobItem>) -> JobRequest {
         req(JobKind::Move, Some("b"), items)
+    }
+
+    fn tag_op(mode: crate::models::TagMode, set: &[(&str, &str)], remove: &[&str]) -> crate::models::TagOperation {
+        crate::models::TagOperation {
+            mode,
+            set: set.iter().map(|(k, v)| crate::models::Tag::new(*k, *v)).collect(),
+            remove: remove.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn tag(items: Vec<JobItem>, op: Option<crate::models::TagOperation>) -> JobRequest {
+        JobRequest { tags: op, ..req(JobKind::Tag, None, items) }
+    }
+
+    #[test]
+    fn tag_kind() {
+        use crate::models::TagMode::{Merge, Replace};
+        let merge = || Some(tag_op(Merge, &[("env", "prod")], &["old"]));
+        ok(&tag(vec![obj("a.txt", None), pre("logs/", None)], merge()));
+        ok(&tag(vec![obj("a.txt", None)], Some(tag_op(Replace, &[], &[]))));
+        // tags required for tag, rejected for every other kind
+        bad(&tag(vec![obj("a", None)], None), "tags is required for tag");
+        for (kind, dest) in [(JobKind::Delete, None), (JobKind::Copy, Some("b")), (JobKind::Move, Some("b"))] {
+            let mut r = req(kind, dest, vec![obj("a", if dest.is_some() { Some("z") } else { None })]);
+            ok(&r);
+            r.tags = merge();
+            bad(&r, "tags must be absent");
+        }
+        // destBucket must be null; `to` must be null on every item
+        let mut r = tag(vec![obj("a", None)], merge());
+        r.dest_bucket = Some("b".into());
+        bad(&r, "destBucket must be null for tag");
+        bad(&tag(vec![obj("a", None), obj("b", Some("c"))], merge()), "items[1].to must be null for tag");
+        bad(&tag(vec![pre("p/", Some("q/"))], merge()), "items[0].to must be null for tag");
+        // the usual item rules still apply
+        bad(&tag(vec![], merge()), "must not be empty");
+        bad(&tag(vec![pre("/", None)], merge()), "folder prefix");
+        bad(&tag(vec![obj("", None)], merge()), "must not be empty");
+        // the operation itself is validated with the object limit
+        let eleven: Vec<(String, String)> = (0..11).map(|i| (format!("k{i}"), "v".to_string())).collect();
+        let eleven: Vec<(&str, &str)> = eleven.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        bad(&tag(vec![obj("a", None)], Some(tag_op(Replace, &eleven, &[]))), "At most 10");
+        bad(&tag(vec![obj("a", None)], Some(tag_op(Merge, &[("aws:x", "1")], &[]))), "reserved");
+        bad(&tag(vec![obj("a", None)], Some(tag_op(Merge, &[("a*", "1")], &[]))), "aren't allowed");
+        bad(&tag(vec![obj("a", None)], Some(tag_op(Merge, &[("k", "1"), ("k", "2")], &[]))), "more than once");
+        bad(&tag(vec![obj("a", None)], Some(tag_op(Replace, &[], &["x"]))), "only used with mode");
+        bad(&tag(vec![obj("a", None)], Some(tag_op(Merge, &[], &[]))), "nothing to add");
+        // overlapping or duplicate items are fine for tag (de-duplicated at expansion)
+        ok(&tag(vec![pre("p/", None), pre("p/q/", None), obj("p/x", None), obj("p/x", None)], merge()));
+    }
+
+    #[test]
+    fn tag_request_json() {
+        let r: JobRequest = serde_json::from_value(serde_json::json!({
+            "kind": "tag", "srcBucket": "b", "destBucket": null,
+            "items": [{"from": "a", "to": null, "isPrefix": false}],
+            "onConflict": "skip",
+            "tags": {"mode": "replace", "set": [{"key": "k", "value": "v"}], "remove": []}
+        }))
+        .expect("parse");
+        assert_eq!(r.kind, JobKind::Tag);
+        ok(&r);
+        // a v0.3 request without `tags` still parses
+        let r: JobRequest = serde_json::from_value(serde_json::json!({
+            "kind": "delete", "srcBucket": "b", "destBucket": null,
+            "items": [{"from": "a", "to": null, "isPrefix": false}], "onConflict": "skip"
+        }))
+        .expect("parse");
+        assert!(r.tags.is_none());
+        ok(&r);
     }
 
     #[test]

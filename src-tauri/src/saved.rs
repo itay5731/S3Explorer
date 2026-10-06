@@ -430,6 +430,8 @@ pub async fn connect_saved(store: &ConnectionStore, state: &AppState, id: &str) 
     let (name, config) = store.resolve(id).await?;
     let mut conn = Connection::open(config).await?;
     conn.info.label = name;
+    // Added buckets of a saved connection follow its id (renaming or editing it keeps them).
+    conn.identity = id.to_string();
     let info = conn.info.clone();
     state.set_connection(Some(Arc::new(conn))).await;
     store.mark_used(id).await;

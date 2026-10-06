@@ -1,4 +1,5 @@
-//! Background object operations ("jobs"): delete, copy, move (and rename = move).
+//! Background object operations ("jobs"): delete, copy, move (and rename = move), and bulk tag
+//! edits (`tag`).
 //!
 //! A job runs in two strict phases: **listing** (expand prefixes, look up single objects, detect
 //! destination conflicts and collisions) and only then **working** (the first change to any
@@ -127,7 +128,7 @@ pub struct JobManager {
 /// Validates `req` and counts what it would touch, without changing anything.
 pub async fn preview(req: &JobRequest, src: &Client, dest: Option<&Client>) -> AppResult<JobPreview> {
     validate(req)?;
-    if req.kind != JobKind::Delete && dest.is_none() {
+    if is_transfer(req.kind) && dest.is_none() {
         return Err(AppError::invalid("destBucket is required"));
     }
     let cancel = CancellationToken::new();
@@ -136,7 +137,7 @@ pub async fn preview(req: &JobRequest, src: &Client, dest: Option<&Client>) -> A
     let (exp, mut truncated) = engine::expand(&ctx, true, Some(JOB_PREVIEW_CAP), &|_| {}).await?;
     let same_bucket = req.dest_bucket.as_deref() == Some(req.src_bucket.as_str());
     plan::check_collisions(&exp.work, same_bucket).map_err(AppError::invalid)?;
-    let conflicts = if req.kind == JobKind::Delete {
+    let conflicts = if !is_transfer(req.kind) {
         0
     } else {
         let (existing, t) = engine::existing_dests(&ctx, &exp, Some(JOB_PREVIEW_CAP)).await?;
@@ -144,6 +145,11 @@ pub async fn preview(req: &JobRequest, src: &Client, dest: Option<&Client>) -> A
         existing.len() as u64
     };
     Ok(JobPreview { objects: exp.work.len() as u64, bytes: exp.bytes(), conflicts, truncated })
+}
+
+/// Copy and move write to a destination; delete and tag change objects in place.
+fn is_transfer(kind: JobKind) -> bool {
+    matches!(kind, JobKind::Copy | JobKind::Move)
 }
 
 impl JobManager {
@@ -166,7 +172,7 @@ impl JobManager {
     /// and destination buckets (each in its own region). Must be called within a Tokio runtime.
     pub fn start(self: &Arc<Self>, req: JobRequest, src: Client, dest: Option<Client>) -> AppResult<String> {
         validate(&req)?;
-        if req.kind != JobKind::Delete && dest.is_none() {
+        if is_transfer(req.kind) && dest.is_none() {
             return Err(AppError::invalid("destBucket is required"));
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -174,7 +180,7 @@ impl JobManager {
             id: id.clone(),
             kind: req.kind,
             src_bucket: req.src_bucket.clone(),
-            dest_bucket: if req.kind == JobKind::Delete { None } else { req.dest_bucket.clone() },
+            dest_bucket: if is_transfer(req.kind) { req.dest_bucket.clone() } else { None },
             label: plan::label(&req),
             phase: JobPhase::Listing,
             total_items: 0,
@@ -240,16 +246,19 @@ impl JobManager {
 
     async fn execute(&self, entry: &JobEntry, req: &JobRequest, src: &Client, dest: Option<&Client>) -> AppResult<()> {
         let ctx = Ctx { req, src, dest, cancel: &entry.cancel, tuning: &self.tuning };
-        let transfer = req.kind != JobKind::Delete;
+        let transfer = is_transfer(req.kind);
 
         // ---- listing phase: nothing is changed here ----
         let on_page = |n: u64| entry.lock().total_items += n;
-        let (mut exp, _) = engine::expand(&ctx, transfer, None, &on_page).await?;
+        // Single objects are looked up for every kind but delete (deleting a missing key is a
+        // no-op; copying or tagging one is a per-object failure).
+        let (mut exp, _) = engine::expand(&ctx, req.kind != JobKind::Delete, None, &on_page).await?;
         engine::require_move_etags(&ctx, &mut exp).await?;
         {
             let mut j = entry.lock();
             j.total_items = (exp.work.len() + exp.missing.len()) as u64;
-            j.total_bytes = exp.bytes();
+            // A tag job moves no data: doneBytes / totalBytes stay 0.
+            j.total_bytes = if req.kind == JobKind::Tag { 0 } else { exp.bytes() };
         }
         let same_bucket = req.dest_bucket.as_deref() == Some(req.src_bucket.as_str());
         plan::check_collisions(&exp.work, same_bucket).map_err(|m| AppError::new(crate::error::ErrorCode::InvalidInput, m))?;
@@ -272,10 +281,10 @@ impl JobManager {
         // ---- working phase ----
         entry.lock().phase = JobPhase::Working;
         self.sink.emit(&entry.snapshot());
-        if transfer {
-            engine::run_transfer(&ctx, entry, &exp.work, &existing).await;
-        } else {
-            engine::run_delete(&ctx, entry, &exp.work).await;
+        match req.kind {
+            JobKind::Copy | JobKind::Move => engine::run_transfer(&ctx, entry, &exp.work, &existing).await,
+            JobKind::Delete => engine::run_delete(&ctx, entry, &exp.work).await,
+            JobKind::Tag => return engine::run_tag(&ctx, entry, &exp.work).await,
         }
         Ok(())
     }
@@ -415,6 +424,7 @@ mod tests {
             dest_bucket: if kind == JobKind::Delete { None } else { Some("b".into()) },
             items,
             on_conflict: ConflictPolicy::Overwrite,
+            tags: None,
         }
     }
 
@@ -424,6 +434,87 @@ mod tests {
         let id = m.start(req, client.clone(), dest).expect("start");
         let j = tokio::time::timeout(Duration::from_secs(60), m.wait(&id)).await.expect("job finished").expect("known");
         (j, m)
+    }
+
+    fn tagging_xml(n: usize) -> String {
+        let tags: String = (0..n).map(|i| format!("<Tag><Key>t{i}</Key><Value>v</Value></Tag>")).collect();
+        format!(r#"<?xml version="1.0" encoding="UTF-8"?><Tagging><TagSet>{tags}</TagSet></Tagging>"#)
+    }
+
+    fn tag_request(items: Vec<JobItem>, op: crate::models::TagOperation) -> JobRequest {
+        JobRequest { dest_bucket: None, tags: Some(op), ..request(JobKind::Tag, items) }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tag_merge_over_the_limit_leaves_the_object_alone() {
+        use crate::models::{Tag, TagMode, TagOperation};
+        let s3 = FakeS3::start(|r| {
+            let key = r.path.trim_start_matches("/b/");
+            match (r.method.as_str(), r.has_query("tagging")) {
+                ("HEAD", _) if key == "gone" => Reply::status(404),
+                ("HEAD", _) => Reply::with_headers(200, vec![h("Content-Length", "7"), h("ETag", "\"e\"")]),
+                ("GET", true) if key == "full" => Reply::xml(200, &tagging_xml(10)),
+                ("GET", true) if key == "same" => {
+                    Reply::xml(200, r#"<Tagging><TagSet><Tag><Key>new</Key><Value>1</Value></Tag></TagSet></Tagging>"#)
+                }
+                ("GET", true) => Reply::xml(200, &tagging_xml(1)),
+                ("PUT", true) => Reply::status(200),
+                _ => Reply::status(500),
+            }
+        })
+        .await;
+        let op = TagOperation { mode: TagMode::Merge, set: vec![Tag::new("new", "1")], remove: vec![] };
+        let items = vec![obj("a", None), obj("full", None), obj("same", None), obj("gone", None)];
+        let (j, _) = run(tag_request(items, op), &s3.client()).await;
+        assert_eq!(j.status, JobStatus::Failed);
+        assert_eq!((j.total_items, j.done_items, j.failed_items), (4, 2, 2));
+        assert_eq!((j.total_bytes, j.done_bytes), (0, 0), "a tag job reports no bytes");
+        assert_eq!(j.dest_bucket, None);
+        assert_eq!(j.label, "Tag 4 items");
+        let msg = |k: &str| j.errors.iter().find(|e| e.key == k).map(|e| e.message.clone()).unwrap_or_default();
+        assert!(msg("full").contains("would have 11 tags; the limit is 10"), "{}", msg("full"));
+        assert_eq!(msg("gone"), plan::OBJECT_MISSING);
+        let puts: Vec<String> =
+            s3.requests().into_iter().filter(|r| r.method == "PUT").map(|r| r.path.trim_start_matches("/b/").to_string()).collect();
+        assert_eq!(puts, ["a"], "only the object that needed a change was written");
+        let body = s3.requests().into_iter().find(|r| r.method == "PUT").map(|r| String::from_utf8_lossy(&r.body).to_string());
+        let body = body.unwrap_or_default();
+        assert!(body.contains("<Key>t0</Key>") && body.contains("<Key>new</Key>"), "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tag_replace_with_an_empty_set_deletes_the_tagging() {
+        use crate::models::{TagMode, TagOperation};
+        let s3 = FakeS3::start(|r| match (r.method.as_str(), r.has_query("tagging")) {
+            ("HEAD", _) => Reply::with_headers(200, vec![h("Content-Length", "1")]),
+            ("DELETE", true) => Reply::status(204),
+            _ => Reply::status(500),
+        })
+        .await;
+        let op = TagOperation { mode: TagMode::Replace, set: vec![], remove: vec![] };
+        let (j, _) = run(tag_request(vec![obj("x", None), obj("y", None)], op), &s3.client()).await;
+        assert_eq!((j.status, j.done_items), (JobStatus::Completed, 2));
+        assert_eq!(s3.count(|r| r.method == "DELETE" && r.has_query("tagging")), 2);
+        assert_eq!(s3.count(|r| r.method == "GET"), 0, "replace never reads the current tags");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tag_job_stops_when_the_server_does_not_support_tagging() {
+        use crate::models::{Tag, TagMode, TagOperation};
+        let s3 = FakeS3::start(|r| match (r.method.as_str(), r.has_query("tagging")) {
+            ("HEAD", _) => Reply::with_headers(200, vec![h("Content-Length", "1")]),
+            (_, true) => Reply::xml(501, "<Error><Code>NotImplemented</Code><Message>A header you provided implies functionality that is not implemented</Message></Error>"),
+            _ => Reply::status(500),
+        })
+        .await;
+        let items: Vec<JobItem> = (0..200).map(|i| obj(&format!("k{i}"), None)).collect();
+        let op = TagOperation { mode: TagMode::Replace, set: vec![Tag::new("a", "b")], remove: vec![] };
+        let (j, _) = run(tag_request(items, op), &s3.client()).await;
+        assert_eq!(j.status, JobStatus::Failed);
+        let err = j.error.clone().unwrap_or_default();
+        assert!(err.contains("does not support object tags"), "{err}");
+        let puts = s3.count(|r| r.method == "PUT");
+        assert!(puts < 200 && j.failed_items as usize == puts, "stopped early: {puts} PUTs, {} failed", j.failed_items);
     }
 
     /// Delete job of keys k1..k3 whose DeleteObjects answer is `answer`; `exists` says which keys a
@@ -750,6 +841,7 @@ mod tests {
             dest_bucket: Some("a".into()),
             items: vec![crate::models::JobItem { from: "x/".into(), to: Some("x/y/".into()), is_prefix: true }],
             on_conflict: ConflictPolicy::Skip,
+            tags: None,
         };
         let e = m.start(bad.clone(), client.clone(), Some(client.clone())).expect_err("into itself");
         assert_eq!(e.code, crate::error::ErrorCode::InvalidInput);

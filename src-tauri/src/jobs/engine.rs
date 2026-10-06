@@ -1016,6 +1016,50 @@ pub(crate) async fn run_transfer(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planne
     }
 }
 
+// ---- working phase: tag ------------------------------------------------------------------------
+
+/// Job-level error when the server does not implement object tagging (the job stops instead of
+/// sending the same refused request for every object).
+pub(crate) fn tags_not_supported(e: &AppError) -> AppError {
+    AppError::new(ErrorCode::NotSupported, format!("Stopped: {}", e.message))
+}
+
+/// Bulk tag edit: each object gets `GetObjectTagging` (merge only), then `PutObjectTagging`, or
+/// `DeleteObjectTagging` when the result is empty (see [`crate::tags::tag_object`]). Up to
+/// [`OBJECT_CONCURRENCY`] objects in flight; cancel stops new work and lets requests in flight
+/// finish. A merge over the object limit, or an object that is gone, is a per-object failure and
+/// that object is left as it was. A server that does not implement object tagging stops the job
+/// with a job-level `NotSupported` error.
+pub(crate) async fn run_tag(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planned]) -> AppResult<()> {
+    let op = ctx.req.tags.as_ref().ok_or_else(|| AppError::invalid("tags is required for tag"))?;
+    let stop = ctx.cancel.child_token();
+    let results = stream::iter(0..work.len())
+        .take_until(stop.clone().cancelled_owned())
+        .map(move |i| async move {
+            let p = &work[i];
+            (p, crate::tags::tag_object(ctx.src, &ctx.req.src_bucket, &p.src, op).await)
+        })
+        .buffer_unordered(OBJECT_CONCURRENCY);
+    tokio::pin!(results);
+    let mut unsupported: Option<AppError> = None;
+    while let Some((p, r)) = results.next().await {
+        match r {
+            Ok(()) => entry.done(0),
+            Err(e) => {
+                if e.code == ErrorCode::NotSupported && unsupported.is_none() {
+                    unsupported = Some(tags_not_supported(&e));
+                    stop.cancel();
+                }
+                entry.fail(&p.src, e.message);
+            }
+        }
+    }
+    match unsupported {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

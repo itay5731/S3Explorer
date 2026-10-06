@@ -146,7 +146,8 @@ mod tests {
                 "notifyOnFinish": true,
                 "textSize": 100,
                 "textWeight": 400,
-                "accent": "yellow"
+                "accent": "yellow",
+                "confirmCopyMove": true
             })
         );
         assert!(d.validate().is_ok());
@@ -187,6 +188,7 @@ mod tests {
         o.entry("textSize").or_insert(json!(100));
         o.entry("textWeight").or_insert(json!(400));
         o.entry("accent").or_insert(json!("yellow"));
+        o.entry("confirmCopyMove").or_insert(json!(true));
         v
     }
 
@@ -227,7 +229,7 @@ mod tests {
     #[test]
     fn strict_parse_theme_and_update_flag() {
         let base =
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow"});
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -315,6 +317,83 @@ mod tests {
     }
 
     #[test]
+    fn confirm_copy_move_flag() {
+        let with = |flag: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match flag {
+                Some(flag) => o.insert("confirmCopyMove".into(), flag),
+                None => o.remove("confirmCopyMove"),
+            };
+            v
+        };
+        assert!(AppSettings::default().confirm_copy_move);
+        for flag in [true, false] {
+            let got = AppSettings::from_json_strict(&with(Some(json!(flag)))).expect("valid");
+            assert_eq!(got.confirm_copy_move, flag);
+            assert_eq!(AppSettings::from_json_lenient(&with(Some(json!(flag)))).confirm_copy_move, flag);
+        }
+        // update_settings requires it; the on-disk file falls back to true on its own.
+        for bad in [Some(json!("false")), Some(json!(0)), Some(serde_json::Value::Null), None] {
+            let v = with(bad);
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert_eq!(e.message, "confirmCopyMove must be true or false");
+            assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{v}");
+        }
+        // false with another field invalid: only the invalid field resets.
+        let mut v = with(Some(json!(false)));
+        v.as_object_mut().expect("object").insert("textSize".into(), json!(9999));
+        let got = AppSettings::from_json_lenient(&v);
+        assert!(!got.confirm_copy_move);
+        assert_eq!(got.text_size, 100);
+    }
+
+    #[test]
+    fn loads_literal_redesign_file_without_confirm_copy_move() {
+        let dir = temp_dir("redesign9");
+        let path = dir.join(SETTINGS_FILE);
+        // Exactly what v0.3.x + the redesign wrote: nine fields, no confirmCopyMove.
+        std::fs::write(
+            &path,
+            "{
+  \"partSizeMib\": 64,
+  \"maxConcurrentParts\": 6,
+  \"maxConcurrentTransfers\": 2,
+  \"theme\": \"dark\",
+  \"checkUpdatesOnStartup\": true,
+  \"notifyOnFinish\": false,
+  \"textSize\": 110,
+  \"textWeight\": 500,
+  \"accent\": \"blue\"
+}",
+        )
+        .expect("write");
+        assert_eq!(
+            load(&path),
+            AppSettings {
+                part_size_mib: Some(64),
+                max_concurrent_parts: 6,
+                max_concurrent_transfers: 2,
+                theme: ThemeMode::Dark,
+                check_updates_on_startup: true,
+                notify_on_finish: false,
+                text_size: 110,
+                text_weight: 500,
+                accent: AccentColor::Blue,
+                confirm_copy_move: true,
+            }
+        );
+        // Saved again, the file carries the new field.
+        let saved = AppSettings { confirm_copy_move: false, ..load(&path) };
+        save(&path, &saved).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"confirmCopyMove\": false"), "{text}");
+        assert_eq!(load(&path), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn accent_is_one_of_four_colours() {
         let with = |value: serde_json::Value| {
             let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
@@ -356,6 +435,7 @@ mod tests {
                 text_size: 100,
                 text_weight: 400,
                 accent: AccentColor::Yellow,
+                confirm_copy_move: true,
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
@@ -382,6 +462,7 @@ mod tests {
                     text_size: 100,
                     text_weight: 400,
                     accent: AccentColor::Yellow,
+                    confirm_copy_move: true,
                 },
             ),
             // Non-boolean flag: only the flag falls back.

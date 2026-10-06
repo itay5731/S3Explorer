@@ -4,6 +4,7 @@
 //! `aws_sdk_s3::Client` and a progress sink ([`transfers::ProgressSink`], [`jobs::JobSink`]);
 //! the Tauri glue is in `commands`.
 
+pub mod buckets;
 pub mod commands;
 pub mod error;
 pub mod jobs;
@@ -14,6 +15,7 @@ pub mod profiles;
 pub mod saved;
 pub mod settings;
 pub mod state;
+pub mod tags;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod transfers;
@@ -26,6 +28,7 @@ use tauri::{Emitter, Manager};
 use crate::jobs::JobSink;
 use crate::keychain::OsKeychain;
 use crate::models::{Job, Transfer, JOB_PROGRESS_EVENT, TRANSFER_PROGRESS_EVENT};
+use crate::buckets::AddedBucketStore;
 use crate::saved::ConnectionStore;
 use crate::settings::SettingsStore;
 use crate::state::AppState;
@@ -72,7 +75,12 @@ pub fn run() {
                 Some(dir) => ConnectionStore::load(dir.join(saved::CONNECTIONS_FILE), keychain),
                 None => ConnectionStore::in_memory(keychain),
             };
+            let added = match &config_dir {
+                Some(dir) => AddedBucketStore::load(dir.join(buckets::ADDED_BUCKETS_FILE)),
+                None => AddedBucketStore::in_memory(),
+            };
             app.manage(AppState::new(sink, job_sink, store));
+            app.manage(added);
             app.manage(connections);
             app.manage(UpdaterState::default());
             Ok(())
@@ -105,6 +113,13 @@ pub fn run() {
             commands::saved::connect_saved,
             commands::updates::check_for_update,
             commands::updates::install_update,
+            commands::buckets::list_added_buckets,
+            commands::buckets::add_bucket,
+            commands::buckets::remove_added_bucket,
+            commands::tags::get_bucket_tags,
+            commands::tags::put_bucket_tags,
+            commands::tags::get_object_tags,
+            commands::tags::put_object_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

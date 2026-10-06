@@ -4337,6 +4337,7 @@ dependencies = [
  "futures",
  "keyring",
  "mime_guess",
+ "regex",
  "reqwest",
  "rustls 0.23.45",
  "semver",

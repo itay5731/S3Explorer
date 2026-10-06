@@ -301,6 +301,9 @@ pub struct AppSettings {
     pub text_weight: u32,
     #[serde(default)]
     pub accent: AccentColor,
+    /// Show the Copy/Move confirmation even when the preview found no conflicts.
+    #[serde(default = "default_confirm_copy_move")]
+    pub confirm_copy_move: bool,
 }
 
 pub const TEXT_SIZE_MIN: u32 = 80;
@@ -325,6 +328,10 @@ fn default_notify_on_finish() -> bool {
     true
 }
 
+fn default_confirm_copy_move() -> bool {
+    true
+}
+
 fn default_text_size() -> u32 {
     DEFAULT_TEXT_SIZE
 }
@@ -345,6 +352,7 @@ impl Default for AppSettings {
             text_size: DEFAULT_TEXT_SIZE,
             text_weight: DEFAULT_TEXT_WEIGHT,
             accent: AccentColor::Yellow,
+            confirm_copy_move: default_confirm_copy_move(),
         }
     }
 }
@@ -387,6 +395,10 @@ fn text_weight_error() -> crate::error::AppError {
     crate::error::AppError::invalid(format!(
         "textWeight must be an integer from {TEXT_WEIGHT_MIN} to {TEXT_WEIGHT_MAX}"
     ))
+}
+
+fn confirm_copy_move_error() -> crate::error::AppError {
+    crate::error::AppError::invalid("confirmCopyMove must be true or false")
 }
 
 fn accent_error() -> crate::error::AppError {
@@ -505,13 +517,17 @@ impl AppSettings {
                 .and_then(serde_json::Value::as_str)
                 .and_then(AccentColor::parse)
                 .unwrap_or(d.accent),
+            confirm_copy_move: obj
+                .get("confirmCopyMove")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(d.confirm_copy_move),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all nine fields must be present. Transfer
+    /// Strict parse of the `update_settings` argument: all ten fields must be present. Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
     /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
-    /// `notifyOnFinish` booleans. Anything else is
+    /// `notifyOnFinish` and `confirmCopyMove` booleans. Anything else is
     /// `InvalidInput` naming the field.
     /// Unknown fields are ignored.
     pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
@@ -548,6 +564,10 @@ impl AppSettings {
                 .and_then(serde_json::Value::as_str)
                 .and_then(AccentColor::parse)
                 .ok_or_else(accent_error)?,
+            confirm_copy_move: obj
+                .get("confirmCopyMove")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(confirm_copy_move_error)?,
         };
         s.validate()?;
         Ok(s)
@@ -570,6 +590,8 @@ pub enum JobKind {
     Delete,
     Copy,
     Move,
+    /// Bulk tag editing (`JobRequest.tags`).
+    Tag,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -624,6 +646,52 @@ pub struct JobRequest {
     pub items: Vec<JobItem>,
     #[serde(default)]
     pub on_conflict: ConflictPolicy,
+    /// Required for `kind: "tag"`, rejected for the other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<TagOperation>,
+}
+
+// ---- v0.4.0: tags and buckets added by name -------------------------------------------------
+
+/// One S3 tag (`Tag` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub struct Tag {
+    pub key: String,
+    pub value: String,
+}
+
+impl Tag {
+    pub fn new(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self { key: key.into(), value: value.into() }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TagMode {
+    Merge,
+    Replace,
+}
+
+/// What a bulk tag job does to every object (`TagOperation` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TagOperation {
+    pub mode: TagMode,
+    #[serde(default)]
+    pub set: Vec<Tag>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// A bucket the user added by name (`AddedBucket` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AddedBucket {
+    pub name: String,
+    pub region: Option<String>,
+    pub added_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]

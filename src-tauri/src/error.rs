@@ -19,6 +19,11 @@ pub enum ErrorCode {
     InvalidInput,
     /// The OS keychain is unavailable or refused access (saved-connection secrets).
     Keychain,
+    /// The server-side state changed since the UI read it (tags, lifecycle); nothing was written.
+    Conflict,
+    /// The server does not implement this S3 feature (MinIO, R2, SeaweedFS and others implement
+    /// tagging and lifecycle only partly).
+    NotSupported,
     Unknown,
 }
 
@@ -88,6 +93,15 @@ fn looks_like_credentials_problem(text: &str) -> bool {
         || t.contains("identity resolver")
 }
 
+/// S3 error codes meaning "this server does not implement that operation": `NotImplemented` (501,
+/// AWS, MinIO, R2) and `MethodNotAllowed` (405). `Unsupported`/`UnsupportedOperation`/`NotSupported`
+/// and vendor-prefixed `X…NotImplemented` codes are treated the same (seen in the wild on
+/// S3-compatible servers; none of them is sent by SeaweedFS for tagging, which it implements).
+pub fn is_not_supported_code(code: &str) -> bool {
+    matches!(code, "NotImplemented" | "MethodNotAllowed" | "Unsupported" | "UnsupportedOperation" | "NotSupported")
+        || (code.starts_with('X') && code.ends_with("NotImplemented"))
+}
+
 fn code_from_service(code: Option<&str>, status: u16) -> ErrorCode {
     match code {
         Some("NoSuchBucket") => ErrorCode::NoSuchBucket,
@@ -104,13 +118,19 @@ fn code_from_service(code: Option<&str>, status: u16) -> ErrorCode {
         Some("RequestTimeout") | Some("SlowDown") | Some("ServiceUnavailable") | Some("InternalError") => {
             ErrorCode::Network
         }
-        Some("InvalidArgument") | Some("InvalidBucketName") | Some("KeyTooLongError") | Some("InvalidRange") => {
+        Some("InvalidArgument")
+        | Some("InvalidBucketName")
+        | Some("KeyTooLongError")
+        | Some("InvalidRange")
+        | Some("InvalidTag") => {
             ErrorCode::InvalidInput
         }
+        Some(c) if is_not_supported_code(c) => ErrorCode::NotSupported,
         _ => match status {
             401 => ErrorCode::Auth,
             403 => ErrorCode::AccessDenied,
             404 => ErrorCode::NoSuchKey,
+            405 | 501 => ErrorCode::NotSupported,
             500..=599 => ErrorCode::Network,
             _ => ErrorCode::Unknown,
         },
@@ -185,4 +205,31 @@ pub fn raw_status_and_region<E>(err: &SdkError<E, HttpResponse>) -> Option<(u16,
 /// True when the error is S3's AccessDenied (used by `connect` to tolerate a denied ListBuckets).
 pub fn is_access_denied(e: &AppError) -> bool {
     e.code == ErrorCode::AccessDenied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_codes() {
+        assert_eq!(code_from_service(Some("NotImplemented"), 501), ErrorCode::NotSupported);
+        assert_eq!(code_from_service(Some("MethodNotAllowed"), 405), ErrorCode::NotSupported);
+        assert_eq!(code_from_service(Some("XMinioNotImplemented"), 400), ErrorCode::NotSupported);
+        assert_eq!(code_from_service(Some("UnsupportedOperation"), 400), ErrorCode::NotSupported);
+        assert_eq!(code_from_service(None, 501), ErrorCode::NotSupported);
+        assert_eq!(code_from_service(None, 405), ErrorCode::NotSupported);
+        assert_eq!(code_from_service(Some("NoSuchBucket"), 404), ErrorCode::NoSuchBucket);
+        assert_eq!(code_from_service(Some("AccessDenied"), 403), ErrorCode::AccessDenied);
+        assert_eq!(code_from_service(Some("InvalidTag"), 400), ErrorCode::InvalidInput);
+        assert_eq!(code_from_service(Some("SomethingElse"), 400), ErrorCode::Unknown);
+    }
+
+    #[test]
+    fn new_codes_serialize_verbatim() {
+        let e = AppError::new(ErrorCode::Conflict, "x");
+        assert_eq!(serde_json::to_value(&e).expect("json"), serde_json::json!({"code": "Conflict", "message": "x"}));
+        let e = AppError::new(ErrorCode::NotSupported, "y");
+        assert_eq!(serde_json::to_value(&e).expect("json")["code"], "NotSupported");
+    }
 }
