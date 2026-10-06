@@ -12,12 +12,16 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
+  BATCH_PROGRESS_EVENT,
   JOB_PROGRESS_EVENT,
   TRANSFER_PROGRESS_EVENT,
   UPDATE_PROGRESS_EVENT,
   type AddedBucket,
   type AppError,
   type AppSettings,
+  type Batch,
+  type BatchPlanRequest,
+  type BatchPreview,
   type Bucket,
   type BucketVersioning,
   type ConnectionConfig,
@@ -80,6 +84,13 @@ export interface Backend {
   removeJob(id: string): Promise<void>;
   listJobs(): Promise<Job[]>;
   onJobProgress(cb: (j: Job) => void): Promise<Unlisten>;
+  // Folder transfers (batches)
+  previewBatch(request: BatchPlanRequest): Promise<BatchPreview>;
+  startBatch(request: BatchPlanRequest): Promise<string>;
+  cancelBatch(id: string): Promise<void>;
+  removeBatch(id: string): Promise<void>;
+  listBatches(): Promise<Batch[]>;
+  onBatchProgress(cb: (b: Batch) => void): Promise<Unlisten>;
   startDownload(bucket: string, key: string, destPath: string): Promise<string>;
   startUpload(bucket: string, key: string, srcPath: string): Promise<string>;
   cancelTransfer(id: string): Promise<void>;
@@ -106,6 +117,8 @@ export interface Backend {
   pickFiles(): Promise<string[]>;
   pickSavePath(defaultName: string): Promise<string | null>;
   pickDirectory(): Promise<string | null>;
+  /** Choose a local folder to upload. */
+  pickFolder(): Promise<string | null>;
   joinPath(dir: string, name: string): Promise<string>;
   revealInFolder(path: string): Promise<void>;
   onFileDrop(cb: (e: FileDropEvent) => void): Promise<Unlisten>;
@@ -163,6 +176,12 @@ const tauriBackend: Backend = {
   removeJob: (id) => invoke<void>("remove_job", { id }),
   listJobs: () => invoke<Job[]>("list_jobs"),
   onJobProgress: (cb) => listen<Job>(JOB_PROGRESS_EVENT, (e) => cb(e.payload)),
+  previewBatch: (request) => invoke<BatchPreview>("preview_batch", { request }),
+  startBatch: (request) => invoke<string>("start_batch", { request }),
+  cancelBatch: (id) => invoke<void>("cancel_batch", { id }),
+  removeBatch: (id) => invoke<void>("remove_batch", { id }),
+  listBatches: () => invoke<Batch[]>("list_batches"),
+  onBatchProgress: (cb) => listen<Batch>(BATCH_PROGRESS_EVENT, (e) => cb(e.payload)),
   startDownload: (bucket, key, destPath) => invoke<string>("start_download", { bucket, key, destPath }),
   startUpload: (bucket, key, srcPath) => invoke<string>("start_upload", { bucket, key, srcPath }),
   cancelTransfer: (id) => invoke<void>("cancel_transfer", { id }),
@@ -198,6 +217,10 @@ const tauriBackend: Backend = {
   },
   async pickDirectory() {
     const res = await open({ directory: true, multiple: false, title: "Download into folder" });
+    return typeof res === "string" ? res : null;
+  },
+  async pickFolder() {
+    const res = await open({ directory: true, multiple: false, title: "Upload folder" });
     return typeof res === "string" ? res : null;
   },
   joinPath: (dir, name) => join(dir, name),
@@ -285,6 +308,28 @@ export const cancelJob = (id: string) => call("cancelJob", id);
 export const removeJob = (id: string) => call("removeJob", id);
 export const listJobs = () => call("listJobs");
 export const onJobProgress = (cb: (j: Job) => void) => call("onJobProgress", cb);
+/** Walk the local folder (upload) or list the prefix (download) and report what would happen. Changes nothing. */
+export const previewBatch = (request: BatchPlanRequest) => call("previewBatch", request);
+/** Plan again and start the folder transfer; returns the batch id. */
+export const startBatch = (request: BatchPlanRequest) => call("startBatch", request);
+export const cancelBatch = (id: string) => call("cancelBatch", id);
+export const removeBatch = (id: string) => call("removeBatch", id);
+export const listBatches = () => call("listBatches");
+export const onBatchProgress = (cb: (b: Batch) => void) => call("onBatchProgress", cb);
+/**
+ * Is `path` (from an OS drop, which gives paths only) a local folder? There is no file-system
+ * plugin, so this asks `preview_batch` to plan an upload of it: the backend answers `InvalidInput`
+ * for anything that is not a directory. Resolves with the preview when it is a folder, `null` when
+ * it is not, and rejects with any other error (a folder that could not be read, for example).
+ */
+export async function probeFolder(request: BatchPlanRequest): Promise<BatchPreview | null> {
+  try {
+    return await previewBatch(request);
+  } catch (e) {
+    if ((e as AppError).code === "InvalidInput") return null;
+    throw e;
+  }
+}
 export const startDownload = (bucket: string, key: string, destPath: string) =>
   call("startDownload", bucket, key, destPath);
 export const startUpload = (bucket: string, key: string, srcPath: string) => call("startUpload", bucket, key, srcPath);
@@ -319,6 +364,7 @@ export const setZoom = (scale: number) => call("setZoom", scale);
 export const pickFiles = () => call("pickFiles");
 export const pickSavePath = (defaultName: string) => call("pickSavePath", defaultName);
 export const pickDirectory = () => call("pickDirectory");
+export const pickFolder = () => call("pickFolder");
 export const joinPath = (dir: string, name: string) => call("joinPath", dir, name);
 export const revealInFolder = (path: string) => call("revealInFolder", path);
 export const onFileDrop = (cb: (e: FileDropEvent) => void) => call("onFileDrop", cb);

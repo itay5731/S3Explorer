@@ -330,7 +330,8 @@ const REFRESH_EVERY_MS = 2000;
 let lastRefresh = 0;
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleRefresh(now: boolean) {
+/** Refresh the open listing in place: right away (`now`), or at most every 2 s while work is running. */
+export function scheduleRefresh(now: boolean) {
   if (now) {
     if (refreshTimer) clearTimeout(refreshTimer);
     refreshTimer = null;

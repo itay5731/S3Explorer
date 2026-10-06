@@ -1,9 +1,12 @@
-import { Fragment } from "react";
+import { Fragment, useRef, useState } from "react";
 import {
+  ChevronDown,
   ChevronRight,
   ClipboardPaste,
   Copy,
   Download,
+  FileUp,
+  FolderUp,
   FolderPlus,
   PanelRightClose,
   PanelRightOpen,
@@ -21,6 +24,8 @@ import { navigate, openModal, refresh, setDetailsOpen, setFilter, useApp } from 
 import { clearClipboard, useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
+import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
+import { PopupMenu } from "./PopupMenu";
 import { getSelected, useSelectionInfo, useViewRows } from "../store/view";
 import { displayName, formatBytes, parentPrefix, prefixSegments, s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
@@ -29,6 +34,59 @@ function clipTitle(mode: "copy" | "cut", keys: string[]): string {
   const shown = keys.slice(0, 20).join("\n");
   const more = keys.length > 20 ? `\n… and ${keys.length - 20} more` : "";
   return `${mode === "cut" ? "Cut (moves on paste)" : "Copied"}:\n${shown}${more}`;
+}
+
+/** "Upload" (files) with a menu button next to it for "Upload files…" / "Upload folder…". */
+function UploadButton({ disabled }: { disabled: boolean }) {
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
+  const caret = useRef<HTMLButtonElement>(null);
+  const openMenu = () => {
+    const r = caret.current?.getBoundingClientRect();
+    if (r) setMenu({ x: r.left - 70, y: r.bottom + 4 });
+  };
+  return (
+    <span className="split-btn">
+      <button className="btn btn-primary split-main" disabled={disabled} onClick={() => void pickAndUpload()} title="Upload files">
+        <Upload size={14} />
+        <span className="btn-label">Upload</span>
+      </button>
+      <button
+        ref={caret}
+        className="btn btn-primary split-caret"
+        disabled={disabled}
+        onClick={() => (menu ? setMenu(null) : openMenu())}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            openMenu();
+          }
+        }}
+        title="More ways to upload"
+        aria-label="More ways to upload"
+        aria-haspopup="menu"
+        aria-expanded={!!menu}
+      >
+        <ChevronDown size={13} />
+      </button>
+      {menu && (
+        <PopupMenu
+          x={menu.x}
+          y={menu.y}
+          label="Upload"
+          onClose={() => {
+            setMenu(null);
+            caret.current?.focus();
+          }}
+          groups={[
+            [
+              { label: "Upload files…", icon: <FileUp size={14} />, action: () => void pickAndUpload() },
+              { label: "Upload folder…", icon: <FolderUp size={14} />, action: () => void pickAndUploadFolder() },
+            ],
+          ]}
+        />
+      )}
+    </span>
+  );
 }
 
 export function Toolbar() {
@@ -45,19 +103,29 @@ export function Toolbar() {
   return (
     <div className="toolbar">
       <div className="tool-group">
-        <button className="btn btn-primary" disabled={disabled} onClick={() => void pickAndUpload()} title="Upload files">
-          <Upload size={14} />
-          <span className="btn-label">Upload</span>
-        </button>
+        <UploadButton disabled={disabled} />
         <button className="btn" disabled={disabled} onClick={() => openModal({ kind: "newFolder" })} title="New folder">
           <FolderPlus size={14} />
           <span className="btn-label secondary">New folder</span>
         </button>
         <button
           className="btn"
-          disabled={disabled || sel.objects === 0}
-          onClick={() => void downloadObjects(getSelected().objects)}
-          title={sel.objects > 1 ? `Download ${sel.objects} objects` : "Download"}
+          disabled={disabled || sel.objects + sel.folders === 0}
+          onClick={() => {
+            // Objects selected: download those (as before). Only folders: download the folders.
+            const { objects, folders } = getSelected();
+            if (objects.length) void downloadObjects(objects);
+            else void requestDownloadFolders(folders);
+          }}
+          title={
+            sel.objects > 1
+              ? `Download ${sel.objects} objects`
+              : sel.objects === 0 && sel.folders > 1
+                ? `Download ${sel.folders} folders`
+                : sel.objects === 0 && sel.folders === 1
+                  ? "Download folder"
+                  : "Download"
+          }
         >
           <Download size={14} />
           <span className="btn-label secondary">Download</span>

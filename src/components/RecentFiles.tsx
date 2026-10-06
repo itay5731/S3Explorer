@@ -5,6 +5,7 @@ import { extension, formatExact, formatRelative } from "../lib/format";
 import { downloadObjects } from "../store/actions";
 import { readPref, revealObject, useApp, writePref } from "../store/app";
 import { onJobUpdate } from "../store/jobs";
+import { isBatchActive, onBatchUpdate } from "../store/batches";
 import { loadRecent, useRecent } from "../store/recent";
 import { onTransferFinished } from "../store/transfers";
 import { isJobActive } from "../lib/ops";
@@ -61,10 +62,16 @@ export function RecentFiles() {
       // A cancelled job may still have changed some objects.
       if (finished && (j.srcBucket === bucket || j.destBucket === bucket)) rescan();
     });
+    // A folder upload into this bucket: once, when it finishes (also when cancelled part way).
+    const stopBatches = onBatchUpdate((b, prev) => {
+      const finished = !isBatchActive(b) && (!prev || isBatchActive(prev));
+      if (finished && b.kind === "upload" && b.bucket === bucket && b.doneFiles > 0) rescan();
+    });
     return () => {
       window.clearTimeout(timer);
       stopTransfers();
       stopJobs();
+      stopBatches();
     };
   }, [bucket]);
 

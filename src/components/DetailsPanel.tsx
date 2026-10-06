@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { ChevronRight, Copy, Download, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
+import { ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
 import { navigate, openModal, setDetailsOpen, useApp } from "../store/app";
@@ -8,6 +8,8 @@ import { loadObjectTags, objectTagId, useTags } from "../store/tags";
 import { isDenied, permissionText } from "../store/toasts";
 import { TagChips } from "./TagEditor";
 import { copyText, downloadObjects } from "../store/actions";
+import { requestDownloadFolders } from "../store/folders";
+import { plural } from "../lib/ops";
 import { getSelected, useSelectionInfo } from "../store/view";
 import { displayName, formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
 import { FileIcon } from "./FileIcon";
@@ -213,6 +215,9 @@ export function DetailsPanel() {
           <button className="btn" onClick={() => navigate(bucket, f.prefix)}>
             <FolderOpen size={14} /> Open
           </button>
+          <button className="btn" onClick={() => void requestDownloadFolders([f])}>
+            <FolderDown size={14} /> Download
+          </button>
           <button className="btn btn-danger-ghost" onClick={() => requestDelete()}>
             <Trash2 size={14} /> Delete
           </button>
@@ -247,14 +252,20 @@ export function DetailsPanel() {
             </div>
           </div>
         </div>
-        {sel.objects > 0 && (
+        {(sel.objects > 0 || sel.folders > 0) && (
           <div className="dactions">
-            <button className="btn" onClick={() => void downloadObjects(getSelected().objects)}>
-              <Download size={14} /> Download {sel.objects}
-            </button>
+            {sel.objects > 0 && (
+              <button className="btn" onClick={() => void downloadObjects(getSelected().objects)}>
+                <Download size={14} /> Download {plural(sel.objects, "object")}
+              </button>
+            )}
+            {sel.folders > 0 && (
+              <button className="btn" onClick={() => void requestDownloadFolders(getSelected().folders)}>
+                <FolderDown size={14} /> Download {plural(sel.folders, "folder")}
+              </button>
+            )}
           </div>
         )}
-        {sel.folders > 0 && <p className="muted small dnote">Folders are skipped when downloading a selection.</p>}
         <div className="dactions">
           <button className="btn" onClick={() => requestBulkTags()}>
             <Tags size={14} /> Edit tags for {(sel.folders + sel.objects).toLocaleString()} items…

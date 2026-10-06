@@ -4,6 +4,7 @@
 import { create } from "zustand";
 import * as api from "../lib/api";
 import type { Transfer } from "../lib/types";
+import { upsertBatchFiles } from "./batches";
 
 interface TransferState {
   byId: Record<string, Transfer>;
@@ -72,8 +73,11 @@ export async function startTransferSync(): Promise<() => void> {
   let frame = 0;
   const flush = () => {
     frame = 0;
-    const batch = [...pending.values()];
+    const all = [...pending.values()];
     pending = new Map();
+    // Files of a folder transfer are folded under their batch row, not listed one by one.
+    upsertBatchFiles(all.filter((t) => t.batchId));
+    const batch = all.filter((t) => !t.batchId);
     const prev = useTransfers.getState().byId;
     useTransfers.getState().upsertMany(batch);
     for (const t of batch) {
@@ -87,7 +91,7 @@ export async function startTransferSync(): Promise<() => void> {
     if (!frame) frame = requestAnimationFrame(flush);
   });
   try {
-    useTransfers.getState().replaceAll(await api.listTransfers());
+    useTransfers.getState().replaceAll((await api.listTransfers()).filter((t) => !t.batchId));
   } catch {
     /* not connected yet / nothing to show */
   }
@@ -107,7 +111,7 @@ export function scheduleTransferResync() {
       const list = await api.listTransfers();
       const state = useTransfers.getState();
       // Merge rather than replace so newer event data isn't clobbered by an older snapshot.
-      state.upsertMany(list.filter((t) => !state.byId[t.id]));
+      state.upsertMany(list.filter((t) => !t.batchId && !state.byId[t.id]));
     } catch {
       /* ignore */
     }

@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ClipboardPaste, Copy, CopyPlus, Download, FolderOpen, FolderPlus, Info, Link, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderOpen, FolderPlus, FolderUp, Info, Link, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, setDetailsOpen, setSelection, useApp } from "../store/app";
 import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
+import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { getSelected } from "../store/view";
 import { useClipboard } from "../store/clipboard";
 import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename } from "../store/ops";
@@ -97,13 +98,17 @@ export function ContextMenu() {
   if (count === 0) {
     groups.push([
       { label: "Upload files…", icon: <Upload size={14} />, action: () => void pickAndUpload() },
+      { label: "Upload folder…", icon: <FolderUp size={14} />, action: () => void pickAndUploadFolder() },
       { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openModal({ kind: "newFolder" }) },
     ]);
     groups.push([pasteItem]);
     groups.push([{ label: "Refresh", icon: <RefreshCw size={14} />, action: () => refresh() }]);
   } else if (count === 1 && folders.length === 1) {
     const f = folders[0];
-    groups.push([{ label: "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: "Enter" }]);
+    groups.push([
+      { label: "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: "Enter" },
+      { label: "Download folder…", icon: <FolderDown size={14} />, action: () => void requestDownloadFolders([f]) },
+    ]);
     groups.push([
       { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(f.prefix, "Key") },
       { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, f.prefix), "S3 URI") },
@@ -133,15 +138,22 @@ export function ContextMenu() {
     groups.push([deleteItem(1, false)]);
   } else {
     const keys = [...folders.map((f) => f.prefix), ...objects.map((o) => o.key)];
+    const downloads: Item[] = [];
     if (objects.length) {
-      groups.push([
-        {
-          label: `Download ${objects.length} object${objects.length === 1 ? "" : "s"}…`,
-          icon: <Download size={14} />,
-          action: () => void downloadObjects(objects),
-        },
-      ]);
+      downloads.push({
+        label: `Download ${objects.length} object${objects.length === 1 ? "" : "s"}…`,
+        icon: <Download size={14} />,
+        action: () => void downloadObjects(objects),
+      });
     }
+    if (folders.length) {
+      downloads.push({
+        label: `Download ${folders.length} folder${folders.length === 1 ? "" : "s"}…`,
+        icon: <FolderDown size={14} />,
+        action: () => void requestDownloadFolders(folders),
+      });
+    }
+    if (downloads.length) groups.push(downloads);
     groups.push([
       { label: `Copy ${keys.length} keys`, icon: <Copy size={14} />, action: () => void copyText(keys.join("\n"), "Keys") },
       {

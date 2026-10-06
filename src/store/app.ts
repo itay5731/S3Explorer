@@ -2,9 +2,10 @@
 
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AddedBucket, AppError, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry } from "../lib/types";
+import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
 import { clearClipboard } from "./clipboard";
+import { selectActiveBatchCount, useBatches } from "./batches";
 import { selectActiveJobCount, useJobs } from "./jobs";
 import { clearRecent } from "./recent";
 import { selectActiveCount, useTransfers } from "./transfers";
@@ -53,6 +54,10 @@ export type Modal =
   | { kind: "objectTags"; bucket: string; key: string }
   /** Tag several objects at once (a "tag" job). `items` are exact keys/prefixes from the selection. */
   | { kind: "bulkTags"; bucket: string; prefix: string; items: JobItem[] }
+  /** Upload a local folder (a batch). `localPath` came from the picker or an OS drop. */
+  | { kind: "uploadFolder"; bucket: string; prefix: string; localPath: string; initialPreview?: BatchPreview }
+  /** Download folders (one batch each) into `dir`. `folders` are exact prefixes from the listing. */
+  | { kind: "downloadFolders"; bucket: string; folders: FolderEntry[]; dir: string }
   /** Disconnect while transfers or jobs are still running. */
   | { kind: "disconnect"; running: number }
   | null;
@@ -215,7 +220,9 @@ export async function disconnect() {
 
 /** Disconnect, but ask first while transfers or file operations are still running. */
 export function requestDisconnect() {
-  const running = selectActiveCount(useTransfers.getState()) + selectActiveJobCount(useJobs.getState());
+  // A folder transfer counts once (its files are not in the transfer list).
+  const running =
+    selectActiveCount(useTransfers.getState()) + selectActiveJobCount(useJobs.getState()) + selectActiveBatchCount(useBatches.getState());
   if (running > 0) openModal({ kind: "disconnect", running });
   else void disconnect();
 }

@@ -7,6 +7,9 @@ import type {
   AddedBucket,
   AppSettings,
   AppError,
+  Batch,
+  BatchPlanRequest,
+  BatchPreview,
   Bucket,
   BucketVersioning,
   ConnectionConfig,
@@ -31,7 +34,7 @@ import type {
   UpdateInfo,
   UpdateProgress,
 } from "./types";
-import { DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { BATCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
 import { planParts, validateAppSettings } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
@@ -185,6 +188,17 @@ function seed() {
   put(assets, "staging/batch-2/report.csv", 3_333, { ageDays: 1 });
   put(assets, "staging/batch-2/photo.jpg", 4_444, { ageDays: 1 });
   put(assets, "staging/batch-2/new-2.txt", 222, { ageDays: 1 });
+  // v0.5.0 folder transfers: uploading the mock "photos" folder to "photos/" conflicts with these two;
+  // downloading "collide/" maps two pairs of keys to the same local file (Windows names are case-insensitive).
+  put(assets, "photos/2026/IMG_0001.jpg", 1_500_000, { ageDays: 30 });
+  put(assets, "photos/2026/IMG_0002.jpg", 1_600_000, { ageDays: 30 });
+  put(assets, "collide/report:v1.txt", 4_100, { ageDays: 6 });
+  put(assets, "collide/report_v1.txt", 4_200, { ageDays: 6 });
+  put(assets, "collide/README.md", 1_100, { ageDays: 6 });
+  put(assets, "collide/readme.md", 1_150, { ageDays: 6 });
+  put(assets, "collide/notes.txt", 900, { ageDays: 6 });
+  put(assets, "collide/sub/fail-download-log.txt", 24_000, { ageDays: 6 });
+  put(assets, "collide/sub/trailing dot.", 300, { ageDays: 6 });
 
   // 2. acme-logs: the 5,000-object folder (virtualization stress test)
   const logs = createMockBucket("acme-logs", "2022-07-01T00:00:00Z");
@@ -754,6 +768,8 @@ function tick() {
       if (s.t.kind === "upload") {
         const b = buckets.get(s.t.bucket);
         if (b) put(b, s.t.key, s.t.totalBytes, { ageDays: 0, metadata: { "uploaded-with": "s3explorer" } });
+      } else {
+        localExisting.add(s.t.localPath.toLowerCase());
       }
       emit(s.t);
       continue;
@@ -771,12 +787,21 @@ function tick() {
   }
 }
 
-function startSim(kind: Transfer["kind"], bucket: string, key: string, localPath: string, size: number, failMessage?: string): string {
+function startSim(
+  kind: Transfer["kind"],
+  bucket: string,
+  key: string,
+  localPath: string,
+  size: number,
+  failMessage?: string,
+  opts: { batchId?: string; durationMs?: number } = {},
+): string {
   const id = `mock-${++idSeq}-${hex(6)}`;
   const { partBytes: partSize, parts } = planParts(kind, settings.partSizeMib, size);
   const t: Transfer = {
     id,
     kind,
+    batchId: opts.batchId ?? null,
     bucket,
     key,
     localPath,
@@ -792,10 +817,10 @@ function startSim(kind: Transfer["kind"], bucket: string, key: string, localPath
   };
   sims.set(id, {
     t,
-    durationMs: 3000 + Math.random() * 3000,
+    durationMs: opts.durationMs ?? 3000 + Math.random() * 3000,
     startedMs: Date.now(),
     partSize,
-    failAt: failMessage ? 0.05 : null,
+    failAt: failMessage ? (opts.batchId ? 0.5 : 0.05) : null,
     failMessage: failMessage ?? "",
   });
   emit(t);
@@ -816,6 +841,382 @@ const fakeSize = (path: string) => {
   const h = hashString(path);
   return path.endsWith(".mp4") ? 300 * MB + (h % (900 * MB)) : 40 * KB + (h % (60 * MB));
 };
+
+// ---- folder transfers (batches) ----------------------------------------------------------
+// Mirrors "Folder transfers (batches)" in docs/CONTRACT.md on a fake local file system.
+// Mock folders (any parent path; matched by the folder's own name, case-insensitively):
+//   photos   nested images, unicode names, a 1.2 GB video, one unreadable file, one symbolic link,
+//            a hidden file and "fail-upload.jpg" (fails half way); "photos/2026/IMG_0001.jpg" and
+//            "IMG_0002.jpg" already exist in acme-prod-assets, so uploading to "photos/" there conflicts
+//   project  small source tree (30 files)
+//   Été 2026 unicode folder name
+//   broken   planning fails (folder unreadable)
+//   huge     60,000 files: planning stops at the limit (truncated), start is refused
+// Anything else is "not a folder" (InvalidInput), which is how dropped files are told apart.
+// Downloads: keys containing "fail-download" fail; archived objects fail; two keys that map to the
+// same local name (case-insensitively) fail for the second one; "C:\Users\demo\Downloads\docs"
+// already holds two of the files under "docs/".
+
+interface FakeLocalFile {
+  rel: string; // "/"-separated, relative to the folder
+  size: number;
+  unreadable?: boolean;
+  symlink?: boolean;
+}
+
+function fakeFolderTree(name: string): FakeLocalFile[] | "broken" | null {
+  const n = name.toLowerCase();
+  const sz = (rel: string, min: number, max: number) => min + (hashString(rel) % Math.max(1, max - min));
+  if (n === "photos") {
+    const out: FakeLocalFile[] = [];
+    for (let i = 1; i <= 24; i++) {
+      const rel = `2026/IMG_${String(i).padStart(4, "0")}.jpg`;
+      out.push({ rel, size: sz(rel, 900 * KB, 7 * MB) });
+    }
+    for (let i = 1; i <= 12; i++) {
+      const rel = `2025/summer/DSC ${String(i).padStart(3, "0")}.jpg`;
+      out.push({ rel, size: sz(rel, 1 * MB, 9 * MB) });
+    }
+    out.push({ rel: "Été à Nice/plage 01.jpg", size: 4_200_111 });
+    out.push({ rel: "Été à Nice/plage 02.jpg", size: 3_870_002 });
+    out.push({ rel: "日本/東京 夜景.jpg", size: 2_800_000 });
+    out.push({ rel: "raw/product launch 4k.mp4", size: Math.round(1.2 * GB) });
+    out.push({ rel: "private/passport scan.jpg", size: 1_200_000, unreadable: true });
+    out.push({ rel: "latest", size: 0, symlink: true });
+    out.push({ rel: ".DS_Store", size: 6_148 });
+    out.push({ rel: "2026/fail-upload.jpg", size: 2_000_000 });
+    return out;
+  }
+  if (n === "project") {
+    const out: FakeLocalFile[] = [];
+    for (const f of ["README.md", "package.json", "tsconfig.json", ".gitignore"]) out.push({ rel: f, size: sz(f, 200, 6 * KB) });
+    for (let i = 1; i <= 18; i++) out.push({ rel: `src/module-${i}.ts`, size: sz(`m${i}`, 1 * KB, 40 * KB) });
+    for (let i = 1; i <= 8; i++) out.push({ rel: `src/components/Widget ${i}.tsx`, size: sz(`w${i}`, 2 * KB, 30 * KB) });
+    return out;
+  }
+  if (n === "été 2026") {
+    return [
+      { rel: "carnet.md", size: 8_000 },
+      { rel: "photos/vue sur la mer.jpg", size: 3_300_000 },
+      { rel: "photos/marché.jpg", size: 2_100_000 },
+    ];
+  }
+  if (n === "broken") return "broken";
+  if (n === "huge") {
+    const out: FakeLocalFile[] = [];
+    for (let i = 0; i < 60_000; i++) {
+      out.push({ rel: `part-${String(Math.floor(i / 1000)).padStart(2, "0")}/rec-${String(i).padStart(5, "0")}.json`, size: 2_000 + (i % 7_000) });
+    }
+    return out;
+  }
+  return null;
+}
+
+/** Test hook: what the next "pick a folder" dialog returns (undefined: the photos folder; null: cancelled). */
+const folderPick: { next: string | null | undefined; dir: string | null | undefined } = { next: undefined, dir: undefined };
+
+const localExisting = new Set<string>(
+  ["C:\\Users\\demo\\Downloads\\docs\\pricing.xlsx", "C:\\Users\\demo\\Downloads\\docs\\brand guidelines v4.pdf"].map((p) => p.toLowerCase()),
+);
+
+const isAbsoluteLocal = (p: string) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("/") || p.startsWith("\\\\");
+const lastSegment = (p: string) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+const joinLocal = (dir: string, rel: string) => dir.replace(/[\\/]+$/, "") + "\\" + rel.split("/").join("\\");
+
+/** The same per-segment rule as single downloads (format.ts sanitizeFileName); "" becomes "_". */
+function sanitizeSegment(name: string): string {
+  // eslint-disable-next-line no-control-regex
+  let n = name.replace(/[\\/:*?"<>|\u0000-\u001f\u007f]/g, "_");
+  n = n.replace(/[. ]+$/, "");
+  if (n === "" || n === "." || n === "..") n = "_";
+  if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i.test(n)) n = "_" + n;
+  return n;
+}
+
+interface PlanFile {
+  rel: string;
+  key: string;
+  local: string;
+  size: number;
+  conflict: boolean;
+  /** Fails before any transfer (unreadable file, local name collision). */
+  preFail?: string;
+}
+
+interface BatchPlan {
+  files: PlanFile[];
+  truncated: boolean;
+  notes: string[];
+  unreadable: number;
+}
+
+const BATCH_NOTES_MAX = 50;
+
+function validateBatchRequest(req: BatchPlanRequest) {
+  if (req.kind !== "upload" && req.kind !== "download") throw invalid(`Unknown batch kind “${String(req.kind)}”.`);
+  if (req.onConflict !== "skip" && req.onConflict !== "overwrite") throw invalid("onConflict must be “skip” or “overwrite”.");
+  if (!req.localPath || !isAbsoluteLocal(req.localPath)) throw invalid("The local path must be absolute.");
+  if (req.localPath.split(/[\\/]/).includes("..")) throw invalid("The local path must not contain “..”.");
+  if (req.kind === "upload" && req.prefix !== "" && !req.prefix.endsWith("/")) throw invalid("The destination prefix must be empty or end with “/”.");
+  if (req.kind === "download" && (!req.prefix || !req.prefix.endsWith("/"))) throw invalid("The source prefix must end with “/”.");
+}
+
+function planBatch(req: BatchPlanRequest): BatchPlan {
+  validateBatchRequest(req);
+  const b = requireBucket(req.bucket);
+  const notes: string[] = [];
+  const note = (n: string) => {
+    if (notes.length < BATCH_NOTES_MAX) notes.push(n);
+  };
+  const files: PlanFile[] = [];
+  let bytes = 0;
+  let truncated = false;
+  let unreadable = 0;
+  if (req.kind === "upload") {
+    const tree = fakeFolderTree(lastSegment(req.localPath));
+    if (tree === null) throw invalid(`“${req.localPath}” is not a folder.`);
+    if (tree === "broken") throw fail("Io", `Could not read the folder “${req.localPath}\\private”: Access is denied. (os error 5)`);
+    const sorted = [...tree].sort((x, y) => (x.rel < y.rel ? -1 : x.rel > y.rel ? 1 : 0));
+    const unreadableFiles: PlanFile[] = [];
+    for (const f of sorted) {
+      const local = joinLocal(req.localPath, f.rel);
+      if (f.symlink) {
+        note(`Skipped a symbolic link: ${local}`);
+        continue;
+      }
+      if (f.unreadable) {
+        unreadable++;
+        note(`Could not read: ${local} (Access is denied.)`);
+        unreadableFiles.push({ rel: f.rel, key: req.prefix + f.rel, local, size: 0, conflict: false, preFail: "Could not read the file: Access is denied. (os error 5)" });
+        continue;
+      }
+      if (files.length >= BATCH_LIMITS.maxFiles || bytes + f.size > BATCH_LIMITS.maxBytes) {
+        truncated = true;
+        break;
+      }
+      const key = req.prefix + f.rel;
+      files.push({ rel: f.rel, key, local, size: f.size, conflict: b.objects.has(key) });
+      bytes += f.size;
+    }
+    // Unreadable files are reported again, as failures, when the batch runs.
+    files.push(...unreadableFiles);
+  } else {
+    const keys = sortedKeys(b);
+    const taken = new Map<string, string>();
+    for (let i = lowerBound(keys, req.prefix); i < keys.length && keys[i].startsWith(req.prefix); i++) {
+      const key = keys[i];
+      const rest = key.slice(req.prefix.length);
+      if (!rest || key.endsWith("/")) continue; // folder markers
+      if (files.length >= BATCH_LIMITS.maxFiles) {
+        truncated = true;
+        break;
+      }
+      const o = b.objects.get(key)!;
+      const localRel = rest.split("/").map(sanitizeSegment).join("/");
+      const local = joinLocal(req.localPath, localRel);
+      const lower = local.toLowerCase();
+      const first = taken.get(lower);
+      if (first !== undefined) {
+        note(`“${key}” and “${first}” are both saved as ${local}: only the first is downloaded.`);
+        files.push({ rel: rest, key, local, size: o.size, conflict: false, preFail: `Another object in this folder (“${first}”) is saved to the same local file.` });
+        continue;
+      }
+      taken.set(lower, key);
+      if (localRel !== rest) note(`Renamed for the local disk: “${rest}” is saved as ${local}`);
+      files.push({ rel: rest, key, local, size: o.size, conflict: localExisting.has(lower) });
+      bytes += o.size;
+    }
+  }
+  return { files, truncated, notes, unreadable };
+}
+
+function previewFromPlan(req: BatchPlanRequest, plan: BatchPlan): BatchPreview {
+  const real = plan.files.filter((f) => !f.preFail);
+  return {
+    files: real.length,
+    bytes: real.reduce((n, f) => n + f.size, 0),
+    conflicts: real.filter((f) => f.conflict).length,
+    skippedUnreadable: req.kind === "upload" ? plan.unreadable : 0,
+    truncated: plan.truncated,
+    notes: plan.notes,
+  };
+}
+
+interface BatchSim {
+  b: Batch;
+  req: BatchPlanRequest;
+  planningUntil: number;
+  files: PlanFile[] | null;
+  pos: number;
+  active: Map<string, PlanFile>; // transfer id -> file
+  baseBytes: number; // bytes of finished files
+  everRan: boolean;
+  transferIds: string[];
+}
+
+const batchSims = new Map<string, BatchSim>();
+const batchListeners = new Set<(b: Batch) => void>();
+let batchTicker: ReturnType<typeof setInterval> | null = null;
+let batchSeq = 0;
+const batchCallLog: { cmd: "preview_batch" | "start_batch" | "cancel_batch"; request: unknown; at: string }[] = [];
+const batchPreviewDelay: { next: number | null } = { next: null };
+
+const cloneBatch = (b: Batch): Batch => ({ ...b, errors: b.errors.map((e) => ({ ...e })) });
+const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running";
+
+function emitBatch(b: Batch) {
+  const copy = cloneBatch(b);
+  for (const l of batchListeners) l(copy);
+}
+
+function batchError(sim: BatchSim, path: string, message: string) {
+  sim.b.failedFiles++;
+  if (sim.b.errors.length < 50) sim.b.errors.push({ path, message });
+}
+
+function finishBatch(sim: BatchSim, status: "completed" | "failed" | "cancelled") {
+  sim.b.status = status;
+  sim.b.bytesPerSec = 0;
+  sim.b.finishedAt = new Date().toISOString();
+  emitBatch(sim.b);
+}
+
+function batchFailMessage(req: BatchPlanRequest, f: PlanFile): string | undefined {
+  const bucket = buckets.get(req.bucket);
+  if (req.kind === "upload") {
+    if (f.rel.includes("fail-upload")) return "Network: connection reset while sending part 1 (after 3 attempts).";
+    return bucket?.readOnly ? DENIED_WRITE : undefined;
+  }
+  if (f.key.includes("fail-download")) return "Network: the server closed the connection (after 3 attempts).";
+  const sc = bucket?.objects.get(f.key)?.storageClass ?? "";
+  return sc === "GLACIER" || sc === "DEEP_ARCHIVE" ? "InvalidObjectState: The object is archived. Restore it before downloading." : undefined;
+}
+
+function batchTick() {
+  const now = Date.now();
+  let active = 0;
+  for (const sim of batchSims.values()) {
+    const b = sim.b;
+    if (!isBatchActive(b)) continue;
+    active++;
+    if (b.status === "planning") {
+      if (now < sim.planningUntil) continue;
+      let plan: BatchPlan;
+      try {
+        plan = planBatch(sim.req);
+      } catch (e) {
+        b.error = (e as AppError).message;
+        finishBatch(sim, "failed");
+        continue;
+      }
+      if (plan.truncated) {
+        b.error = `This folder has more than ${BATCH_LIMITS.maxFiles.toLocaleString()} files or 1 TiB. A folder transfer can include at most that.`;
+        finishBatch(sim, "failed");
+        continue;
+      }
+      const name = lastSegment(sim.req.kind === "upload" ? sim.req.localPath : sim.req.prefix);
+      sim.files = [];
+      for (const f of plan.files) {
+        b.totalFiles++;
+        if (f.preFail) {
+          batchError(sim, sim.req.kind === "upload" ? f.local : f.key, f.preFail);
+        } else if (f.conflict && sim.req.onConflict === "skip") {
+          b.skippedFiles++;
+        } else {
+          b.totalBytes += f.size;
+          sim.files.push(f);
+        }
+      }
+      b.label =
+        sim.req.kind === "upload"
+          ? `Upload ${name}/ (${b.totalFiles.toLocaleString()} file${b.totalFiles === 1 ? "" : "s"})`
+          : `Download ${name}/ to ${sim.req.localPath}`;
+      b.status = "queued";
+      emitBatch(b);
+      continue;
+    }
+    let liveBytes = 0;
+    let speed = 0;
+    let running = false;
+    for (const [tid, f] of [...sim.active]) {
+      const t = sims.get(tid)?.t;
+      if (!t) {
+        sim.active.delete(tid);
+        continue;
+      }
+      if (t.status === "completed") {
+        b.doneFiles++;
+        sim.baseBytes += f.size;
+        sim.active.delete(tid);
+      } else if (t.status === "failed") {
+        batchError(sim, sim.req.kind === "upload" ? f.local : f.key, t.error ?? "Failed");
+        sim.active.delete(tid);
+      } else if (t.status === "cancelled") {
+        sim.active.delete(tid);
+      } else {
+        liveBytes += t.transferredBytes;
+        speed += t.bytesPerSec;
+        if (t.status === "running") running = true;
+      }
+    }
+    // Feed the normal transfer queue in path order; the global limit decides what runs.
+    const files = sim.files ?? [];
+    while (sim.active.size < settings.maxConcurrentTransfers && sim.pos < files.length) {
+      const f = files[sim.pos++];
+      const durationMs = Math.min(8000, 350 + (f.size / (40 * MB)) * 1000);
+      const tid = startSim(sim.req.kind, sim.req.bucket, f.key, f.local, f.size, batchFailMessage(sim.req, f), { batchId: b.id, durationMs });
+      sim.active.set(tid, f);
+      sim.transferIds.push(tid);
+    }
+    if (running) sim.everRan = true;
+    b.doneBytes = sim.baseBytes + liveBytes;
+    b.bytesPerSec = speed;
+    if (sim.everRan && b.status === "queued") b.status = "running";
+    if (sim.pos >= files.length && sim.active.size === 0) {
+      b.doneBytes = sim.baseBytes;
+      finishBatch(sim, b.failedFiles > 0 ? "failed" : "completed");
+      continue;
+    }
+    emitBatch(b);
+  }
+  if (active === 0 && batchTicker) {
+    clearInterval(batchTicker);
+    batchTicker = null;
+  }
+}
+
+function startBatchSim(req: BatchPlanRequest): string {
+  const id = `batch-${++batchSeq}-${hex(6)}`;
+  const name = lastSegment(req.kind === "upload" ? req.localPath : req.prefix);
+  const b: Batch = {
+    id,
+    kind: req.kind,
+    bucket: req.bucket,
+    prefix: req.prefix,
+    localPath: req.localPath,
+    label: req.kind === "upload" ? `Upload ${name}/` : `Download ${name}/ to ${req.localPath}`,
+    totalFiles: 0,
+    doneFiles: 0,
+    skippedFiles: 0,
+    failedFiles: 0,
+    totalBytes: 0,
+    doneBytes: 0,
+    bytesPerSec: 0,
+    status: "planning",
+    error: null,
+    errors: [],
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+  };
+  batchSims.set(id, { b, req, planningUntil: Date.now() + 900, files: null, pos: 0, active: new Map(), baseBytes: 0, everRan: false, transferIds: [] });
+  emitBatch(b);
+  if (!batchTicker) batchTicker = setInterval(batchTick, 100);
+  return id;
+}
+
+function logBatchCall(cmd: "preview_batch" | "start_batch" | "cancel_batch", request: unknown) {
+  batchCallLog.push({ cmd, request: JSON.parse(JSON.stringify(request)), at: new Date().toISOString() });
+}
 
 // ---- jobs (delete / copy / move) -----------------------------------------------------
 // Mirrors "Object operations (jobs)" in docs/CONTRACT.md: validation, prefix expansion,
@@ -859,6 +1260,20 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
 // Test hook (mock only): inspect requests and the in-memory tree from a driver script.
 (globalThis as Record<string, unknown>).__s3xMock = {
   jobCalls: jobCallLog,
+  batchCalls: batchCallLog,
+  /** What the next upload-folder picker returns (a path, or null for "cancelled"). */
+  setNextFolder: (path: string | null) => {
+    folderPick.next = path;
+  },
+  /** What the next download-into-folder picker returns (a path, or null for "cancelled"). */
+  setNextDirectory: (path: string | null) => {
+    folderPick.dir = path;
+  },
+  slowNextBatchPreview: (ms: number) => {
+    batchPreviewDelay.next = ms;
+  },
+  localExists: (path: string) => localExisting.has(path.toLowerCase()),
+  batchTransfers: (id: string) => (batchSims.get(id)?.transferIds ?? []).map((t) => (sims.get(t) ? { ...sims.get(t)!.t } : null)),
   tagCalls: tagCallLog,
   objectTags: (bucket: string, key: string) => copyTags(buckets.get(bucket)?.objects.get(key)?.tags),
   bucketTags: (bucket: string) => copyTags(buckets.get(bucket)?.tags),
@@ -1597,6 +2012,72 @@ export const mockBackend: Backend = {
     put(b, p, 0, { ageDays: 0 });
   },
 
+  async previewBatch(request) {
+    const slow = /huge$/i.test(request.localPath) || request.kind === "download";
+    await delay(batchPreviewDelay.next ?? (slow ? 500 : 250) + rand() * 300);
+    batchPreviewDelay.next = null;
+    logBatchCall("preview_batch", request);
+    requireConnection();
+    return previewFromPlan(request, planBatch(request));
+  },
+
+  async startBatch(request) {
+    await delay(80);
+    logBatchCall("start_batch", request);
+    requireConnection();
+    // Same checks as planning; the plan itself is redone in the batch's planning phase.
+    validateBatchRequest(request);
+    requireBucket(request.bucket);
+    if (request.kind === "upload" && fakeFolderTree(lastSegment(request.localPath)) === null) throw invalid(`“${request.localPath}” is not a folder.`);
+    if (request.kind === "upload" && /^huge$/i.test(lastSegment(request.localPath))) {
+      throw invalid(
+        `This folder has more than ${BATCH_LIMITS.maxFiles.toLocaleString()} files (60,000 found). A folder transfer can include at most ${BATCH_LIMITS.maxFiles.toLocaleString()} files and 1 TiB.`,
+      );
+    }
+    return startBatchSim(request);
+  },
+
+  async cancelBatch(id) {
+    await delay(30);
+    logBatchCall("cancel_batch", { id });
+    const sim = batchSims.get(id);
+    if (!sim) throw invalid("Unknown batch.");
+    if (!isBatchActive(sim.b)) return;
+    for (const tid of sim.active.keys()) {
+      const s = sims.get(tid);
+      if (s && (s.t.status === "running" || s.t.status === "queued")) {
+        s.t.status = "cancelled";
+        s.t.bytesPerSec = 0;
+        s.t.finishedAt = new Date().toISOString();
+        emit(s.t);
+      }
+    }
+    sim.active.clear();
+    sim.pos = sim.files?.length ?? 0;
+    finishBatch(sim, "cancelled");
+  },
+
+  async removeBatch(id) {
+    await delay(20);
+    const sim = batchSims.get(id);
+    if (!sim) return;
+    if (isBatchActive(sim.b)) throw invalid("Cannot remove a folder transfer that is still running. Cancel it first.");
+    for (const tid of sim.transferIds) sims.delete(tid);
+    batchSims.delete(id);
+  },
+
+  async listBatches() {
+    await delay(20);
+    return [...batchSims.values()].map((s) => cloneBatch(s.b));
+  },
+
+  async onBatchProgress(cb) {
+    batchListeners.add(cb);
+    return () => {
+      batchListeners.delete(cb);
+    };
+  },
+
   async startDownload(bucket, key, destPath) {
     await delay(40);
     if (!key || key.endsWith("/")) throw fail("InvalidInput", "Key must name an object, not a folder.");
@@ -1909,7 +2390,16 @@ export const mockBackend: Backend = {
 
   async pickDirectory() {
     await delay(150);
-    return "C:\\Users\\demo\\Downloads";
+    const next = folderPick.dir;
+    folderPick.dir = undefined;
+    return next === undefined ? "C:\\Users\\demo\\Downloads" : next;
+  },
+
+  async pickFolder() {
+    await delay(150);
+    const next = folderPick.next;
+    folderPick.next = undefined;
+    return next === undefined ? "C:\\Users\\demo\\Pictures\\photos" : next;
   },
 
   async joinPath(dir, name) {

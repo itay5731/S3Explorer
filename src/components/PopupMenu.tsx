@@ -24,8 +24,14 @@ export function PopupMenu({ x, y, groups, onClose, label }: { x: number; y: numb
     const px = Math.max(6, Math.min(x, window.innerWidth - r.width - 6));
     const py = y + r.height > window.innerHeight - 6 ? Math.max(6, y - r.height) : y;
     setPos({ x: px, y: py });
-    el.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
   }, [x, y]);
+
+  // Focus the first item once the menu is visible (a hidden element can't take focus).
+  useEffect(() => {
+    const el = ref.current;
+    if (!pos || !el || el.contains(document.activeElement)) return;
+    el.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }, [pos]);
 
   useEffect(() => {
     const close = () => closeRef.current();

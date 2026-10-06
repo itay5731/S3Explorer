@@ -18,11 +18,14 @@ import {
   Ban,
   Tags,
   ArchiveRestore,
+  FolderDown,
+  FolderUp,
 } from "lucide-react";
 import * as api from "../lib/api";
-import type { AppError, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
+import type { AppError, Batch, BatchStatus, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
 import { isActive, selectActiveCount, useTransfers } from "../store/transfers";
 import { removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
+import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, useBatches } from "../store/batches";
 import { setTransfersOpen, useApp } from "../store/app";
 import { toast } from "../store/toasts";
 import { basename, formatBytes, formatDuration, formatSpeed } from "../lib/format";
@@ -71,7 +74,7 @@ async function removeTransfers(ids: string[]) {
   remove(removed);
 }
 
-async function reveal(t: Transfer) {
+async function reveal(t: Pick<Transfer, "localPath">) {
   try {
     await api.revealInFolder(t.localPath);
   } catch (e) {
@@ -262,7 +265,154 @@ const JobRow = memo(function JobRow({ id }: { id: string }) {
   );
 });
 
-/** Overall progress of everything active: each transfer or job weighs the same. */
+// ---- folder transfers (batches) ------------------------------------------------------------------
+
+const BATCH_STATUS_LABEL: Record<BatchStatus, string> = { ...STATUS_LABEL, planning: "Planning" };
+const BATCH_STATUS_ICON: Record<BatchStatus, typeof Clock | null> = { ...STATUS_ICON, planning: null };
+/** At most this many running files are listed under an expanded batch. */
+const BATCH_FILES_SHOWN = 8;
+
+function batchWhere(b: Batch): string {
+  return b.kind === "upload" ? `${b.localPath} → s3://${b.bucket}/${b.prefix}` : `s3://${b.bucket}/${b.prefix} → ${b.localPath}`;
+}
+
+function batchProgressText(b: Batch): string {
+  if (b.status === "planning") return b.kind === "upload" ? "Reading the folder…" : "Listing the folder…";
+  if (b.status === "queued" && b.doneFiles + b.failedFiles === 0) return `Queued: ${plural(b.totalFiles, "file")}, waiting for a free transfer slot`;
+  return `${(b.doneFiles + b.skippedFiles + b.failedFiles).toLocaleString()} / ${b.totalFiles.toLocaleString()} files · ${formatBytes(b.doneBytes)} / ${formatBytes(b.totalBytes)}`;
+}
+
+/** The files of a batch that are transferring right now (bounded by the transfer limit). */
+function BatchFiles({ id }: { id: string }) {
+  const files = useBatches((s) => s.files[id]);
+  const list = useMemo(
+    () => Object.values(files ?? {}).sort((a, b) => (a.status === b.status ? a.key.localeCompare(b.key) : a.status === "running" ? -1 : 1)),
+    [files],
+  );
+  if (!list.length) return null;
+  const shown = list.slice(0, BATCH_FILES_SHOWN);
+  return (
+    <div className="bfiles" aria-label="Files transferring now">
+      <div className="bsection">Transferring now</div>
+      {shown.map((t) => {
+        const pct = t.totalBytes > 0 ? Math.min(100, (t.transferredBytes / t.totalBytes) * 100) : 0;
+        const indeterminate = t.status === "queued" || t.transferredBytes === 0;
+        return (
+          <div key={t.id} className="bfile">
+            <span className="bfile-name mono" title={t.kind === "upload" ? `${t.localPath} → ${t.key}` : `${t.key} → ${t.localPath}`}>
+              {t.key}
+            </span>
+            <span className={`pbar ${indeterminate ? "indeterminate" : ""} ${t.status === "queued" ? "queued" : ""}`}>
+              {!indeterminate && <span className="pbar-fill" style={{ transform: `scaleX(${pct / 100})` }} />}
+            </span>
+            <span className="bfile-num">{t.status === "queued" ? "Queued" : `${formatBytes(t.transferredBytes)} / ${formatBytes(t.totalBytes)}`}</span>
+          </div>
+        );
+      })}
+      {list.length > shown.length && <div className="muted small">and {(list.length - shown.length).toLocaleString()} more starting</div>}
+    </div>
+  );
+}
+
+const BatchRow = memo(function BatchRow({ id }: { id: string }) {
+  const b = useBatches((s) => s.byId[id]);
+  const expanded = useBatches((s) => !!s.expanded[id]);
+  if (!b) return null;
+  const Icon = b.kind === "upload" ? FolderUp : FolderDown;
+  const active = isBatchActive(b);
+  const pct = batchFraction(b) * 100;
+  const indeterminate = b.status === "planning" || (b.status === "queued" && b.doneBytes === 0);
+  const StatusIcon = BATCH_STATUS_ICON[b.status];
+  const hasProblems = b.failedFiles > 0 || !!b.error;
+  const canExpand = b.errors.length > 0 || !!b.error || b.status === "running" || b.status === "queued";
+  const statusText = b.status === "running" ? `${pct.toFixed(0)}%` : BATCH_STATUS_LABEL[b.status];
+  const where = batchWhere(b);
+  return (
+    <div id={`batch-${id}`} className={`jobwrap batchwrap ${hasProblems ? "has-problems" : ""}`}>
+      <div className={`xrow jrow brow status-${b.status}`}>
+        <div className={`xdir ${b.kind}`} title={b.kind === "upload" ? "Folder upload" : "Folder download"}>
+          <Icon size={14} />
+        </div>
+        <div className="xname">
+          <div className="xname-main" title={b.label}>
+            {b.label}
+          </div>
+          <div className="xname-sub" title={b.error ?? where}>
+            {b.error ? <span className="err-text">{b.error}</span> : where}
+          </div>
+        </div>
+        <div className="xprogress">
+          <div className={`pbar ${indeterminate ? "indeterminate" : ""} ${b.status === "queued" ? "queued" : ""}`}>
+            {!indeterminate && <div className="pbar-fill" style={{ transform: `scaleX(${pct / 100})` }} />}
+          </div>
+          <div className="xbytes">{batchProgressText(b)}</div>
+        </div>
+        <div className="jcounts">
+          {b.status === "running" && b.bytesPerSec > 0 && <span className="jcount speed">{formatSpeed(b.bytesPerSec)}</span>}
+          {b.skippedFiles > 0 && <span className="jcount skipped">{b.skippedFiles.toLocaleString()} skipped</span>}
+          {b.failedFiles > 0 && <span className="jcount failed">{b.failedFiles.toLocaleString()} failed</span>}
+        </div>
+        <div className={`xstatus s-${b.status === "planning" ? "running" : b.status}`}>
+          {StatusIcon ? <StatusIcon size={13} /> : <span className="pulse-dot" />}
+          {statusText}
+        </div>
+        <div className="xactions">
+          {b.kind === "download" && !active && b.doneFiles > 0 && (
+            <button className="icon-btn" onClick={() => void reveal({ localPath: b.localPath })} title="Show in folder" aria-label="Show in folder">
+              <FolderSearch size={14} />
+            </button>
+          )}
+          {canExpand && (
+            <button
+              className="icon-btn"
+              onClick={() => useBatches.getState().setExpanded(id, !expanded)}
+              title={expanded ? "Hide details" : "Show details"}
+              aria-label={expanded ? "Hide details" : "Show details"}
+              aria-expanded={expanded}
+              aria-controls={`batch-details-${id}`}
+            >
+              <ChevronRight size={14} className={expanded ? "rot90" : ""} />
+            </button>
+          )}
+          {active ? (
+            <button className="icon-btn" onClick={() => void cancelBatch(b.id)} title="Cancel" aria-label="Cancel folder transfer">
+              <CircleStop size={14} />
+            </button>
+          ) : (
+            <button className="icon-btn" onClick={() => void removeBatches([b.id])} title="Remove from list" aria-label="Remove folder transfer">
+              <X size={14} />
+            </button>
+          )}
+        </div>
+      </div>
+      {expanded && canExpand && (
+        <div className="jerrors" id={`batch-details-${id}`}>
+          {active && <BatchFiles id={id} />}
+          {b.error && (
+            <div className="jerror">
+              <AlertTriangle size={12} />
+              <span className="jerror-msg">{b.error}</span>
+            </div>
+          )}
+          {b.errors.length > 0 && <div className="bsection">{b.failedFiles === 1 ? "Failed file" : "Failed files"}</div>}
+          {b.errors.map((e, i) => (
+            <div key={i} className="jerror">
+              <span className="jerror-key mono">{e.path}</span>
+              <span className="jerror-msg">{e.message}</span>
+            </div>
+          ))}
+          {b.failedFiles > b.errors.length && (
+            <div className="jerror-more muted">
+              and {(b.failedFiles - b.errors.length).toLocaleString()} more failed files (the first {b.errors.length} are listed).
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+});
+
+/** Overall progress of everything active: each transfer, job or folder transfer weighs the same. */
 function Summary() {
   const transfers = useTransfers((s) => {
     let speed = 0;
@@ -290,50 +440,73 @@ function Summary() {
     }
     return `${frac}|${n}`;
   });
-  const [speed, tFrac, tN] = transfers.split("|").map(Number);
+  const batches = useBatches((s) => {
+    let speed = 0;
+    let frac = 0;
+    let n = 0;
+    for (const id of s.ids) {
+      const b = s.byId[id];
+      if (b && isBatchActive(b)) {
+        speed += b.bytesPerSec;
+        frac += batchFraction(b);
+        n++;
+      }
+    }
+    return `${speed}|${frac}|${n}`;
+  });
+  const [tSpeed, tFrac, tN] = transfers.split("|").map(Number);
   const [jFrac, jN] = jobs.split("|").map(Number);
-  const n = tN + jN;
+  const [bSpeed, bFrac, bN] = batches.split("|").map(Number);
+  const n = tN + jN + bN;
   if (!n) return null;
-  const pct = Math.min(100, ((tFrac + jFrac) / n) * 100);
+  const speed = tSpeed + bSpeed;
+  const pct = Math.min(100, ((tFrac + jFrac + bFrac) / n) * 100);
   return (
     <span className="xsummary">
       <span className="mini-bar">
         <span style={{ transform: `scaleX(${pct / 100})` }} />
       </span>
-      {pct.toFixed(0)}%{tN > 0 && speed > 0 ? ` · ${formatSpeed(speed)}` : ""}
+      {pct.toFixed(0)}%{tN + bN > 0 && speed > 0 ? ` · ${formatSpeed(speed)}` : ""}
     </span>
   );
 }
 
-type ActivityRow = { kind: "job" | "transfer"; id: string };
+type ActivityRow = { kind: "job" | "transfer" | "batch"; id: string };
 
 /** Bottom panel: transfers (uploads/downloads) and jobs (delete/copy/move), newest first. */
 export function ActivityPanel() {
   const open = useApp((s) => s.transfersOpen);
   const transferIds = useTransfers((s) => s.ids);
   const jobIds = useJobs((s) => s.ids);
+  const batchIds = useBatches((s) => s.ids);
   const activeTransfers = useTransfers(selectActiveCount);
   const activeJobs = useJobs(selectActiveJobCount);
-  const active = activeTransfers + activeJobs;
-  const total = transferIds.length + jobIds.length;
+  const activeBatches = useBatches(selectActiveBatchCount);
+  // Transfers inside a folder transfer are not in the transfer list: a batch counts once.
+  const active = activeTransfers + activeJobs + activeBatches;
+  const total = transferIds.length + jobIds.length + batchIds.length;
   const finishedCount = total - active;
 
   // Start times never change, so this only re-sorts when rows are added or removed.
   const rows = useMemo<ActivityRow[]>(() => {
     const t = useTransfers.getState().byId;
     const j = useJobs.getState().byId;
+    const bt = useBatches.getState().byId;
     const all = [
+      ...batchIds.map((id) => ({ kind: "batch" as const, id, at: bt[id]?.startedAt ?? "" })),
       ...jobIds.map((id) => ({ kind: "job" as const, id, at: j[id]?.startedAt ?? "" })),
       ...transferIds.map((id) => ({ kind: "transfer" as const, id, at: t[id]?.startedAt ?? "" })),
     ];
     return all.sort((a, b) => b.at.localeCompare(a.at));
-  }, [jobIds, transferIds]);
+  }, [jobIds, transferIds, batchIds]);
 
   const clearFinished = () => {
     const ts = useTransfers.getState();
     void removeTransfers(ts.ids.filter((id) => ts.byId[id] && !isActive(ts.byId[id])));
     const js = useJobs.getState();
     void removeJobs(js.ids.filter((id) => js.byId[id] && !isJobActive(js.byId[id])));
+    const bs = useBatches.getState();
+    void removeBatches(bs.ids.filter((id) => bs.byId[id] && !isBatchActive(bs.byId[id])));
   };
 
   return (
@@ -343,7 +516,10 @@ export function ActivityPanel() {
           {open ? <ChevronDown size={14} /> : <ChevronUp size={14} />}
           <span>Activity</span>
           {active > 0 && (
-            <span className="badge" title={`${activeTransfers} transfers, ${activeJobs} file operations active`}>
+            <span
+              className="badge"
+              title={`${activeTransfers} transfers, ${activeBatches} folder transfers, ${activeJobs} file operations active`}
+            >
               {active}
             </span>
           )}
@@ -362,7 +538,15 @@ export function ActivityPanel() {
           {total === 0 ? (
             <div className="empty-note">Nothing here yet. Uploads, downloads and file operations show their progress here.</div>
           ) : (
-            rows.map((r) => (r.kind === "job" ? <JobRow key={r.id} id={r.id} /> : <TransferRow key={r.id} id={r.id} />))
+            rows.map((r) =>
+              r.kind === "job" ? (
+                <JobRow key={r.id} id={r.id} />
+              ) : r.kind === "batch" ? (
+                <BatchRow key={r.id} id={r.id} />
+              ) : (
+                <TransferRow key={r.id} id={r.id} />
+              ),
+            )
           )}
         </div>
       )}

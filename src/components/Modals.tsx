@@ -5,7 +5,6 @@ import type { AppError, ConflictPolicy, JobPreview, JobRequest } from "../lib/ty
 import { BUCKETLESS_MODALS, disconnect, openModal, useApp, type RenameTarget } from "../store/app";
 import { isDenied, permissionText } from "../store/toasts";
 import { AddBucketModal, RemoveBucketModal } from "./BucketDialogs";
-import { BucketTagsModal, BulkTagsModal, ObjectTagsModal } from "./TagDialogs";
 import { createFolder } from "../store/actions";
 import { startConfirmedJob } from "../store/ops";
 import { joinKey, s3Uri, validateFolderName } from "../lib/format";
@@ -13,6 +12,12 @@ import { plural, previewSummary, splitExt, validateNewName } from "../lib/ops";
 
 // The lifecycle editor is large and rarely opened: load it on first use.
 const LifecycleDialog = lazy(() => import("./LifecycleDialog").then((m) => ({ default: m.LifecycleDialog })));
+// Tag and folder transfer dialogs: also loaded on first use (keeps the start-up bundle small).
+const BucketTagsModal = lazy(() => import("./TagDialogs").then((m) => ({ default: m.BucketTagsModal })));
+const ObjectTagsModal = lazy(() => import("./TagDialogs").then((m) => ({ default: m.ObjectTagsModal })));
+const BulkTagsModal = lazy(() => import("./TagDialogs").then((m) => ({ default: m.BulkTagsModal })));
+const UploadFolderModal = lazy(() => import("./BatchDialogs").then((m) => ({ default: m.UploadFolderModal })));
+const DownloadFoldersModal = lazy(() => import("./BatchDialogs").then((m) => ({ default: m.DownloadFoldersModal })));
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
@@ -476,6 +481,50 @@ function RenameModal({ target }: { target: RenameTarget }) {
   );
 }
 
+// ---- conflict choice (paste, folder uploads and downloads) -----------------------------------------
+
+/**
+ * "Skip existing" / "Overwrite" when something is already at the destination. Nothing is chosen
+ * until the user picks (`policy` null), so Overwrite is never a default.
+ */
+export function ConflictChoice({
+  policy,
+  onChange,
+  legend,
+  skipText,
+  overwriteText,
+}: {
+  policy: ConflictPolicy | null;
+  onChange: (p: ConflictPolicy) => void;
+  legend: ReactNode;
+  skipText: ReactNode;
+  overwriteText: ReactNode;
+}) {
+  // One choice is on screen at a time; the name stays what it was before this was shared.
+  const name = "conflict";
+  return (
+    <fieldset className="conflict-choice">
+      <legend>
+        <AlertTriangle size={14} /> {legend}
+      </legend>
+      <label className={`choice ${policy === "skip" ? "active" : ""}`}>
+        <input type="radio" name={name} checked={policy === "skip"} onChange={() => onChange("skip")} />
+        <span>
+          <strong>Skip existing</strong>
+          <span className="choice-sub">{skipText}</span>
+        </span>
+      </label>
+      <label className={`choice danger ${policy === "overwrite" ? "active" : ""}`}>
+        <input type="radio" name={name} checked={policy === "overwrite"} onChange={() => onChange("overwrite")} />
+        <span>
+          <strong>Overwrite</strong>
+          <span className="choice-sub">{overwriteText}</span>
+        </span>
+      </label>
+    </fieldset>
+  );
+}
+
 // ---- paste (copy / move) -----------------------------------------------------------------------
 
 function PasteModal({
@@ -551,31 +600,23 @@ function PasteModal({
       <PreviewLine state={state} retry={retry} verb={verb} />
       {nothing && <div className="hint err-text">Nothing to paste: the copied items no longer exist.</div>}
       {needChoice && (
-        <fieldset className="conflict-choice">
-          <legend>
-            <AlertTriangle size={14} /> {plural(conflicts, "object")} already {conflicts === 1 ? "exists" : "exist"} at the destination. Choose what happens to{" "}
-            {conflicts === 1 ? "it" : "them"}:
-          </legend>
-          <label className={`choice ${policy === "skip" ? "active" : ""}`}>
-            <input type="radio" name="conflict" checked={policy === "skip"} onChange={() => setPolicy("skip")} />
-            <span>
-              <strong>Skip existing</strong>
-              <span className="choice-sub">
-                Objects already at the destination are left untouched.
-                {move && " Their sources are not deleted: skipped items stay where they are now."}
-              </span>
-            </span>
-          </label>
-          <label className={`choice danger ${policy === "overwrite" ? "active" : ""}`}>
-            <input type="radio" name="conflict" checked={policy === "overwrite"} onChange={() => setPolicy("overwrite")} />
-            <span>
-              <strong>Overwrite</strong>
-              <span className="choice-sub">
-                The existing objects are replaced by the pasted ones. This cannot be undone.
-              </span>
-            </span>
-          </label>
-        </fieldset>
+        <ConflictChoice
+          policy={policy}
+          onChange={setPolicy}
+          legend={
+            <>
+              {plural(conflicts, "object")} already {conflicts === 1 ? "exists" : "exist"} at the destination. Choose what happens to{" "}
+              {conflicts === 1 ? "it" : "them"}:
+            </>
+          }
+          skipText={
+            <>
+              Objects already at the destination are left untouched.
+              {move && " Their sources are not deleted: skipped items stay where they are now."}
+            </>
+          }
+          overwriteText="The existing objects are replaced by the pasted ones. This cannot be undone."
+        />
       )}
       <div className="modal-actions">
         <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus>
@@ -628,6 +669,14 @@ function DisconnectModal({ running }: { running: number }) {
 }
 
 export function Modals() {
+  return (
+    <Suspense fallback={null}>
+      <ModalSwitch />
+    </Suspense>
+  );
+}
+
+function ModalSwitch() {
   const modal = useApp((s) => s.modal);
   const bucket = useApp((s) => s.bucket);
   if (!modal) return null;
@@ -652,6 +701,18 @@ export function Modals() {
       return <BulkTagsModal bucket={modal.bucket} prefix={modal.prefix} items={modal.items} />;
     case "disconnect":
       return <DisconnectModal running={modal.running} />;
+    case "uploadFolder":
+      return (
+        <Suspense fallback={null}>
+          <UploadFolderModal key={modal.localPath} bucket={modal.bucket} prefix={modal.prefix} localPath={modal.localPath} initialPreview={modal.initialPreview} />
+        </Suspense>
+      );
+    case "downloadFolders":
+      return (
+        <Suspense fallback={null}>
+          <DownloadFoldersModal bucket={modal.bucket} folders={modal.folders} dir={modal.dir} />
+        </Suspense>
+      );
     case "newFolder":
       return <NewFolderModal />;
     case "delete":

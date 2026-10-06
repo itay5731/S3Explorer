@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as R
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
 import { readPref, requestDisconnect, useApp, writePref } from "../store/app";
-import { installTransferEffects, uploadPaths } from "../store/actions";
+import { installTransferEffects } from "../store/actions";
+import { handleOsDrop, installBatchEffects } from "../store/folders";
 import { installJobEffects } from "../store/ops";
 import { installTagEffects } from "../store/tags";
 import { DragBadge } from "./RowDrag";
@@ -88,7 +89,8 @@ function useFileDrop() {
         else if (e.type === "leave") setDragging(false);
         else {
           setDragging(false);
-          if (e.paths.length) void uploadPaths(e.paths);
+          // Files upload right away; a folder opens the upload-folder confirmation.
+          if (e.paths.length) void handleOsDrop(e.paths);
         }
       })
       .then((u) => (disposed ? u() : (unlisten = u)))
@@ -155,6 +157,7 @@ export function Explorer() {
 
   useEffect(() => installTransferEffects(), []);
   useEffect(() => installJobEffects(), []);
+  useEffect(() => installBatchEffects(), []);
   useEffect(() => installTagEffects(), []);
 
   return (
@@ -189,7 +192,7 @@ export function Explorer() {
               <div className={`drop-overlay ${bucket ? "" : "disabled"}`}>
                 <div className="drop-card">
                   <UploadCloud size={34} strokeWidth={1.5} />
-                  <div className="drop-title">{bucket ? "Drop to upload" : "Select a bucket first"}</div>
+                  <div className="drop-title">{bucket ? "Drop files or a folder to upload" : "Select a bucket first"}</div>
                   {bucket && <div className="muted mono small">s3://{bucket}/{prefix}</div>}
                 </div>
               </div>

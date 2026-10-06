@@ -4,6 +4,7 @@ import * as api from "./lib/api";
 import { setConnected, useApp } from "./store/app";
 import { startTransferSync } from "./store/transfers";
 import { startJobSync } from "./store/jobs";
+import { startBatchSync } from "./store/batches";
 import { ConnectScreen } from "./components/ConnectScreen";
 import { Explorer } from "./components/Explorer";
 import { Toasts } from "./components/Toasts";
@@ -19,6 +20,7 @@ export default function App() {
   useEffect(() => {
     let stop: (() => void) | null = null;
     let stopJobs: (() => void) | null = null;
+    let stopBatches: (() => void) | null = null;
     let cancelUpdateCheck: (() => void) | null = null;
     let disposed = false;
     // Settings work while disconnected, so load them independently of the connection.
@@ -32,6 +34,9 @@ export default function App() {
     startJobSync()
       .then((s) => (disposed ? s() : (stopJobs = s)))
       .catch(() => {});
+    startBatchSync()
+      .then((s) => (disposed ? s() : (stopBatches = s)))
+      .catch(() => {});
     api
       .connectionStatus()
       .then((info) => {
@@ -43,6 +48,7 @@ export default function App() {
       disposed = true;
       stop?.();
       stopJobs?.();
+      stopBatches?.();
       cancelUpdateCheck?.();
     };
   }, []);

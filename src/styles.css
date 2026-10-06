@@ -4877,3 +4877,198 @@ input.lc-date {
   align-items: center;
   gap: 2px;
 }
+
+/* ==========================================================================
+   v0.5.0: folder transfers (batches)
+   ========================================================================== */
+/* Toolbar "Upload" with a menu button for files / folder */
+.split-btn {
+  display: inline-flex;
+}
+.split-btn .split-main {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.split-btn .split-caret {
+  padding: 0 5px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: 1px solid color-mix(in srgb, var(--btn-primary-fg) 22%, transparent);
+}
+
+/* Destination prefix: the bucket is fixed, the prefix after it is editable */
+.batch-prefix-field {
+  margin-top: 12px;
+}
+.prefix-input {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  height: 30px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  transition: border-color 0.12s, box-shadow 0.12s;
+}
+.prefix-input:focus-within {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
+}
+.prefix-input-fixed {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding-left: 10px;
+  color: var(--muted);
+}
+.prefix-input input:not([type="checkbox"]) {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px 0 1px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
+.batch-warnings {
+  margin: 6px 0 0;
+  padding-left: 16px;
+  display: block;
+  color: var(--warning);
+}
+.modal .batch-notes,
+.modal .batch-dest,
+.modal form > .route,
+.modal form > .preview-line,
+.modal form > .inline-error,
+.modal form > .callout,
+.modal form > .conflict-choice,
+.modal form > .hint {
+  margin-top: 10px;
+}
+.batch-notes-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 0;
+  border: none;
+  background: none;
+  color: var(--text-2);
+  font-size: 12px;
+  border-radius: 4px;
+}
+.batch-notes-toggle:hover {
+  color: var(--text);
+}
+.batch-notes-toggle:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.batch-notes-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 6px 10px;
+  max-height: 150px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-size: 12px;
+  user-select: text;
+}
+.batch-notes-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 0;
+  word-break: break-word;
+}
+.batch-notes-list li + li {
+  border-top: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+}
+.batch-note-head {
+  font-size: 11px;
+  color: var(--muted);
+}
+.batch-dest {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.batch-dest + .key-list-wrap {
+  margin-top: 10px;
+}
+.batch-folder-dest {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.batch-folder-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--text-2);
+}
+.warn-text {
+  color: var(--warning);
+}
+.pre-line {
+  white-space: pre-line;
+}
+
+/* Activity panel: a batch row and the files it is transferring now */
+.jcount.speed {
+  color: var(--text-2);
+  background: var(--bg-active);
+}
+.bfiles {
+  display: grid;
+  gap: 3px;
+  padding: 2px 0 6px;
+}
+.bfile {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px 130px;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+}
+.bfile-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.bfile-num {
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.bfile .pbar {
+  display: block;
+}
+@media (max-width: 1000px) {
+  .bfile {
+    grid-template-columns: minmax(0, 1fr) 80px;
+  }
+  .bfile-num {
+    display: none;
+  }
+}
+.bsection {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 4px 0 2px;
+}
