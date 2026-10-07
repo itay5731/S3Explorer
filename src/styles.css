@@ -44,7 +44,7 @@
   --danger: #f2555a;
   --danger-soft: rgba(242, 85, 90, 0.12);
 
-  --folder: #e8b04b;
+  --folder: color-mix(in srgb, var(--accent) 85%, #d4d4d8);
   --ic-image: #c77dff;
   --ic-video: #ff6b8b;
   --ic-audio: #ff9f5a;
@@ -132,7 +132,7 @@
   --warning: #c98a12;
   --danger: #e0393f;
   --danger-soft: rgba(224, 57, 63, 0.08);
-  --folder: #d99a22;
+  --folder: color-mix(in srgb, var(--accent) 85%, #000000);
   --ic-image: #9b4dde;
   --ic-video: #e0446a;
   --ic-audio: #e07a2a;
@@ -184,7 +184,7 @@
     --warning: #c98a12;
     --danger: #e0393f;
     --danger-soft: rgba(224, 57, 63, 0.08);
-    --folder: #d99a22;
+    --folder: color-mix(in srgb, var(--accent) 85%, #000000);
     --ic-image: #9b4dde;
     --ic-video: #e0446a;
     --ic-audio: #e07a2a;

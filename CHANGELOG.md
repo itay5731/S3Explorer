@@ -9,6 +9,10 @@ The section for a version becomes the text of its GitHub Release.
 
 - **A hidden game.** Click a server on the start screen five times: your first connection moves to the middle and the servers defend it against bugs, power surges, worms, ransomware and a DDoS boss. Esc leaves.
 
+### Improved
+
+- **Folder icons follow the accent colour.**
+
 ## [0.5.1] - 2026-10-07
 
 ### Fixed
