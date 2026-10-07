@@ -51,6 +51,13 @@ machine: 40 MiB upload ~300 MiB/s, download ~450 MiB/s; 512 MiB upload ~480 MiB/
   `dev.s3explorer.app.test`. `updater_check`: the update check and a failing-signature install against a local server.
 - Linking can fail with "paging file is too small (os error 1455)" or a spurious `E0463`; rerun with `-j 2`.
 
+## Lessons from v0.5.x
+- Assert the painted state of progress bars (the fill's rendered width via getBoundingClientRect), not only
+  DOM attributes or store state. The v0.5.0 end-to-end run saw byte counts update beside bars whose fill had
+  zero width (an inline element) and reported them fine.
+- A stale vite from an earlier run holding port 1420 makes `npm run tauri dev` exit silently right after
+  "Running BeforeDevCommand". Kill the port holder first (`netstat -ano | findstr :1420`).
+
 ## When a test drives the real app
 - It uses the real keychain service and `%APPDATA%dev.s3explorer.app`. Back both up first, prefix test connections
   with `e2e-`, delete them through the app, and prove afterwards (`cmdkey /list`, file hashes) that nothing is left.
