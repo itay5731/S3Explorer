@@ -5,6 +5,12 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-07
+
+### Fixed
+
+- **The per-file progress bars inside a folder transfer never filled.** The byte counts beside them moved, but the bar itself stayed empty because of a styling mistake. The bars now fill as each file downloads or uploads.
+
 ## [0.5.0] - 2026-10-06
 
 Whole folders, and your files' history. This version moves folders in and out in one go, shows and restores object versions, brings archived objects back, and lets you stop running work when you disconnect.

@@ -224,7 +224,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.5.0`:
+Honest status, as of `v0.5.1`:
 
 | | |
 |---|---|
