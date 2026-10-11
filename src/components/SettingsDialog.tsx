@@ -7,6 +7,7 @@ import {
   Cpu,
   FileStack,
   Info,
+  Keyboard,
   Loader2,
   MousePointer2,
   Network,
@@ -54,6 +55,8 @@ import { AppearanceTab } from "./AppearanceTab";
 import { BehaviorTab, type FileManagerDraft } from "./BehaviorTab";
 import { NotificationsTab } from "./NotificationsTab";
 import { UpdatesTab } from "./UpdatesTab";
+import { KeyboardTab } from "./KeyboardTab";
+import { ACTIONS_BY_ID, chordProblem, effectiveBindings, findConflicts, normalizeOverrides, type Bindings } from "../lib/keys";
 
 // ---- draft model ------------------------------------------------------------------
 
@@ -78,6 +81,8 @@ interface Draft {
   accent: AccentColor;
   confirmCopyMove: boolean;
   fileManager: FileManagerDraft;
+  /** Overrides only (see "Settings → Keyboard" in docs/CONTRACT.md). */
+  keybindings: Bindings;
 }
 
 type TransferErrors = Record<"partSize" | "parts" | "transfers", string | null>;
@@ -97,7 +102,19 @@ const toDraft = (s: AppSettings): Draft => ({
   accent: s.accent,
   confirmCopyMove: s.confirmCopyMove,
   fileManager: { mode: s.fileManagerCommand ? "program" : "system", command: s.fileManagerCommand ?? "" },
+  keybindings: normalizeOverrides(s.keybindings ?? {}),
 });
+
+/** Problem with the key bindings (a conflict, a chord that can't be bound), or null. */
+function keybindingsError(b: Bindings): string | null {
+  const effective = effectiveBindings(b);
+  if (findConflicts(effective).length) return "Two actions share a key.";
+  for (const [id, chords] of Object.entries(b)) {
+    if (!ACTIONS_BY_ID.has(id)) continue;
+    for (const c of chords) if (chordProblem(id, c)) return `${c}: ${chordProblem(id, c)}`;
+  }
+  return null;
+}
 
 /** Problem with the file-manager choice, or null. "This program" needs a command. */
 function fileManagerError(f: FileManagerDraft): string | null {
@@ -120,6 +137,7 @@ function toSettings(d: Draft): AppSettings | null {
   const errs = transferErrors(t);
   if (errs.partSize || errs.parts || errs.transfers) return null;
   if (fileManagerError(d.fileManager)) return null;
+  if (keybindingsError(d.keybindings)) return null;
   return {
     partSizeMib: t.partMode === "auto" ? null : Number(t.partSize),
     maxConcurrentParts: Number(t.parts),
@@ -132,6 +150,7 @@ function toSettings(d: Draft): AppSettings | null {
     accent: d.accent,
     confirmCopyMove: d.confirmCopyMove,
     fileManagerCommand: d.fileManager.mode === "system" ? null : normalizeFileManagerCommand(d.fileManager.command),
+    keybindings: normalizeOverrides(d.keybindings),
   };
 }
 
@@ -245,6 +264,17 @@ const TABS: SettingsTab[] = [
     ),
     reset: (d) => ({ ...d, notifyOnFinish: DEFAULT_DRAFT.notifyOnFinish }),
     atDefaults: (d) => d.notifyOnFinish === DEFAULT_DRAFT.notifyOnFinish,
+  },
+  {
+    id: "keyboard",
+    label: "Keyboard",
+    icon: Keyboard,
+    render: (ctx) => (
+      <KeyboardTab value={ctx.draft.keybindings} disabled={ctx.disabled} onChange={(keybindings) => ctx.update({ ...ctx.draft, keybindings })} />
+    ),
+    // Unknown actions (from another version) are kept; only the known ones go back to their defaults.
+    reset: (d) => ({ ...d, keybindings: Object.fromEntries(Object.entries(d.keybindings).filter(([id]) => !ACTIONS_BY_ID.has(id))) }),
+    atDefaults: (d) => Object.keys(d.keybindings).every((id) => !ACTIONS_BY_ID.has(id)),
   },
   {
     id: "updates",

@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Archive, ArchiveX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
-import { loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, usePane, writePref } from "../store/app";
+import { activePane, loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, usePane, writePref } from "../store/app";
+import { focusPaneListSoon } from "../store/keyboard";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
 import { PopupMenu } from "./PopupMenu";
@@ -47,6 +48,33 @@ function useSplit() {
   return { sidebar, style: { "--buckets-share": share } as CSSProperties, onPointerDown, reset: () => save(DEFAULT_SHARE) };
 }
 
+/** Open a bucket in the active pane and give its file list the keyboard. */
+function openBucket(name: string) {
+  navigate(name, "");
+  focusPaneListSoon(activePane());
+}
+
+/**
+ * Arrow keys, Home and End move between the bucket rows (a list widget's own keys; the app's
+ * shortcuts go through the key dispatcher). From the filter box, ArrowDown enters the list.
+ */
+function moveInList(from: HTMLElement, key: string): boolean {
+  const list = from.closest(".sidebar-buckets")?.querySelector(".bucket-list");
+  const rows = [...(list?.querySelectorAll<HTMLElement>(".bucket-item:not(.skeleton)") ?? [])];
+  if (!rows.length) return false;
+  const i = rows.indexOf(from);
+  const to =
+    key === "ArrowDown" ? (i < 0 ? 0 : Math.min(rows.length - 1, i + 1))
+    : key === "ArrowUp" ? (i < 0 ? rows.length - 1 : Math.max(0, i - 1))
+    : key === "Home" ? 0
+    : key === "End" ? rows.length - 1
+    : -1;
+  if (to < 0) return false;
+  rows[to].focus();
+  rows[to].scrollIntoView({ block: "nearest" });
+  return true;
+}
+
 interface BucketEntry {
   name: string;
   title: string;
@@ -70,15 +98,18 @@ function BucketRow({ b, selected, onMenu }: { b: BucketEntry; selected: boolean;
       title={b.title}
       data-drop-bucket={b.name}
       data-drop-prefix=""
-      onClick={() => navigate(b.name, "")}
+      onClick={() => openBucket(b.name)}
       onContextMenu={(e) => {
         e.preventDefault();
         onMenu(b, e.clientX, e.clientY);
       }}
       onKeyDown={(e) => {
+        if (e.defaultPrevented || e.target !== e.currentTarget || e.ctrlKey || e.altKey || e.metaKey) return;
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          navigate(b.name, "");
+          openBucket(b.name);
+        } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key) && !e.shiftKey) {
+          if (moveInList(e.currentTarget, e.key)) e.preventDefault();
         } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
           e.preventDefault();
           openMenuAt(e as unknown as ReactMouseEvent<HTMLElement>);
@@ -172,7 +203,16 @@ export function Sidebar() {
 
         <div className="search-box">
           <Search size={13} />
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter buckets" spellCheck={false} />
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="Filter buckets"
+            aria-label="Filter buckets"
+            spellCheck={false}
+            onKeyDown={(e) => {
+              if (e.key === "ArrowDown" && !e.altKey && !e.ctrlKey && !e.metaKey && moveInList(e.currentTarget, "ArrowDown")) e.preventDefault();
+            }}
+          />
           {filter && (
             <button className="icon-btn" onClick={() => setFilter("")} aria-label="Clear filter">
               <X size={12} />
@@ -258,7 +298,7 @@ export function Sidebar() {
           label={`Actions for ${menu.b.name}`}
           onClose={() => setMenu(null)}
           groups={[
-            [{ label: "Open", icon: <FolderOpen size={14} />, action: () => navigate(menu.b.name, "") }],
+            [{ label: "Open", icon: <FolderOpen size={14} />, action: () => openBucket(menu.b.name) }],
             [
               { label: "Bucket tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "bucketTags", bucket: menu.b.name }) },
               { label: "Lifecycle rules…", icon: <CalendarClock size={14} />, action: () => openModal({ kind: "lifecycle", bucket: menu.b.name }) },

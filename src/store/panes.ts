@@ -54,6 +54,21 @@ export interface PaneSearch {
   focus: string | null;
 }
 
+/** One place a pane was at (see "History" in docs/CONTRACT.md). */
+export interface HistoryEntry {
+  bucket: string;
+  prefix: string;
+}
+
+/** A pane's back/forward history: `entries[index]` is where the pane is now. */
+export interface PaneHistory {
+  entries: HistoryEntry[];
+  index: number;
+}
+
+export const HISTORY_CAP = 100;
+export const emptyHistory: PaneHistory = { entries: [], index: -1 };
+
 export interface PaneState {
   bucket: string | null;
   prefix: string;
@@ -72,6 +87,9 @@ export interface PaneState {
   scrollTo: { id: string; seq: number } | null;
 
   search: PaneSearch;
+
+  /** Back / Forward (cleared with the pane: disconnect, a new connection). */
+  history: PaneHistory;
 }
 
 export const emptyListing: Listing = {
@@ -112,6 +130,7 @@ export function freshPane(sort: SortState = readPref<SortState>(SORT_KEY, { key:
     reveal: null,
     scrollTo: null,
     search: emptySearch,
+    history: emptyHistory,
   };
 }
 

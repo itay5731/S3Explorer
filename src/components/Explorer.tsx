@@ -1,22 +1,10 @@
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
-import {
-  activePane,
-  getPane,
-  isSplitShown,
-  readPref,
-  requestDisconnect,
-  setActivePane,
-  setNarrow,
-  setSplit,
-  shownOtherPane,
-  useApp,
-  writePref,
-} from "../store/app";
+import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNarrow, useApp, writePref } from "../store/app";
 import { PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
-import { requestTransferToOther } from "../store/ops";
-import { useSettings } from "../store/settings";
+import { onExplorerKeyDown, onExplorerMouseDown } from "../store/keyActions";
+import { ShortcutsDialog } from "./ShortcutsDialog";
 import { installTransferEffects } from "../store/actions";
 import { handleOsDrop, installBatchEffects } from "../store/folders";
 import { installJobEffects } from "../store/ops";
@@ -157,42 +145,18 @@ function useNarrowWatch() {
   return ref;
 }
 
-/** Give a pane the keyboard: its table (or results list), else the pane itself. */
-function focusPane(id: PaneId) {
-  setActivePane(id);
-  const root = document.querySelector<HTMLElement>(`[data-pane="${id}"]`);
-  (root?.querySelector<HTMLElement>(".tbody") ?? root)?.focus();
-}
-
 /**
- * Window shortcuts for the panes: Ctrl+2 / Ctrl+1 split and unsplit; F5 / F6 copy and move the active
- * pane's selection to the other pane (split view only; F5 never reloads the page then).
+ * The key dispatcher: one capture-phase keydown listener for the whole explorer (see "Dispatcher
+ * rules" in docs/CONTRACT.md and store/keyActions.ts).
  */
-function usePaneShortcuts() {
+function useKeyDispatcher() {
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const st = useApp.getState();
-      const ctrl = e.ctrlKey || e.metaKey;
-      const transfer = (e.key === "F5" || e.key === "F6") && !ctrl && !e.altKey && !e.shiftKey;
-      // With the split on, F5/F6 belong to the panes: never let the webview reload the page, even
-      // while a dialog is open or the second pane is hidden for width.
-      if (transfer && st.split) e.preventDefault();
-      if (e.defaultPrevented && !transfer) return;
-      // The same guard as the table shortcuts: not while typing, in a dialog, menu or popover, or
-      // while Settings is open.
-      const el = e.target as HTMLElement | null;
-      const typing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-      const inOverlay = !!el?.closest?.(".modal, .context-menu, .popover");
-      if (st.modal || st.contextMenu || useSettings.getState().open || typing || inOverlay) return;
-      if (ctrl && !e.altKey && !e.shiftKey && (e.key === "1" || e.key === "2")) {
-        e.preventDefault();
-        setSplit(e.key === "2");
-        return;
-      }
-      if (transfer && isSplitShown() && getPane().bucket) void requestTransferToOther(e.key === "F5" ? "copy" : "cut");
+    window.addEventListener("keydown", onExplorerKeyDown, true);
+    window.addEventListener("mousedown", onExplorerMouseDown, true);
+    return () => {
+      window.removeEventListener("keydown", onExplorerKeyDown, true);
+      window.removeEventListener("mousedown", onExplorerMouseDown, true);
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
   }, []);
 }
 
@@ -204,16 +168,6 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
   const split = useApp((s) => s.split && !s.narrow);
   const active = useApp((s) => s.activePane === id);
 
-  // Tab / Shift+Tab in a table or results list moves to the other pane (split view only).
-  const onKeyDown = (e: ReactKeyboardEvent) => {
-    if (e.key !== "Tab" || e.ctrlKey || e.altKey || e.metaKey) return;
-    if (!(e.target as HTMLElement).classList.contains("tbody")) return;
-    const other = shownOtherPane();
-    if (!other) return;
-    e.preventDefault();
-    focusPane(other);
-  };
-
   return (
     <PaneContext.Provider value={id}>
       <section
@@ -223,7 +177,6 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
         aria-label={split ? (id === "a" ? "Left pane" : "Right pane") : undefined}
         onPointerDownCapture={() => setActivePane(id)}
         onFocusCapture={() => setActivePane(id)}
-        onKeyDown={onKeyDown}
       >
         {bucket && <Breadcrumbs />}
         <div className="table-wrap">
@@ -297,7 +250,7 @@ export function Explorer() {
   const dropTarget = useFileDrop();
   const sidebar = useSidebarResize();
   const main = useNarrowWatch();
-  usePaneShortcuts();
+  useKeyDispatcher();
   // Two panes side by side, or only the active one.
   const panes = shown ? PANE_IDS : [active];
 
@@ -347,6 +300,7 @@ export function Explorer() {
       <ActivityPanel />
       <ContextMenu />
       <Modals />
+      <ShortcutsDialog />
       <DragBadge />
     </div>
   );

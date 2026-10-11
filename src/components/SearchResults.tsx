@@ -2,7 +2,7 @@
 // list of hits (folders, then objects). The rows are the selection while the view is open, with the
 // table's conventions, so every toolbar and context-menu action works on them (see getSelected).
 
-import { memo, useEffect, useMemo, useRef, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { AlertTriangle, ArrowLeft, Loader2, RefreshCw, SearchX, X } from "lucide-react";
 import type { ParsedSearch, SearchHit } from "../lib/types";
@@ -20,9 +20,11 @@ import {
   setSearchScope,
   getSearch,
   setSearchSelection,
+  runWasTyped,
+  takeResultsFocus,
   usePaneSearch,
 } from "../store/search";
-import { copySelection, requestDelete, requestRename } from "../store/ops";
+import { registerListKeys, searchInput, type ListKeys } from "../store/keyboard";
 import { FileIcon } from "./FileIcon";
 
 const ROW_H = 44;
@@ -255,9 +257,15 @@ export function SearchResults() {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [runSeq]);
 
-  // Results arrived: the list takes the keyboard, with the first row focused (Enter opens it).
+  // Results arrived: the list takes the keyboard, with the first row focused (Enter opens it), unless
+  // the search box has it (search as you type keeps typing there; Enter / ArrowDown ask for the list).
   useEffect(() => {
-    if (result) scrollRef.current?.focus();
+    if (!result) return;
+    const wanted = takeResultsFocus(pane);
+    // A search started by typing never takes the keyboard by itself: the user may still be typing,
+    // or may have moved on (to the other pane, a dialog) while it ran.
+    const typing = runWasTyped(pane) || document.activeElement === searchInput();
+    if (wanted || !typing) scrollRef.current?.focus();
   }, [result === null, runSeq]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const indexFromEvent = (e: ReactMouseEvent) => {
@@ -277,90 +285,82 @@ export function SearchResults() {
 
   const onContextMenu = (e: ReactMouseEvent) => {
     e.preventDefault();
+    // The menu key and Shift+F10 also fire a contextmenu event (button -1); the key dispatcher
+    // already opened the menu for the focused row (sel.menu), so this one is not a click.
+    if (e.button < 0) return;
     const index = indexFromEvent(e);
     if (index < 0) return; // no folder in view: nothing to offer for empty space
     if (!getSearch(pane).selection.has(hitId(hits[index]))) selectIndex(index, "single", pane);
     openContextMenu({ x: e.clientX, y: e.clientY });
   };
 
-  const onKeyDown = (e: ReactKeyboardEvent) => {
-    if (!hits.length) {
-      if (e.key === "Escape") leaveSearch(pane);
-      return;
-    }
-    const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 300) / ROW_H) - 1);
-    const move = (to: number) => {
-      const next = Math.max(0, Math.min(hits.length - 1, to));
-      selectIndex(next, e.shiftKey ? "range" : "single", pane);
+  // The keys of this list, run by the key dispatcher (store/keyActions.ts) through the registry.
+  const keysRef = useRef<ListKeys | null>(null);
+  keysRef.current = {
+    move(to, extend) {
+      if (!hits.length) return;
+      const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 300) / ROW_H) - 1);
+      const target =
+        to === "down" ? (focusIndex < 0 ? 0 : focusIndex + 1)
+        : to === "up" ? (focusIndex < 0 ? hits.length - 1 : focusIndex - 1)
+        : to === "pageDown" ? focusIndex + page
+        : to === "pageUp" ? focusIndex - page
+        : to === "first" ? 0
+        : hits.length - 1;
+      const next = Math.max(0, Math.min(hits.length - 1, target));
+      selectIndex(next, extend ? "range" : "single", pane);
       virtualizer.scrollToIndex(next, { align: "auto" });
-    };
-    const ctrl = e.ctrlKey || e.metaKey;
-    const { selection } = getSearch(pane);
-    switch (e.key) {
-      case "ArrowDown":
-        move(focusIndex < 0 ? 0 : focusIndex + 1);
-        break;
-      case "ArrowUp":
-        move(focusIndex < 0 ? hits.length - 1 : focusIndex - 1);
-        break;
-      case "PageDown":
-        move(focusIndex + page);
-        break;
-      case "PageUp":
-        move(focusIndex - page);
-        break;
-      case "Home":
-        move(0);
-        break;
-      case "End":
-        move(hits.length - 1);
-        break;
-      case " ":
-        if (focusIndex >= 0) selectIndex(focusIndex, "toggle", pane);
-        break;
-      case "Enter":
-        if (focusIndex >= 0) openHit(hits[focusIndex], pane);
-        break;
-      case "Escape":
-        // Like the table: Esc clears the selection first; with nothing selected it leaves the results.
-        if (selection.size) setSearchSelection(new Set(), null, getSearch(pane).focus, pane);
-        else leaveSearch(pane);
-        break;
-      case "Delete":
-        if (ctrl || e.altKey || !selection.size) return;
-        requestDelete();
-        break;
-      case "F2":
-        if (selection.size !== 1) return;
-        void requestRename();
-        break;
-      case "a":
-      case "A":
-        if (!ctrl) return;
-        setSearchSelection(new Set(hits.map(hitId)), hitId(hits[0]), getSearch(pane).focus, pane);
-        break;
-      case "c":
-      case "C":
-      case "x":
-      case "X":
-        if (!ctrl || e.altKey || e.shiftKey || !selection.size) return;
-        void copySelection(e.key.toLowerCase() === "x" ? "cut" : "copy");
-        break;
-      case "ContextMenu":
-      case "F10": {
-        if (e.key === "F10" && !e.shiftKey) return;
-        const index = focusIndex >= 0 ? focusIndex : 0;
-        if (!selection.has(hitId(hits[index]))) selectIndex(index, "single", pane);
-        const row = scrollRef.current?.querySelector<HTMLElement>(`[data-index="${index}"]`);
-        const r = row?.getBoundingClientRect() ?? scrollRef.current!.getBoundingClientRect();
-        openContextMenu({ x: r.left + 40, y: r.top + Math.min(r.height, ROW_H) });
-        break;
-      }
-      default:
+    },
+    toggle() {
+      if (focusIndex >= 0) selectIndex(focusIndex, "toggle", pane);
+      else if (hits.length) selectIndex(0, "single", pane);
+    },
+    toggleNext() {
+      if (!hits.length) return;
+      if (focusIndex < 0) {
+        selectIndex(0, "toggle", pane);
         return;
-    }
-    e.preventDefault();
+      }
+      selectIndex(focusIndex, "toggle", pane);
+      const next = Math.min(hits.length - 1, focusIndex + 1);
+      const s = getSearch(pane);
+      setSearchSelection(s.selection, s.anchor, hitId(hits[next]), pane);
+      virtualizer.scrollToIndex(next, { align: "auto" });
+    },
+    selectAll() {
+      if (hits.length) setSearchSelection(new Set(hits.map(hitId)), hitId(hits[0]), getSearch(pane).focus, pane);
+    },
+    clear() {
+      // Like the table: Esc clears the selection first; with nothing selected it leaves the results.
+      const { selection } = getSearch(pane);
+      if (hits.length && selection.size) setSearchSelection(new Set(), null, getSearch(pane).focus, pane);
+      else leaveSearch(pane);
+    },
+    open() {
+      if (focusIndex >= 0) openHit(hits[focusIndex], pane);
+    },
+    menu() {
+      if (!hits.length) return;
+      const index = focusIndex >= 0 ? focusIndex : 0;
+      if (!getSearch(pane).selection.has(hitId(hits[index]))) selectIndex(index, "single", pane);
+      const row = scrollRef.current?.querySelector<HTMLElement>(`[data-index="${index}"]`);
+      const r = row?.getBoundingClientRect() ?? scrollRef.current?.getBoundingClientRect();
+      if (r) openContextMenu({ x: r.left + 40, y: r.top + Math.min(r.height, ROW_H) });
+    },
   };
+  useEffect(
+    () =>
+      registerListKeys(pane, {
+        move: (to, extend) => keysRef.current?.move(to, extend),
+        toggle: () => keysRef.current?.toggle(),
+        toggleNext: () => keysRef.current?.toggleNext(),
+        selectAll: () => keysRef.current?.selectAll(),
+        clear: () => keysRef.current?.clear(),
+        open: () => keysRef.current?.open(),
+        menu: () => keysRef.current?.menu(),
+      }),
+    [pane],
+  );
 
   let body: ReactNode;
   if (!result) {
@@ -428,7 +428,6 @@ export function SearchResults() {
         ref={scrollRef}
         tabIndex={0}
         style={{ ["--row-h" as string]: `${ROW_H}px` }}
-        onKeyDown={onKeyDown}
         onClick={onClick}
         onDoubleClick={(e) => {
           const i = indexFromEvent(e);

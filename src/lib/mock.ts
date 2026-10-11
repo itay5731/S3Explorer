@@ -39,7 +39,7 @@ import type {
   UpdateProgress,
   VersionListing,
 } from "./types";
-import { BATCH_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { BATCH_LIMITS, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
 import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
@@ -2229,6 +2229,33 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   },
 });
 
+// ---- text files (keyboard bindings export / import, v0.7.0) -----------------------------------
+// The real backend writes and reads `.json` files on disk; the mock keeps them in a map keyed by
+// path (case-insensitive, like Windows). A parent folder containing "missing" does not exist.
+
+const textFiles = new Map<string, { path: string; content: string }>();
+const textFileCallLog: { cmd: "write" | "read"; path: string; at: string }[] = [];
+const textPick: { save: string | null | undefined; open: string | null | undefined } = { save: undefined, open: undefined };
+
+function checkTextPath(path: string) {
+  if (typeof path !== "string" || !isAbsoluteLocal(path)) throw fail("InvalidInput", "The path must be absolute.");
+  if (!/\.json$/i.test(path)) throw fail("InvalidInput", "Only .json files can be read or written.");
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  textFileCalls: textFileCallLog,
+  textFile: (path: string) => textFiles.get(path.toLowerCase())?.content ?? null,
+  setTextFile: (path: string, content: string) => textFiles.set(path.toLowerCase(), { path, content }),
+  /** What the next export save dialog returns (a path, or null for "cancelled"). */
+  setNextExportPath: (path: string | null) => {
+    textPick.save = path;
+  },
+  /** What the next import open dialog returns (a path, or null for "cancelled"). */
+  setNextImportFile: (path: string | null) => {
+    textPick.open = path;
+  },
+});
+
 export const mockBackend: Backend = {
   async listProfiles() {
     await latency();
@@ -2825,6 +2852,8 @@ export const mockBackend: Backend = {
       confirmCopyMove: next.confirmCopyMove,
       // Like the backend: trimmed, empty becomes null; the field is required.
       fileManagerCommand: typeof next.fileManagerCommand === "string" ? normalizeFileManagerCommand(next.fileManagerCommand) : next.fileManagerCommand,
+      // Like the backend: a missing field is {} (a settings.json without it loads {}).
+      keybindings: JSON.parse(JSON.stringify(next.keybindings ?? {})) as Record<string, string[]>,
     };
     if (candidate.fileManagerCommand === undefined) throw fail("InvalidInput", "fileManagerCommand: required.");
     const problem = validateAppSettings(candidate);
@@ -3077,6 +3106,44 @@ export const mockBackend: Backend = {
   async pickProgram() {
     await delay(150);
     return "C:\\Program Files\\totalcmd\\TOTALCMD64.EXE";
+  },
+
+  async pickExportPath(defaultName) {
+    await delay(120);
+    const next = textPick.save;
+    textPick.save = undefined;
+    return next === undefined ? `C:\\Users\\demo\\Documents\\${defaultName}` : next;
+  },
+
+  async pickImportFile() {
+    await delay(120);
+    const next = textPick.open;
+    textPick.open = undefined;
+    return next === undefined ? "C:\\Users\\demo\\Documents\\s3explorer-keybindings.json" : next;
+  },
+
+  async writeTextFile(path, content) {
+    await delay(60);
+    textFileCallLog.push({ cmd: "write", path, at: new Date().toISOString() });
+    checkTextPath(path);
+    if (typeof content !== "string") throw fail("InvalidInput", "content must be text.");
+    if (new TextEncoder().encode(content).length > KEYBINDING_LIMITS.fileMaxBytes) {
+      throw fail("InvalidInput", `The content is larger than ${KEYBINDING_LIMITS.fileMaxBytes} bytes.`);
+    }
+    if (/[\\/][^\\/]*missing[^\\/]*[\\/][^\\/]+$/i.test(path)) throw fail("Io", "The folder does not exist.");
+    textFiles.set(path.toLowerCase(), { path, content });
+  },
+
+  async readTextFile(path) {
+    await delay(60);
+    textFileCallLog.push({ cmd: "read", path, at: new Date().toISOString() });
+    checkTextPath(path);
+    const f = textFiles.get(path.toLowerCase());
+    if (!f) throw fail("Io", `File not found: ${path}`);
+    if (new TextEncoder().encode(f.content).length > KEYBINDING_LIMITS.fileMaxBytes) {
+      throw fail("InvalidInput", `The file is larger than ${KEYBINDING_LIMITS.fileMaxBytes} bytes.`);
+    }
+    return f.content;
   },
 
   async onFileDrop(cb: (e: FileDropEvent) => void): Promise<Unlisten> {

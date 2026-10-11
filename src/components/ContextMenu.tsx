@@ -11,6 +11,7 @@ import { useOtherPaneDest } from "./Toolbar";
 import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlocked } from "../store/archive";
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
+import { useKeyHint } from "../store/keyboard";
 
 interface Item {
   label: string;
@@ -38,6 +39,23 @@ export function ContextMenu() {
   const singleInfo = useArchive((s) => (bucket && single ? s.byId[archiveId(bucket, single.key)] : undefined));
   // Split view: the other pane's folder is a destination for the selection.
   const dest = useOtherPaneDest();
+  const k = {
+    open: useKeyHint("nav.open"),
+    copy: useKeyHint("act.copy"),
+    cut: useKeyHint("act.cut"),
+    paste: useKeyHint("act.paste"),
+    rename: useKeyHint("act.rename"),
+    toOther: useKeyHint("act.copyToOther"),
+    moveOther: useKeyHint("act.moveToOther"),
+    del: useKeyHint("act.delete"),
+    copyKey: useKeyHint("act.copyKey"),
+    copyUri: useKeyHint("act.copyUri"),
+    tags: useKeyHint("act.tags"),
+    newFolder: useKeyHint("act.newFolder"),
+    refresh: useKeyHint("nav.refresh"),
+    upload: useKeyHint("act.upload"),
+    uploadFolder: useKeyHint("act.uploadFolder"),
+  };
 
   useLayoutEffect(() => {
     if (!menu || !ref.current) {
@@ -94,22 +112,22 @@ export function ContextMenu() {
     label: clip ? `Paste ${plural(clip.items.length, "item")} here` : "Paste",
     icon: <ClipboardPaste size={14} />,
     action: () => requestPaste(),
-    hint: "Ctrl+V",
+    hint: k.paste,
     disabled: !clip,
   };
   const editItems = (n: number, archived = false): Item[] => {
     const why = archived ? { disabled: true, title: ARCHIVED_REASON } : {};
     return [
-      { label: n > 1 ? `Copy ${n} items` : "Copy", icon: <CopyPlus size={14} />, action: () => void copySelection("copy"), hint: "Ctrl+C", ...why },
-      { label: n > 1 ? `Cut ${n} items` : "Cut", icon: <Scissors size={14} />, action: () => void copySelection("cut"), hint: "Ctrl+X", ...why },
-      ...(n === 1 ? [{ label: "Rename…", icon: <PencilLine size={14} />, action: () => void requestRename(), hint: "F2", ...why }] : []),
+      { label: n > 1 ? `Copy ${n} items` : "Copy", icon: <CopyPlus size={14} />, action: () => void copySelection("copy"), hint: k.copy, ...why },
+      { label: n > 1 ? `Cut ${n} items` : "Cut", icon: <Scissors size={14} />, action: () => void copySelection("cut"), hint: k.cut, ...why },
+      ...(n === 1 ? [{ label: "Rename…", icon: <PencilLine size={14} />, action: () => void requestRename(), hint: k.rename, ...why }] : []),
       ...(dest
         ? [
             {
               label: "Copy to other pane",
               icon: <CopyPlus size={14} />,
               action: () => void requestTransferToOther("copy"),
-              hint: "F5",
+              hint: k.toOther,
               title: `Copy to ${s3Uri(dest.bucket, dest.prefix)}`,
               ...why,
             },
@@ -117,7 +135,7 @@ export function ContextMenu() {
               label: "Move to other pane",
               icon: <FolderInput size={14} />,
               action: () => void requestTransferToOther("cut"),
-              hint: "F6",
+              hint: k.moveOther,
               title: `Move to ${s3Uri(dest.bucket, dest.prefix)}`,
               ...why,
             },
@@ -131,26 +149,26 @@ export function ContextMenu() {
     icon: <Trash2 size={14} />,
     danger: true,
     action: () => requestDelete(),
-    hint: "Del",
+    hint: k.del,
   });
 
   if (count === 0) {
     groups.push([
-      { label: "Upload files…", icon: <Upload size={14} />, action: () => void pickAndUpload() },
-      { label: "Upload folder…", icon: <FolderUp size={14} />, action: () => void pickAndUploadFolder() },
-      { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openNewFolder() },
+      { label: "Upload files…", icon: <Upload size={14} />, action: () => void pickAndUpload(), hint: k.upload },
+      { label: "Upload folder…", icon: <FolderUp size={14} />, action: () => void pickAndUploadFolder(), hint: k.uploadFolder },
+      { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openNewFolder(), hint: k.newFolder },
     ]);
     groups.push([pasteItem]);
-    groups.push([{ label: "Refresh", icon: <RefreshCw size={14} />, action: () => refresh() }]);
+    groups.push([{ label: "Refresh", icon: <RefreshCw size={14} />, action: () => refresh(), hint: k.refresh }]);
   } else if (count === 1 && folders.length === 1) {
     const f = folders[0];
     groups.push([
-      { label: inResults ? "Open folder" : "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: "Enter" },
+      { label: inResults ? "Open folder" : "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: k.open },
       { label: "Download folder…", icon: <FolderDown size={14} />, action: () => void requestDownloadFolders([f]) },
     ]);
     groups.push([
-      { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(f.prefix, "Key") },
-      { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, f.prefix), "S3 URI") },
+      { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(f.prefix, "Key"), hint: k.copyKey },
+      { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, f.prefix), "S3 URI"), hint: k.copyUri },
     ]);
     groups.push(editItems(1));
     groups.push([
@@ -170,7 +188,7 @@ export function ContextMenu() {
             ? { disabled: true, title: "Already restored" }
             : {};
     if (inResults) {
-      groups.push([{ label: "Go to object", icon: <LocateFixed size={14} />, action: () => revealObject(bucket, o.key, o.name), hint: "Enter" }]);
+      groups.push([{ label: "Go to object", icon: <LocateFixed size={14} />, action: () => revealObject(bucket, o.key, o.name), hint: k.open }]);
     }
     groups.push([
       {
@@ -182,12 +200,12 @@ export function ContextMenu() {
       ...(restoreState ? [{ ...restoreItem("Restore…"), ...restoreState }] : []),
     ]);
     groups.push([
-      { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(o.key, "Key") },
-      { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, o.key), "S3 URI") },
+      { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(o.key, "Key"), hint: k.copyKey },
+      { label: "Copy S3 URI", icon: <Link size={14} />, action: () => void copyText(s3Uri(bucket, o.key), "S3 URI"), hint: k.copyUri },
     ]);
     groups.push(editItems(1, blocked));
     groups.push([
-      { label: "Edit tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "objectTags", bucket, key: o.key }) },
+      { label: "Edit tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "objectTags", bucket, key: o.key }), hint: k.tags },
       {
         label: "Properties",
         icon: <Info size={14} />,

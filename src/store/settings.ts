@@ -6,7 +6,7 @@ import * as api from "../lib/api";
 import { applyAccent, applyTheme, readAccentMirror, readThemeMirror, writeAccentMirror, writeThemeMirror } from "../lib/theme";
 import type { AppError, AppSettings } from "../lib/types";
 
-export type SettingsTabId = "transfers" | "behavior" | "appearance" | "notifications" | "updates";
+export type SettingsTabId = "transfers" | "behavior" | "appearance" | "notifications" | "keyboard" | "updates";
 
 interface SettingsState {
   /** Last values confirmed by the backend; null until the first load succeeds. */

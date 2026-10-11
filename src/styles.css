@@ -5694,3 +5694,279 @@ mark.hl {
     text-align: right;
   }
 }
+
+/* ---- v0.7.0 keyboard: history buttons, cheat sheet, Settings → Keyboard ---------------------- */
+
+/* Back / Forward give way first when the toolbar runs out of room (the keys still work). */
+@container browser (max-width: 760px) {
+  .tb-history {
+    display: none;
+  }
+}
+
+kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border-radius: 5px;
+  border: 1px solid var(--border-strong);
+  border-bottom-width: 2px;
+  background: var(--bg-input);
+  color: var(--text);
+  font: 500 11px/1 var(--font);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.chord {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.shortcuts-modal {
+  width: min(980px, 100%);
+  display: flex;
+  flex-direction: column;
+  outline: none;
+}
+.shortcuts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 6px 22px;
+  overflow: auto;
+  min-height: 0;
+  padding-right: 4px;
+}
+.shortcuts-group h3 {
+  margin: 6px 0 6px;
+}
+.shortcuts-group dl {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+}
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 28px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.shortcut-row:last-child {
+  border-bottom: 0;
+}
+.shortcut-row dt {
+  color: var(--text-2);
+  min-width: 0;
+}
+.shortcut-ctx {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.shortcut-row dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: none;
+  max-width: 55%;
+}
+.chord-alt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.chord-or {
+  font-size: 11px;
+  color: var(--dim);
+}
+.shortcuts-foot {
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.shortcuts-foot kbd {
+  height: 18px;
+}
+
+.kb-tab {
+  gap: 16px;
+}
+.kb-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.kb-toolbar .set-desc {
+  min-width: 220px;
+}
+.kb-group h4 {
+  margin: 0 0 6px;
+}
+.kb-rows {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.kb-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.1fr) minmax(0, 1.4fr) auto;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 6px 8px 6px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-elev);
+}
+.kb-row:last-child {
+  border-bottom: 0;
+}
+.kb-row:nth-child(even) {
+  background: color-mix(in srgb, var(--bg-elev) 92%, var(--bg-input));
+}
+.kb-row.conflict {
+  background: var(--danger-soft);
+}
+.kb-row.kb-recording {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.kb-label {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  color: var(--text);
+}
+.kb-ctx {
+  font-size: 11px;
+  color: var(--muted);
+}
+.kb-chords {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+.kb-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 26px;
+  padding: 0 2px 0 4px;
+  border-radius: 7px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg);
+}
+.kb-chip.clash {
+  border-color: var(--danger);
+}
+.kb-chip.kb-live {
+  padding: 0 8px;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  color: var(--accent-text);
+  font-size: 12px;
+}
+.kb-chip-x {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+}
+.kb-chip-x:hover:not(:disabled) {
+  background: var(--bg-active);
+  color: var(--text);
+}
+.kb-chip-x:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.kb-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  justify-self: end;
+}
+.kb-actions .btn.active {
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+.kb-notes {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11.5px;
+}
+.kb-notes span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.kb-import {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border-strong));
+  background: var(--bg);
+  box-shadow: var(--shadow-sm);
+}
+.kb-import-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--accent-text);
+}
+.kb-import-head h4 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text);
+}
+.kb-import-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+}
+.kb-import-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+}
+.kb-import-list li {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 8px;
+}
+.kb-import-from,
+.kb-import-to {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.kb-import-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}

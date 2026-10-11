@@ -10,18 +10,17 @@ import {
   setDetailsOpen,
   setSelection,
   setSort,
-  useApp,
   usePane,
   usePaneId,
   type SortKey,
 } from "../store/app";
+import { registerListKeys, type ListKeys } from "../store/keyboard";
 import { getViewRows, useViewRows, type Row } from "../store/view";
-import { formatBytes, formatExact, formatRelative, formatStorageClass, parentPrefix, displayName } from "../lib/format";
+import { formatBytes, formatExact, formatRelative, formatStorageClass, displayName } from "../lib/format";
 import { FileIcon } from "./FileIcon";
 import { Welcome } from "./Welcome";
 import { pickAndUpload } from "../store/actions";
 import { useClipboard } from "../store/clipboard";
-import { copySelection, requestDelete, requestPaste, requestRename } from "../store/ops";
 import { isDenied, permissionText } from "../store/toasts";
 import { useRowDrag, useRowDragView } from "./RowDrag";
 
@@ -86,11 +85,6 @@ const RowView = memo(function RowView({
     </div>
   );
 });
-
-function isTypingTarget(t: EventTarget | null) {
-  const el = t as HTMLElement | null;
-  return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
-}
 
 export function ObjectTable() {
   // The pane this table belongs to: every action below names it explicitly.
@@ -203,6 +197,9 @@ export function ObjectTable() {
 
   const onContextMenu = (e: ReactMouseEvent) => {
     e.preventDefault();
+    // The menu key and Shift+F10 also fire a contextmenu event (button -1); the key dispatcher
+    // already opened the menu for the focused row (sel.menu), so this one is not a click.
+    if (e.button < 0) return;
     const index = rowIndexFromEvent(e);
     if (index >= 0) {
       const row = rows[index];
@@ -226,107 +223,75 @@ export function ObjectTable() {
     virtualizer.scrollToIndex(next, { align: "auto" });
   };
 
-  const handleKey = (e: KeyboardEvent) => {
-    const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 300) / ROW_H) - 1);
-    switch (e.key) {
-      case "ArrowDown":
-        moveFocus(1, e.shiftKey);
-        break;
-      case "ArrowUp":
-        moveFocus(-1, e.shiftKey);
-        break;
-      case "PageDown":
-        moveFocus(page, e.shiftKey);
-        break;
-      case "PageUp":
-        moveFocus(-page, e.shiftKey);
-        break;
-      case "Home":
-        moveFocus("home", e.shiftKey);
-        break;
-      case "End":
-        moveFocus("end", e.shiftKey);
-        break;
-      case "Enter": {
-        const rows = getViewRows(pane);
-        const { focus, selection } = getPane(pane);
-        const row =
-          rows.find((r) => r.id === focus && selection.has(r.id)) ??
-          (selection.size === 1 ? rows.find((r) => selection.has(r.id)) : undefined);
-        if (row) openRow(row);
-        break;
-      }
-      case "Backspace": {
-        const { bucket, prefix } = getPane(pane);
-        if (bucket && prefix) navigate(bucket, parentPrefix(prefix), pane);
-        break;
-      }
-      case "Escape":
-        select(new Set(), null, null);
-        break;
-      case "Delete":
-        if (e.ctrlKey || e.metaKey || e.altKey || !getPane(pane).selection.size) return;
-        requestDelete();
-        break;
-      case "F2":
-        if (getPane(pane).selection.size !== 1) return;
-        void requestRename();
-        break;
-      case "a":
-      case "A":
-        if (e.ctrlKey || e.metaKey) {
-          const rows = getViewRows(pane);
-          select(new Set(rows.map((r) => r.id)), rows[0]?.id ?? null, getPane(pane).focus);
-          break;
-        }
+  // The keys of this list, run by the key dispatcher (store/keyActions.ts) through the registry.
+  const keysRef = useRef<ListKeys | null>(null);
+  keysRef.current = {
+    move(to, extend) {
+      const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 300) / ROW_H) - 1);
+      const delta = { up: -1, down: 1, pageUp: -page, pageDown: page, first: "home", last: "end" } as const;
+      moveFocus(delta[to], extend);
+    },
+    toggle() {
+      const rows = getViewRows(pane);
+      const { focus } = getPane(pane);
+      const i = focus ? rows.findIndex((r) => r.id === focus) : -1;
+      if (i >= 0) selectIndex(i, "toggle");
+      else if (rows.length) selectIndex(0, "single");
+    },
+    toggleNext() {
+      const rows = getViewRows(pane);
+      if (!rows.length) return;
+      const { focus } = getPane(pane);
+      const i = focus ? rows.findIndex((r) => r.id === focus) : -1;
+      if (i < 0) {
+        selectIndex(0, "toggle");
         return;
-      case "c":
-      case "C":
-      case "x":
-      case "X":
-      case "v":
-      case "V": {
-        if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
-        // Text selected outside the table (e.g. in the details panel): let the browser copy it.
-        const inTable = !!scrollRef.current?.contains(e.target as Node);
-        const text = window.getSelection();
-        if (!inTable && text && !text.isCollapsed && text.toString()) return;
-        const k = e.key.toLowerCase();
-        if (k === "v") requestPaste(pane);
-        else if (!getPane(pane).selection.size) return;
-        else void copySelection(k === "x" ? "cut" : "copy");
-        break;
       }
-      default:
-        return;
-    }
-    e.preventDefault();
+      selectIndex(i, "toggle");
+      const next = Math.min(rows.length - 1, i + 1);
+      const s = getPane(pane);
+      select(s.selection, s.anchor, rows[next].id);
+      virtualizer.scrollToIndex(next, { align: "auto" });
+    },
+    selectAll() {
+      const rows = getViewRows(pane);
+      select(new Set(rows.map((r) => r.id)), rows[0]?.id ?? null, getPane(pane).focus);
+    },
+    clear() {
+      select(new Set(), null, null);
+    },
+    open() {
+      const rows = getViewRows(pane);
+      const { focus, selection } = getPane(pane);
+      const row =
+        rows.find((r) => r.id === focus && selection.has(r.id)) ??
+        (selection.size === 1 ? rows.find((r) => selection.has(r.id)) : undefined);
+      if (row) openRow(row);
+    },
+    menu() {
+      const rows = getViewRows(pane);
+      const { focus, selection } = getPane(pane);
+      const index = focus ? rows.findIndex((r) => r.id === focus) : -1;
+      if (index >= 0 && !selection.has(rows[index].id)) selectIndex(index, "single");
+      const el = index >= 0 ? scrollRef.current?.querySelector<HTMLElement>(`[data-index="${index}"]`) : null;
+      const r = el?.getBoundingClientRect() ?? scrollRef.current?.getBoundingClientRect();
+      if (!r) return;
+      openContextMenu(el ? { x: r.left + 40, y: r.top + Math.min(r.height, ROW_H) } : { x: r.left + 40, y: r.top + 12 });
+    },
   };
-
-  // Global shortcuts (when focus isn't in an input and no modal is open), for the active pane only.
-  const handleKeyRef = useRef(handleKey);
-  handleKeyRef.current = handleKey;
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || isTypingTarget(e.target)) return;
-      const st = useApp.getState();
-      if (st.modal || st.contextMenu || st.activePane !== pane || !getPane(pane).bucket) return;
-      const target = e.target as HTMLElement;
-      const inTable = scrollRef.current?.contains(target);
-      if (!inTable && target !== document.body) {
-        // Let focused buttons/menus handle their own activation keys and arrows.
-        if (target.closest(".context-menu, .popover, .modal")) return;
-        if (target.closest(".sidebar, .transfers")) {
-          // Backspace (up) and paste (e.g. right after picking another bucket) still work here.
-          const paste = (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "v";
-          if (e.key !== "Backspace" && !paste) return;
-        } else if (e.key === "Enter" || e.key === " ") return;
-      }
-      handleKeyRef.current(e);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [pane]);
+  useEffect(
+    () =>
+      registerListKeys(pane, {
+        move: (to, extend) => keysRef.current?.move(to, extend),
+        toggle: () => keysRef.current?.toggle(),
+        toggleNext: () => keysRef.current?.toggleNext(),
+        selectAll: () => keysRef.current?.selectAll(),
+        clear: () => keysRef.current?.clear(),
+        open: () => keysRef.current?.open(),
+        menu: () => keysRef.current?.menu(),
+      }),
+    [pane],
+  );
 
   if (!bucket) return <Welcome />;
 

@@ -162,6 +162,13 @@ export interface Backend {
   /** Choose a program (the file-manager command's Browse…); null when cancelled. */
   pickProgram(): Promise<string | null>;
   onFileDrop(cb: (e: FileDropEvent) => void): Promise<Unlisten>;
+  // Keyboard bindings export / import (v0.7.0)
+  /** Choose where to export (a `.json` file); null when cancelled. */
+  pickExportPath(defaultName: string): Promise<string | null>;
+  /** Choose a `.json` file to import; null when cancelled. */
+  pickImportFile(): Promise<string | null>;
+  writeTextFile(path: string, content: string): Promise<void>;
+  readTextFile(path: string): Promise<string>;
 }
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -319,6 +326,15 @@ const tauriBackend: Backend = {
     });
     return typeof res === "string" ? res : null;
   },
+  async pickExportPath(defaultName) {
+    return (await save({ defaultPath: defaultName, title: "Export keyboard shortcuts", filters: [{ name: "JSON", extensions: ["json"] }] })) ?? null;
+  },
+  async pickImportFile() {
+    const res = await open({ multiple: false, directory: false, title: "Import keyboard shortcuts", filters: [{ name: "JSON", extensions: ["json"] }] });
+    return typeof res === "string" ? res : null;
+  },
+  writeTextFile: (path, content) => invoke<void>("write_text_file", { path, content }),
+  readTextFile: (path) => invoke<string>("read_text_file", { path }),
   onFileDrop: (cb) =>
     getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload;
@@ -505,3 +521,7 @@ export const tryFileManager = (command: string | null, path: string) => call("tr
 /** The file picker for the file-manager command's Browse… button. */
 export const pickProgram = () => call("pickProgram");
 export const onFileDrop = (cb: (e: FileDropEvent) => void) => call("onFileDrop", cb);
+export const pickExportPath = (defaultName: string) => call("pickExportPath", defaultName);
+export const pickImportFile = () => call("pickImportFile");
+export const writeTextFile = (path: string, content: string) => call("writeTextFile", path, content);
+export const readTextFile = (path: string) => call("readTextFile", path);

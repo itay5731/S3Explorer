@@ -497,7 +497,8 @@ async function leaveVanishedFolder(pane: PaneId) {
   }
   const now = getPane(pane);
   if (now.bucket !== bucket || now.prefix !== prefix) return; // the user moved on meanwhile
-  navigate(bucket, at, pane);
+  // Replace the vanished folder in the pane's history: Back must not lead into it again.
+  navigate(bucket, at, pane, { replaceHistory: true });
   toast.info("This folder no longer exists", `${s3Uri(bucket, prefix)} was moved or deleted. Showing ${s3Uri(bucket, at)} instead.`);
 }
 

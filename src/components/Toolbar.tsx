@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -20,14 +20,17 @@ import {
   Archive,
   ArchiveRestore,
   ArrowUp,
+  ArrowLeft,
+  ArrowRight,
   Columns2,
   CopyPlus,
   Folder,
   FolderInput,
 } from "lucide-react";
-import { navigate, readPref, refresh, setDetailsOpen, setFilter, setSplit, useApp, usePane, usePaneId, writePref } from "../store/app";
+import { goHistory, navigate, readPref, refresh, setDetailsOpen, setFilter, setSplit, useApp, usePane, usePaneId, writePref } from "../store/app";
 import { otherPane, usePanes } from "../store/panes";
-import { leaveSearch, rerunSearch, runSearch, setSearchScope, usePaneSearch, useSearch } from "../store/search";
+import { getSearch, leaveSearch, requestResultsFocus, rerunSearch, runSearch, scheduleSearch, searchScheduled, setSearchScope, usePaneSearch, useSearch } from "../store/search";
+import { focusPaneListSoon, useKeyHint, withKey } from "../store/keyboard";
 import { clearClipboard, useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, useArchiveBlocked } from "../store/archive";
@@ -100,10 +103,12 @@ function UploadButton({ disabled }: { disabled: boolean }) {
 const HINT_KEY = "s3x.searchHintDismissed";
 
 /**
- * The toolbar box: typing filters the loaded rows (unchanged), Enter searches the bucket, Ctrl+F
- * focuses it, Esc clears it and leaves the results. The scope control sits beside it.
+ * The toolbar box: typing filters the loaded rows at once and searches the bucket 500 ms after the
+ * last keystroke (Enter searches right away); Esc clears it and leaves the results. The scope
+ * control sits beside it. Mod+F, `/` and typing in the file list focus it (key dispatcher).
  */
 function SearchBox() {
+  const pane = usePaneId();
   const bucket = usePane((s) => s.bucket);
   const prefix = usePane((s) => s.prefix);
   const filter = usePane((s) => s.filter);
@@ -113,21 +118,12 @@ function SearchBox() {
   const [focused, setFocused] = useState(false);
   const [hintDismissed, setHintDismissed] = useState(() => readPref<boolean>(HINT_KEY, false));
   const disabled = !bucket;
+  const searchKey = useKeyHint("nav.focusSearch");
 
-  // Ctrl+F (Cmd+F) focuses the box, unless a dialog is open.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== "f") return;
-      if (useApp.getState().modal) return;
-      e.preventDefault();
-      input.current?.focus();
-      input.current?.select();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  const clear = () => leaveSearch();
+  const clear = () => {
+    leaveSearch(pane);
+    focusPaneListSoon(pane);
+  };
   const dismissHint = () => {
     setHintDismissed(true);
     writePref(HINT_KEY, true);
@@ -141,20 +137,32 @@ function SearchBox() {
         <input
           ref={input}
           value={filter}
-          onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter · press Enter to search"
-          aria-label="Filter loaded items; press Enter to search"
+          onChange={(e) => {
+            setFilter(e.target.value, pane);
+            scheduleSearch(e.target.value, pane);
+          }}
+          placeholder="Filter · searches as you type"
+          aria-label="Filter loaded items; searches the bucket as you type"
+          title={withKey("Search", searchKey)}
           spellCheck={false}
           disabled={disabled}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
           onKeyDown={(e) => {
+            if (e.nativeEvent.isComposing) return;
             if (e.key === "Escape") {
               e.preventDefault();
               clear();
-            } else if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+            } else if (e.key === "Enter") {
+              // Right away (no waiting for the typing to stop), and the results take the keyboard.
               e.preventDefault();
-              runSearch(filter);
+              const s = getSearch(pane);
+              const same = s.open && s.request?.text === filter && !searchScheduled(pane);
+              if (!same) runSearch(filter, pane);
+              if (getSearch(pane).open) requestResultsFocus(pane);
+            } else if (e.key === "ArrowDown" && !e.altKey && !e.ctrlKey && !e.metaKey && (getSearch(pane).open || searchScheduled(pane))) {
+              e.preventDefault();
+              requestResultsFocus(pane);
             }
           }}
         />
@@ -166,7 +174,7 @@ function SearchBox() {
         {focused && !filter && !hintDismissed && (
           <div className="search-hint" role="note" onMouseDown={(e) => e.preventDefault()}>
             <span>
-              Enter searches: <code>word</code> <code>"a phrase"</code> <code>-not</code> <code>tag:key=value</code> <code>folder/part</code>
+              Searches as you type: <code>word</code> <code>"a phrase"</code> <code>-not</code> <code>tag:key=value</code> <code>folder/part</code>
             </span>
             <button className="icon-btn" onClick={dismissHint} aria-label="Dismiss hint" title="Don't show again">
               <X size={11} />
@@ -211,15 +219,17 @@ export function useOtherPaneDest(): { bucket: string; prefix: string } | null {
   return shown && bucket ? { bucket, prefix } : null;
 }
 
-/** Split / Single: one toggle, pressed while two panes are open (Ctrl+2 / Ctrl+1). */
+/** Split / Single: one toggle, pressed while two panes are open (Mod+2 / Mod+1 by default). */
 function SplitButton() {
   const split = useApp((s) => s.split);
   const narrow = useApp((s) => s.narrow);
+  const single = useKeyHint("view.single");
+  const two = useKeyHint("view.split");
   const title = split
     ? narrow
-      ? "Single view (Ctrl+1). The second pane is hidden: the window is too narrow for two panes."
-      : "Single view (Ctrl+1): keep only the active pane"
-    : "Split view (Ctrl+2): two panes side by side";
+      ? `${withKey("Single view", single)}. The second pane is hidden: the window is too narrow for two panes.`
+      : `${withKey("Single view", single)}: keep only the active pane`
+    : `${withKey("Split view", two)}: two panes side by side`;
   return (
     <button
       className={`icon-btn lg split-toggle ${split ? "active" : ""} ${split && narrow ? "hidden-pane" : ""}`}
@@ -255,13 +265,33 @@ export function Toolbar() {
     () => (sel.objects ? getSelected().objects.filter((o) => isArchiveClass(o.storageClass)).length : 0),
     [sel],
   );
+  const k = {
+    copy: useKeyHint("act.copy"),
+    cut: useKeyHint("act.cut"),
+    paste: useKeyHint("act.paste"),
+    rename: useKeyHint("act.rename"),
+    toOther: useKeyHint("act.copyToOther"),
+    moveOther: useKeyHint("act.moveToOther"),
+    del: useKeyHint("act.delete"),
+    up: useKeyHint("nav.up"),
+    back: useKeyHint("nav.back"),
+    forward: useKeyHint("nav.forward"),
+    refresh: useKeyHint("nav.refresh"),
+    newFolder: useKeyHint("act.newFolder"),
+    download: useKeyHint("act.download"),
+    details: useKeyHint("view.details"),
+  };
+  // Back / Forward follow the active pane's history.
+  const paneId = usePaneId();
+  const backOk = usePanes((s) => s[paneId].history.index > 0);
+  const forwardOk = usePanes((s) => s[paneId].history.index < s[paneId].history.entries.length - 1);
 
   return (
     <div className={`toolbar ${dest || splitShown ? "split" : ""}`}>
       <div className="tool-group">
         {/* No folder is in view while search results are open: nothing to upload or create into. */}
         <UploadButton disabled={disabled || searchOpen} />
-        <button className="btn" disabled={disabled || searchOpen} onClick={() => openNewFolder()} title={searchOpen ? "Go back to a folder to create one" : "New folder"}>
+        <button className="btn" disabled={disabled || searchOpen} onClick={() => openNewFolder()} title={searchOpen ? "Go back to a folder to create one" : withKey("New folder", k.newFolder)}>
           <FolderPlus size={14} />
           <span className="btn-label secondary">New folder</span>
         </button>
@@ -282,8 +312,8 @@ export function Toolbar() {
               : sel.objects === 0 && sel.folders > 1
                 ? `Download ${sel.folders} folders`
                 : sel.objects === 0 && sel.folders === 1
-                  ? "Download folder"
-                  : "Download"
+                  ? withKey("Download folder", k.download)
+                  : withKey("Download", k.download)
           }
         >
           <Download size={14} />
@@ -294,7 +324,7 @@ export function Toolbar() {
           className="icon-btn lg"
           disabled={disabled || selCount === 0 || blocked}
           onClick={() => void copySelection("copy")}
-          title={why("Copy (Ctrl+C)")}
+          title={why(withKey("Copy", k.copy))}
           aria-label="Copy"
         >
           <Copy size={15} />
@@ -303,7 +333,7 @@ export function Toolbar() {
           className="icon-btn lg"
           disabled={disabled || selCount === 0 || blocked}
           onClick={() => void copySelection("cut")}
-          title={why("Cut (Ctrl+X)")}
+          title={why(withKey("Cut", k.cut))}
           aria-label="Cut"
         >
           <Scissors size={15} />
@@ -312,7 +342,7 @@ export function Toolbar() {
           className="icon-btn lg"
           disabled={disabled || !clip || searchOpen}
           onClick={() => requestPaste()}
-          title={searchOpen ? "Go back to a folder to paste into it" : clip ? `Paste into this folder (Ctrl+V)` : "Paste (clipboard is empty)"}
+          title={searchOpen ? "Go back to a folder to paste into it" : clip ? withKey("Paste into this folder", k.paste) : "Paste (clipboard is empty)"}
           aria-label="Paste"
         >
           <ClipboardPaste size={15} />
@@ -321,7 +351,7 @@ export function Toolbar() {
           className="icon-btn lg"
           disabled={disabled || selCount !== 1 || blocked}
           onClick={() => void requestRename()}
-          title={why("Rename (F2)")}
+          title={why(withKey("Rename", k.rename))}
           aria-label="Rename"
         >
           <PencilLine size={15} />
@@ -332,7 +362,7 @@ export function Toolbar() {
               className="icon-btn lg"
               disabled={disabled || selCount === 0 || blocked}
               onClick={() => void requestTransferToOther("copy")}
-              title={blocked ? ARCHIVED_REASON : `Copy to other pane (F5): ${destUri}`}
+              title={blocked ? ARCHIVED_REASON : `${withKey("Copy to other pane", k.toOther)}: ${destUri}`}
               aria-label="Copy to other pane"
             >
               <CopyPlus size={15} />
@@ -341,7 +371,7 @@ export function Toolbar() {
               className="icon-btn lg"
               disabled={disabled || selCount === 0 || blocked}
               onClick={() => void requestTransferToOther("cut")}
-              title={blocked ? ARCHIVED_REASON : `Move to other pane (F6): ${destUri}`}
+              title={blocked ? ARCHIVED_REASON : `${withKey("Move to other pane", k.moveOther)}: ${destUri}`}
               aria-label="Move to other pane"
             >
               <FolderInput size={15} />
@@ -363,20 +393,32 @@ export function Toolbar() {
           className="btn btn-danger-ghost"
           disabled={disabled || selCount === 0}
           onClick={() => requestDelete()}
-          title={selCount > 1 ? `Delete ${selCount} items (Delete)` : "Delete (Delete)"}
+          title={withKey(selCount > 1 ? `Delete ${selCount} items` : "Delete", k.del)}
         >
           <Trash2 size={14} />
           <span className="btn-label secondary">Delete</span>
         </button>
         <span className="tool-sep" />
-        <button className="icon-btn lg" disabled={disabled || !prefix} onClick={() => bucket && navigate(bucket, parentPrefix(prefix))} title="Up one level (Backspace)">
+        <button className="icon-btn lg tb-history" disabled={!backOk} onClick={() => goHistory(-1)} title={withKey("Back", k.back)} aria-label="Back">
+          <ArrowLeft size={15} />
+        </button>
+        <button className="icon-btn lg tb-history" disabled={!forwardOk} onClick={() => goHistory(1)} title={withKey("Forward", k.forward)} aria-label="Forward">
+          <ArrowRight size={15} />
+        </button>
+        <button
+          className="icon-btn lg"
+          disabled={disabled || !prefix}
+          onClick={() => bucket && navigate(bucket, parentPrefix(prefix))}
+          title={withKey("Up one level", k.up)}
+          aria-label="Up one level"
+        >
           <ArrowUp size={15} />
         </button>
         <button
           className="icon-btn lg"
           disabled={disabled}
           onClick={() => (searchOpen ? rerunSearch() : refresh())}
-          title={searchOpen ? "Search again" : "Refresh"}
+          title={withKey(searchOpen ? "Search again" : "Refresh", k.refresh)}
         >
           <RefreshCw size={15} className={(searchOpen ? searching : loading) ? "spin" : ""} />
         </button>
@@ -401,7 +443,7 @@ export function Toolbar() {
         <button
           className={`icon-btn lg ${detailsOpen ? "active" : ""}`}
           onClick={() => setDetailsOpen(!detailsOpen)}
-          title={detailsOpen ? "Hide details" : "Show details"}
+          title={withKey(detailsOpen ? "Hide details" : "Show details", k.details)}
         >
           {detailsOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
         </button>

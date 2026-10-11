@@ -9,7 +9,7 @@ import { openModal, setTransfersOpen } from "../store/app";
 import { copyText } from "../store/actions";
 import { scheduleTransferResync } from "../store/transfers";
 import { isDenied, permissionText, toastFailure } from "../store/toasts";
-import { ensureVersioning, hasVersions, rememberVersionDownload, shortVersionId, useObjectRev, useVersioning } from "../store/versions";
+import { ensureVersioning, hasVersions, rememberVersionDownload, shortVersionId, takeVersionsOpenRequest, useObjectRev, useVersioning, useVersionsOpen } from "../store/versions";
 import { formatBytes, formatDateTime, formatExact, formatRelative, formatStorageClass, sanitizeFileName } from "../lib/format";
 import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
 
@@ -30,6 +30,18 @@ type LoadState = { status: "loading" } | { status: "ok"; listing: VersionListing
 
 function VersionsList({ bucket, objKey, name }: { bucket: string; objKey: string; name: string }) {
   const [open, setOpen] = useState(keepOpen);
+  const disclosure = useRef<HTMLButtonElement>(null);
+  // "Show versions" from the keyboard: open the section, bring it into view and give it the focus.
+  const openSeq = useVersionsOpen((s) => s.seq);
+  useEffect(() => {
+    if (!takeVersionsOpenRequest(bucket, objKey)) return;
+    keepOpen = true;
+    setOpen(true);
+    requestAnimationFrame(() => {
+      disclosure.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+      disclosure.current?.focus({ preventScroll: true });
+    });
+  }, [openSeq]);
   const [state, setState] = useState<LoadState | null>(null);
   const [shown, setShown] = useState(PAGE);
   const [attempt, setAttempt] = useState(0);
@@ -62,7 +74,7 @@ function VersionsList({ bucket, objKey, name }: { bucket: string; objKey: string
 
   return (
     <div className="dsection">
-      <button type="button" className="disclosure" onClick={toggle} aria-expanded={open}>
+      <button ref={disclosure} type="button" className="disclosure versions-disclosure" onClick={toggle} aria-expanded={open}>
         <ChevronRight size={14} className={open ? "rot90" : ""} /> Versions
         {count && <span className="count-pill">{count}</span>}
         {open && state?.status === "loading" && <Loader2 size={12} className="spin" />}

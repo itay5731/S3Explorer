@@ -11,6 +11,7 @@ import {
   type AppSettings,
   type TransferKind,
   type TransferSettings, DOWNLOAD_BUFFER_CAP_MIB } from "./types";
+import { sameOverrides, validateKeybindings } from "./keys";
 
 export const MIB = 1024 * 1024;
 export const GIB = 1024 * MIB;
@@ -89,7 +90,8 @@ export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
   a.textWeight === b.textWeight &&
   a.accent === b.accent &&
   a.confirmCopyMove === b.confirmCopyMove &&
-  (a.fileManagerCommand ?? null) === (b.fileManagerCommand ?? null);
+  (a.fileManagerCommand ?? null) === (b.fileManagerCommand ?? null) &&
+  sameOverrides(a.keybindings, b.keybindings);
 
 /** The file-manager command as the backend stores it: trimmed, empty becomes null. */
 export function normalizeFileManagerCommand(v: string | null | undefined): string | null {
@@ -127,5 +129,7 @@ export function validateAppSettings(s: AppSettings): { field: keyof AppSettings;
   if (typeof s.confirmCopyMove !== "boolean") return { field: "confirmCopyMove", message: "Must be true or false." };
   const fm = validateFileManagerCommand(s.fileManagerCommand ?? null);
   if (fm) return { field: "fileManagerCommand", message: fm };
+  const kb = validateKeybindings(s.keybindings);
+  if (kb) return { field: "keybindings", message: kb };
   return null;
 }

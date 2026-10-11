@@ -13,7 +13,7 @@ import { clearRecent } from "./recent";
 import { clearArchive } from "./archive";
 import { clearVersioning } from "./versions";
 import { selectActiveCount, useTransfers } from "./transfers";
-import { emptyListing, emptySearch, freshPane, otherPane, PANE_IDS, PaneContext, SORT_KEY, usePanes, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
+import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, usePanes, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
 import { readPref, writePref } from "./prefs";
 
 export type { Listing, PaneId, PaneState, SortKey, SortState } from "./panes";
@@ -357,12 +357,55 @@ export function onNavigate(cb: (pane: PaneId) => void): () => void {
   return () => navigateListeners.delete(cb);
 }
 
-/** Open `bucket`/`prefix` in a pane (default: the active pane). */
-export function navigate(bucket: string, prefix: string, pane: PaneId = activePane()) {
+/** Record a navigation in a pane's history: drops the forward entries, caps the length. */
+function pushHistory(pane: PaneId, bucket: string, prefix: string, replace = false) {
+  setPane(pane, (s) => {
+    const { entries, index } = s.history;
+    const cur = entries[index];
+    if (cur && cur.bucket === bucket && cur.prefix === prefix) return {};
+    if (replace && cur) {
+      const next = entries.slice(0, index + 1);
+      next[index] = { bucket, prefix };
+      return { history: { entries: next, index } };
+    }
+    const next = entries.slice(0, index + 1);
+    next.push({ bucket, prefix });
+    const drop = Math.max(0, next.length - HISTORY_CAP);
+    const kept = drop ? next.slice(drop) : next;
+    return { history: { entries: kept, index: kept.length - 1 } };
+  });
+}
+
+/** Can a pane go back / forward in its history? */
+export function canGoBack(pane: PaneId = activePane()): boolean {
+  return getPane(pane).history.index > 0;
+}
+export function canGoForward(pane: PaneId = activePane()): boolean {
+  const h = getPane(pane).history;
+  return h.index >= 0 && h.index < h.entries.length - 1;
+}
+
+/** Back (-1) or Forward (+1) in a pane's history; false when there is nowhere to go. */
+export function goHistory(delta: -1 | 1, pane: PaneId = activePane()): boolean {
+  const h = getPane(pane).history;
+  const to = h.index + delta;
+  const entry = h.entries[to];
+  if (to < 0 || !entry) return false;
+  setPane(pane, { history: { entries: h.entries, index: to } });
+  navigate(entry.bucket, entry.prefix, pane, { fromHistory: true });
+  return true;
+}
+
+/**
+ * Open `bucket`/`prefix` in a pane (default: the active pane). Every navigation is recorded in the
+ * pane's history except Back / Forward themselves (`fromHistory`).
+ */
+export function navigate(bucket: string, prefix: string, pane: PaneId = activePane(), opts: { fromHistory?: boolean; replaceHistory?: boolean } = {}) {
   navigateListeners.forEach((cb) => cb(pane));
   freshPanes.delete(pane);
   // Server-provided prefixes are used verbatim (see asFolderPrefix / normalizePrefix).
   const p = asFolderPrefix(prefix);
+  if (!opts.fromHistory) pushHistory(pane, bucket, p, opts.replaceHistory);
   setPane(pane, {
     bucket,
     prefix: p,

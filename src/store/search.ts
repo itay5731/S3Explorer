@@ -59,6 +59,83 @@ const runningId: Record<PaneId, string | null> = { a: null, b: null };
 
 const CANCELLED: AppError = { code: "Cancelled", message: "Search cancelled." };
 
+// ---- search as you type (v0.7.0) -------------------------------------------------------------
+
+/** The toolbar box searches this long after the last keystroke. */
+export const SEARCH_DEBOUNCE_MS = 500;
+const timers: Record<PaneId, ReturnType<typeof setTimeout> | null> = { a: null, b: null };
+
+/** Drop a pane's search that is waiting for the typing to stop. */
+export function cancelScheduledSearch(pane: PaneId = activePane()) {
+  const t = timers[pane];
+  if (t) clearTimeout(t);
+  timers[pane] = null;
+}
+
+/** Is a search waiting for the typing to stop in this pane? */
+export const searchScheduled = (pane: PaneId = activePane()) => timers[pane] !== null;
+
+/**
+ * The box's text changed: search 500 ms after the last keystroke (non-empty text). Typing more
+ * stops the search that is running and schedules a new one; clearing the box closes the results.
+ * A pasted `s3://bucket/path` (which can open another bucket) waits for Enter.
+ */
+export function scheduleSearch(text: string, pane: PaneId = activePane()) {
+  cancelScheduledSearch(pane);
+  if (!text.trim()) {
+    closeSearch(pane);
+    return;
+  }
+  const s = getSearch(pane);
+  if (parseS3Path(text)) {
+    // Waits for Enter: stop the search for the earlier text and leave no spinner behind.
+    if (s.loading) {
+      cancelRunning(pane);
+      mine[pane] = 0;
+      setSearch(pane, { loading: false, error: s.open ? CANCELLED : null });
+    }
+    return;
+  }
+  if (s.loading || s.open) {
+    // The scan for the old text stops now; the results stay until the new ones replace them.
+    cancelRunning(pane);
+    mine[pane] = 0;
+    if (s.open && s.request) setSearch(pane, { loading: true, error: null, request: { ...s.request, text } });
+  }
+  timers[pane] = setTimeout(() => {
+    timers[pane] = null;
+    typedNext[pane] = true;
+    runSearch(text, pane);
+    typedNext[pane] = false;
+  }, SEARCH_DEBOUNCE_MS);
+}
+
+/** Panes whose results list should take the keyboard once results arrive (Enter / ArrowDown in the box). */
+const focusWanted: Record<PaneId, boolean> = { a: false, b: false };
+
+/** Ask for the results list to take the focus when its results are shown (now, if they already are). */
+export function requestResultsFocus(pane: PaneId = activePane()) {
+  focusWanted[pane] = true;
+  const s = getSearch(pane);
+  if (s.result && !s.loading) focusResultsNow(pane);
+}
+
+/** Consume a pending focus request (the results list calls this when results arrive). */
+export function takeResultsFocus(pane: PaneId): boolean {
+  const want = focusWanted[pane];
+  focusWanted[pane] = false;
+  return want;
+}
+
+function focusResultsNow(pane: PaneId) {
+  focusWanted[pane] = false;
+  const s = getSearch(pane);
+  const first = s.result?.hits[0];
+  if (first && !s.focus) setSearch(pane, { focus: hitId(first) });
+  else if (first && s.focus && !s.selection.size) setSearch(pane, { focus: hitId(first) });
+  document.querySelector<HTMLElement>(`[data-pane="${pane}"] .search-results .tbody`)?.focus();
+}
+
 /** Stop the backend scan of a pane's run in flight, if any. */
 function cancelRunning(pane: PaneId) {
   const id = runningId[pane];
@@ -72,7 +149,16 @@ export function setSearchScope(scope: SearchScope) {
   useSearch.setState({ scope });
 }
 
+/** The next run of a pane comes from typing (the debounce), and whether each pane's current run did. */
+const typedNext: Record<PaneId, boolean> = { a: false, b: false };
+const typedRun: Record<PaneId, boolean> = { a: false, b: false };
+
+/** Was the pane's current run started by typing (search as you type) rather than Enter, Refresh or a button? */
+export const runWasTyped = (pane: PaneId): boolean => typedRun[pane];
+
 async function start(request: SearchRequest, pane: PaneId) {
+  typedRun[pane] = typedNext[pane];
+  cancelScheduledSearch(pane);
   cancelRunning(pane);
   const run = ++seq;
   mine[pane] = run;
@@ -135,6 +221,7 @@ export function rerunSearch(pane: PaneId = activePane()) {
 
 /** Stop the running search (the backend scan stops too). The view keeps its header and says it was cancelled. */
 export function cancelSearch(pane: PaneId = activePane()) {
+  cancelScheduledSearch(pane);
   if (!getSearch(pane).loading) return;
   mine[pane] = 0;
   setSearch(pane, { loading: false, error: CANCELLED });
@@ -143,6 +230,8 @@ export function cancelSearch(pane: PaneId = activePane()) {
 
 /** Leave the results view (Back to folder, Esc, a different bucket, disconnect). */
 export function closeSearch(pane: PaneId = activePane()) {
+  cancelScheduledSearch(pane);
+  focusWanted[pane] = false;
   const s = getSearch(pane);
   if (!s.open && !s.loading) return;
   cancelRunning(pane);

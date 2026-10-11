@@ -69,3 +69,24 @@ export function bumpObject(bucket: string, key: string) {
 }
 
 export const useObjectRev = (bucket: string, key: string) => useObjectRevs((s) => s.revs[objectRevId(bucket, key)] ?? 0);
+
+// ---- "Show versions" (v0.7.0 keyboard action) --------------------------------------------------
+
+/** The pending request to open the details panel's Versions section, for one object. */
+export const useVersionsOpen = create<{ seq: number; bucket: string; key: string; at: number }>(() => ({ seq: 0, bucket: "", key: "", at: 0 }));
+let handledSeq = 0;
+/** A request older than this is dropped (the section may never mount, e.g. versioning is off). */
+const REQUEST_TTL_MS = 5000;
+
+/** Open the Versions section of the details panel for this object (and keep it open, like a click). */
+export function requestVersionsOpen(bucket: string, key: string) {
+  useVersionsOpen.setState((s) => ({ seq: s.seq + 1, bucket, key, at: Date.now() }));
+}
+
+/** For the Versions section of `bucket`/`key`: a fresh request for it not acted on yet (consumed). */
+export function takeVersionsOpenRequest(bucket: string, key: string): boolean {
+  const r = useVersionsOpen.getState();
+  if (r.seq === handledSeq || r.bucket !== bucket || r.key !== key) return false;
+  handledSeq = r.seq;
+  return Date.now() - r.at <= REQUEST_TTL_MS;
+}
