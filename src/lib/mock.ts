@@ -1477,6 +1477,8 @@ let jobSeq = 0;
 const previewDelay: { next: number | null } = { next: null };
 /** Every preview/start request the mock received, verbatim (deep-cloned), for test inspection. */
 const jobCallLog: { cmd: "preview_job" | "start_job"; request: unknown; at: string }[] = [];
+/** Buckets scanned by list_recent, in order (test hook). */
+const recentCallLog: string[] = [];
 function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
   jobCallLog.push({ cmd, request: JSON.parse(JSON.stringify(request)), at: new Date().toISOString() });
 }
@@ -1484,6 +1486,7 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
 (globalThis as Record<string, unknown>).__s3xMock = {
   jobCalls: jobCallLog,
   batchCalls: batchCallLog,
+  recentCalls: recentCallLog,
   /** What the next upload-folder picker returns (a path, or null for "cancelled"). */
   setNextFolder: (path: string | null) => {
     folderPick.next = path;
@@ -2522,6 +2525,7 @@ export const mockBackend: Backend = {
   },
 
   async listRecent(bucket, prefix): Promise<RecentListing> {
+    recentCallLog.push(bucket);
     await latency();
     const b = requireBucket(bucket);
     const files = sortedKeys(b).filter((key) => key.startsWith(prefix) && !key.endsWith("/"));
@@ -3082,12 +3086,12 @@ export const mockBackend: Backend = {
     const enter = (e: DragEvent) => {
       if (!hasFiles(e)) return;
       e.preventDefault();
-      if (depth++ === 0) cb({ type: "enter", paths: [] });
+      if (depth++ === 0) cb({ type: "enter", paths: [], position: { x: e.clientX, y: e.clientY } });
     };
     const over = (e: DragEvent) => {
       if (!hasFiles(e)) return;
       e.preventDefault();
-      cb({ type: "over" });
+      cb({ type: "over", position: { x: e.clientX, y: e.clientY } });
     };
     const leave = (e: DragEvent) => {
       if (!hasFiles(e)) return;
@@ -3101,7 +3105,7 @@ export const mockBackend: Backend = {
       e.preventDefault();
       depth = 0;
       const paths = [...(e.dataTransfer?.files ?? [])].map((f) => `C:\\Users\\demo\\Dropped\\${f.name}`);
-      cb({ type: "drop", paths });
+      cb({ type: "drop", paths, position: { x: e.clientX, y: e.clientY } });
     };
     window.addEventListener("dragenter", enter);
     window.addEventListener("dragover", over);

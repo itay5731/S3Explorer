@@ -3,14 +3,16 @@
 import * as api from "../lib/api";
 import type { AppError, ObjectEntry, Transfer } from "../lib/types";
 import { basename, joinKey, sanitizeFileName, uniqueFileName } from "../lib/format";
-import { refresh, setTransfersOpen, useApp, upsertListedFolder, upsertListedObject } from "./app";
+import { activePane, getPane, openModal, refresh, setTransfersOpen, upsertListedFolder, upsertListedObject } from "./app";
+import { PANE_IDS, type PaneId } from "./panes";
 import { isDenied, toast, toastDenied, toastFailure } from "./toasts";
 import { notifyInBackground } from "./notify";
 import { ARCHIVED_MESSAGE, splitReadable, toastArchivedSkipped } from "./archive";
 import { scheduleTransferResync, onTransferFinished, selectActiveCount, useTransfers } from "./transfers";
 
-export async function uploadPaths(paths: string[]) {
-  const { bucket, prefix } = useApp.getState();
+/** Upload files into a pane's folder (default: the active pane). */
+export async function uploadPaths(paths: string[], pane: PaneId = activePane()) {
+  const { bucket, prefix } = getPane(pane);
   if (!bucket) {
     toast.info("Select a bucket first", "Uploads go into the folder you are viewing.");
     return;
@@ -34,16 +36,18 @@ export async function uploadPaths(paths: string[]) {
 }
 
 export async function pickAndUpload() {
+  // The pane the upload was asked from, even if another one becomes active while the picker is open.
+  const pane = activePane();
   try {
     const paths = await api.pickFiles();
-    await uploadPaths(paths);
+    await uploadPaths(paths, pane);
   } catch (e) {
     toast.error("Could not open file picker", e as AppError);
   }
 }
 
 export async function downloadObjects(selected: ObjectEntry[]) {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   if (!bucket || !selected.length) return;
   // Archived objects that aren't restored can't be read: left out, with the reason.
   const { readable: objects, blocked } = await splitReadable(bucket, selected);
@@ -83,14 +87,14 @@ export async function downloadObjects(selected: ObjectEntry[]) {
   }
 }
 
-export async function createFolder(name: string): Promise<boolean> {
-  const { bucket, prefix } = useApp.getState();
-  if (!bucket) return false;
+/** Create `name` in `bucket`/`prefix` (captured when the dialog opened). */
+export async function createFolder(name: string, bucket: string, prefix: string): Promise<boolean> {
   const full = joinKey(prefix, name.trim() + "/");
   try {
     await api.createFolder(bucket, full);
     toast.success("Folder created", full);
-    refresh();
+    // Every pane that shows the folder.
+    for (const id of PANE_IDS) if (getPane(id).bucket === bucket && getPane(id).prefix === prefix) refresh(id);
     return true;
   } catch (e) {
     toastFailure("Could not create folder", e as AppError, "create folders");
@@ -149,21 +153,34 @@ export function installTransferEffects(): () => void {
       return;
     }
     if (t.status !== "completed" || t.kind !== "upload") return;
-    const { bucket, prefix } = useApp.getState();
-    if (t.bucket !== bucket || !t.key.startsWith(prefix)) return;
-    const rest = t.key.slice(prefix.length);
-    const slash = rest.indexOf("/");
-    if (slash >= 0) {
-      upsertListedFolder(t.bucket, { prefix: prefix + rest.slice(0, slash + 1), name: rest.slice(0, slash) });
-    } else {
-      upsertListedObject(t.bucket, {
-        key: t.key,
-        name: rest,
-        size: t.totalBytes,
-        lastModified: t.finishedAt ?? new Date().toISOString(),
-        etag: null,
-        storageClass: "STANDARD",
-      });
+    // Every pane showing the folder the file went into (or a parent of it) gets the new row.
+    for (const pane of PANE_IDS) {
+      const { bucket, prefix } = getPane(pane);
+      if (t.bucket !== bucket || !t.key.startsWith(prefix)) continue;
+      const rest = t.key.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      if (slash >= 0) {
+        upsertListedFolder(t.bucket, { prefix: prefix + rest.slice(0, slash + 1), name: rest.slice(0, slash) }, pane);
+      } else {
+        upsertListedObject(
+          t.bucket,
+          {
+            key: t.key,
+            name: rest,
+            size: t.totalBytes,
+            lastModified: t.finishedAt ?? new Date().toISOString(),
+            etag: null,
+            storageClass: "STANDARD",
+          },
+          pane,
+        );
+      }
     }
   });
+}
+
+/** Open the New folder dialog for a pane's folder (default: the active pane), captured now. */
+export function openNewFolder(pane: PaneId = activePane()) {
+  const { bucket, prefix } = getPane(pane);
+  if (bucket) openModal({ kind: "newFolder", bucket, prefix });
 }

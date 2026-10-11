@@ -9,7 +9,7 @@ import type { ParsedSearch, SearchHit } from "../lib/types";
 import { highlightRanges, highlightTerms } from "../lib/search";
 import { formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
-import { navigate, openContextMenu, revealObject } from "../store/app";
+import { navigate, openContextMenu, revealObject, usePaneId, type PaneId } from "../store/app";
 import {
   cancelSearch,
   getHits,
@@ -18,8 +18,9 @@ import {
   rerunSearch,
   runSearch,
   setSearchScope,
+  getSearch,
   setSearchSelection,
-  useSearch,
+  usePaneSearch,
 } from "../store/search";
 import { copySelection, requestDelete, requestRename } from "../store/ops";
 import { FileIcon } from "./FileIcon";
@@ -115,10 +116,11 @@ const HitRow = memo(function HitRow({
 });
 
 function Header() {
-  const request = useSearch((s) => s.request);
-  const result = useSearch((s) => s.result);
-  const error = useSearch((s) => s.error);
-  const loading = useSearch((s) => s.loading);
+  const pane = usePaneId();
+  const request = usePaneSearch((s) => s.request);
+  const result = usePaneSearch((s) => s.result);
+  const error = usePaneSearch((s) => s.error);
+  const loading = usePaneSearch((s) => s.loading);
   if (!request) return null;
   const where = request.scope ? (
     <span className="mono" title={s3Uri(request.bucket, request.scope)}>
@@ -130,7 +132,7 @@ function Header() {
   const listed = result && result.parsed.listPrefix !== request.scope ? result.parsed.listPrefix : null;
   return (
     <div className="search-head">
-      <button className="btn btn-ghost search-back" style={{ flex: "none" }} onClick={leaveSearch} title="Back to the folder (Esc)">
+      <button className="btn btn-ghost search-back" style={{ flex: "none" }} onClick={() => leaveSearch(pane)} title="Back to the folder (Esc)">
         <ArrowLeft size={14} /> Back to folder
       </button>
       <div className="search-summary" role="status" aria-live="polite">
@@ -179,11 +181,11 @@ function Header() {
         ) : null}
       </div>
       {loading ? (
-        <button className="btn" onClick={cancelSearch}>
+        <button className="btn" onClick={() => cancelSearch(pane)}>
           <X size={14} /> Cancel
         </button>
       ) : (
-        <button className="icon-btn lg" onClick={rerunSearch} title="Search again" aria-label="Search again">
+        <button className="icon-btn lg" onClick={() => rerunSearch(pane)} title="Search again" aria-label="Search again">
           <RefreshCw size={15} />
         </button>
       )}
@@ -192,47 +194,48 @@ function Header() {
 }
 
 /** Open a hit: an object is shown in its folder (selected), a folder is opened. */
-function openHit(hit: SearchHit) {
-  const bucket = useSearch.getState().request?.bucket;
+function openHit(hit: SearchHit, pane: PaneId) {
+  const bucket = getSearch(pane).request?.bucket;
   if (!bucket) return;
   // Navigating closes the results (see store/search.ts).
-  if (hit.kind === "folder" && hit.folder) navigate(bucket, hit.folder.prefix);
-  else if (hit.entry) revealObject(bucket, hit.entry.key, hit.entry.name);
+  if (hit.kind === "folder" && hit.folder) navigate(bucket, hit.folder.prefix, pane);
+  else if (hit.entry) revealObject(bucket, hit.entry.key, hit.entry.name, pane);
 }
 
 type SelectMode = "single" | "toggle" | "range" | "range-add";
 
 /** The table's selection rules, over the hits. */
-function selectIndex(index: number, mode: SelectMode) {
-  const hits = getHits();
+function selectIndex(index: number, mode: SelectMode, pane: PaneId) {
+  const hits = getHits(pane);
   const hit = hits[index];
   if (!hit) return;
   const id = hitId(hit);
-  const { selection, anchor } = useSearch.getState();
+  const { selection, anchor } = getSearch(pane);
   if (mode === "toggle") {
     const next = new Set(selection);
     if (next.has(id)) next.delete(id);
     else next.add(id);
-    setSearchSelection(next, id, id);
+    setSearchSelection(next, id, id, pane);
   } else if (mode === "range" || mode === "range-add") {
     const a = anchor ? hits.findIndex((h) => hitId(h) === anchor) : -1;
     const from = a < 0 ? index : Math.min(a, index);
     const to = a < 0 ? index : Math.max(a, index);
     const next = mode === "range-add" ? new Set(selection) : new Set<string>();
     for (let i = from; i <= to; i++) next.add(hitId(hits[i]));
-    setSearchSelection(next, a < 0 ? id : anchor, id);
+    setSearchSelection(next, a < 0 ? id : anchor, id, pane);
   } else {
-    setSearchSelection(new Set([id]), id, id);
+    setSearchSelection(new Set([id]), id, id, pane);
   }
 }
 
 export function SearchResults() {
-  const result = useSearch((s) => s.result);
-  const request = useSearch((s) => s.request);
-  const loading = useSearch((s) => s.loading);
-  const runSeq = useSearch((s) => s.runSeq);
-  const selection = useSearch((s) => s.selection);
-  const focusId = useSearch((s) => s.focus);
+  const pane = usePaneId();
+  const result = usePaneSearch((s) => s.result);
+  const request = usePaneSearch((s) => s.request);
+  const loading = usePaneSearch((s) => s.loading);
+  const runSeq = usePaneSearch((s) => s.runSeq);
+  const selection = usePaneSearch((s) => s.selection);
+  const focusId = usePaneSearch((s) => s.focus);
   const hits = result?.hits ?? [];
   const parsed: ParsedSearch | null = result?.parsed ?? null;
   const terms = useMemo(() => (parsed ? highlightTerms(parsed) : []), [parsed]);
@@ -265,34 +268,34 @@ export function SearchResults() {
   const onClick = (e: ReactMouseEvent) => {
     const index = indexFromEvent(e);
     if (index < 0) {
-      if (!e.ctrlKey && !e.metaKey && !e.shiftKey) setSearchSelection(new Set(), null, null);
+      if (!e.ctrlKey && !e.metaKey && !e.shiftKey) setSearchSelection(new Set(), null, null, pane);
       return;
     }
     const multi = e.ctrlKey || e.metaKey;
-    selectIndex(index, e.shiftKey ? (multi ? "range-add" : "range") : multi ? "toggle" : "single");
+    selectIndex(index, e.shiftKey ? (multi ? "range-add" : "range") : multi ? "toggle" : "single", pane);
   };
 
   const onContextMenu = (e: ReactMouseEvent) => {
     e.preventDefault();
     const index = indexFromEvent(e);
     if (index < 0) return; // no folder in view: nothing to offer for empty space
-    if (!useSearch.getState().selection.has(hitId(hits[index]))) selectIndex(index, "single");
+    if (!getSearch(pane).selection.has(hitId(hits[index]))) selectIndex(index, "single", pane);
     openContextMenu({ x: e.clientX, y: e.clientY });
   };
 
   const onKeyDown = (e: ReactKeyboardEvent) => {
     if (!hits.length) {
-      if (e.key === "Escape") leaveSearch();
+      if (e.key === "Escape") leaveSearch(pane);
       return;
     }
     const page = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? 300) / ROW_H) - 1);
     const move = (to: number) => {
       const next = Math.max(0, Math.min(hits.length - 1, to));
-      selectIndex(next, e.shiftKey ? "range" : "single");
+      selectIndex(next, e.shiftKey ? "range" : "single", pane);
       virtualizer.scrollToIndex(next, { align: "auto" });
     };
     const ctrl = e.ctrlKey || e.metaKey;
-    const { selection } = useSearch.getState();
+    const { selection } = getSearch(pane);
     switch (e.key) {
       case "ArrowDown":
         move(focusIndex < 0 ? 0 : focusIndex + 1);
@@ -313,15 +316,15 @@ export function SearchResults() {
         move(hits.length - 1);
         break;
       case " ":
-        if (focusIndex >= 0) selectIndex(focusIndex, "toggle");
+        if (focusIndex >= 0) selectIndex(focusIndex, "toggle", pane);
         break;
       case "Enter":
-        if (focusIndex >= 0) openHit(hits[focusIndex]);
+        if (focusIndex >= 0) openHit(hits[focusIndex], pane);
         break;
       case "Escape":
         // Like the table: Esc clears the selection first; with nothing selected it leaves the results.
-        if (selection.size) setSearchSelection(new Set(), null, useSearch.getState().focus);
-        else leaveSearch();
+        if (selection.size) setSearchSelection(new Set(), null, getSearch(pane).focus, pane);
+        else leaveSearch(pane);
         break;
       case "Delete":
         if (ctrl || e.altKey || !selection.size) return;
@@ -334,7 +337,7 @@ export function SearchResults() {
       case "a":
       case "A":
         if (!ctrl) return;
-        setSearchSelection(new Set(hits.map(hitId)), hitId(hits[0]), useSearch.getState().focus);
+        setSearchSelection(new Set(hits.map(hitId)), hitId(hits[0]), getSearch(pane).focus, pane);
         break;
       case "c":
       case "C":
@@ -347,7 +350,7 @@ export function SearchResults() {
       case "F10": {
         if (e.key === "F10" && !e.shiftKey) return;
         const index = focusIndex >= 0 ? focusIndex : 0;
-        if (!selection.has(hitId(hits[index]))) selectIndex(index, "single");
+        if (!selection.has(hitId(hits[index]))) selectIndex(index, "single", pane);
         const row = scrollRef.current?.querySelector<HTMLElement>(`[data-index="${index}"]`);
         const r = row?.getBoundingClientRect() ?? scrollRef.current!.getBoundingClientRect();
         openContextMenu({ x: r.left + 40, y: r.top + Math.min(r.height, ROW_H) });
@@ -380,7 +383,7 @@ export function SearchResults() {
             className="btn"
             onClick={() => {
               setSearchScope("bucket");
-              runSearch(request.text);
+              runSearch(request.text, pane);
             }}
           >
             Search the whole bucket
@@ -429,7 +432,7 @@ export function SearchResults() {
         onClick={onClick}
         onDoubleClick={(e) => {
           const i = indexFromEvent(e);
-          if (i >= 0 && hits[i] && !e.ctrlKey && !e.metaKey && !e.shiftKey) openHit(hits[i]);
+          if (i >= 0 && hits[i] && !e.ctrlKey && !e.metaKey && !e.shiftKey) openHit(hits[i], pane);
         }}
         onContextMenu={onContextMenu}
       >

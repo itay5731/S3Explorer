@@ -5,7 +5,17 @@ import { plural } from "../lib/ops";
 export function Welcome() {
   const connection = useApp((s) => s.connection);
   const bucketCount = useApp((s) => s.buckets.length);
+  // In split view this is one of two panes: a bucket clicked in the sidebar opens in the active pane.
+  const split = useApp((s) => s.split && !s.narrow);
   if (!connection) return null;
+  if (split) {
+    return (
+      <div className="welcome welcome-pane">
+        <h1>Pick a bucket for this pane</h1>
+        <p className="welcome-lead">Click here, then choose a bucket on the left. It opens in this pane; the other pane stays where it is.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="welcome">

@@ -5,7 +5,8 @@ import { useId, useState } from "react";
 import { AlertCircle, AlertTriangle, History, Loader2, Trash2, Undo2 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectVersion } from "../lib/types";
-import { openModal, refreshInPlace } from "../store/app";
+import { getPane, openModal, refreshInPlace } from "../store/app";
+import { PANE_IDS } from "../store/panes";
 import { isDenied, permissionText, toast } from "../store/toasts";
 import { bumpObject, shortVersionId } from "../store/versions";
 import { formatBytes, formatExact } from "../lib/format";
@@ -51,7 +52,9 @@ export function VersionActionModal({
         }
       }
       bumpObject(bucket, objectKey);
-      void refreshInPlace();
+      // Every pane showing the object's folder.
+      const parent = objectKey.slice(0, objectKey.lastIndexOf("/") + 1);
+      for (const id of PANE_IDS) if (getPane(id).bucket === bucket && getPane(id).prefix === parent) void refreshInPlace(id);
       close();
     } catch (e) {
       setError(e as AppError);

@@ -1,6 +1,7 @@
 // Drag rows of the object table onto a folder row, a path-bar segment or a bucket in the sidebar to
 // move them there; hold Ctrl (Option on macOS) to copy instead (see "Drag and drop to move or copy" in
-// docs/CONTRACT.md). Built on pointer events, like useTileReorder: inside the Tauri webview the OS
+// docs/CONTRACT.md). In split view (v0.7.0) the other pane's table is a target too: its folder rows
+// and crumbs as usual, and its empty area or object rows for the folder that pane shows. Built on pointer events, like useTileReorder: inside the Tauri webview the OS
 // file-drop handling (uploads) swallows HTML5 drag and drop. The two never share a handler: OS file
 // drops arrive through api.onFileDrop, row drags only through the listeners below.
 
@@ -9,7 +10,7 @@ import { create } from "zustand";
 import { Ban, CopyPlus, FolderInput } from "lucide-react";
 import { JOB_MAX_ITEMS } from "../lib/types";
 import { plural } from "../lib/ops";
-import { useApp } from "../store/app";
+import { getPane, type PaneId, type PaneState } from "../store/app";
 import type { ClipItem } from "../store/clipboard";
 import { buildTransferRequest, confirmOrStart, tooMany, withoutArchived } from "../store/ops";
 import { toast } from "../store/toasts";
@@ -46,6 +47,7 @@ export const useRowDragView = create<DragView>(() => ({ ids: NONE, count: 0, cop
 
 /** What is dragged, frozen when the drag starts; a drop sends exactly these items. */
 interface Source {
+  readonly pane: PaneId;
   readonly bucket: string;
   readonly prefix: string;
   readonly items: readonly ClipItem[];
@@ -84,7 +86,7 @@ const clipItem = (r: Row): ClipItem =>
  * Pointer handlers for the table body. `scrollRef` is the virtualized list's scroll container.
  * Returns handlers to attach and nothing else: the drag lives outside React state.
  */
-export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
+export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: PaneId) {
   /** A drag (or a cancelled one) just ended: the click that follows the release must not select. */
   const swallowClick = useRef(false);
 
@@ -95,7 +97,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
     if (!rowEl || rowId === undefined) return;
     // What was pressed, captured now: the row by its id (never by its position, which a refresh, "load
     // more" or a re-sort can shift before the drag starts), the folder, and the selection as it is now.
-    const pressed = { rowId, ...pick(useApp.getState()) };
+    const pressed = { rowId, ...pick(getPane(pane)) };
     const start = { x: e.clientX, y: e.clientY };
     swallowClick.current = false;
 
@@ -117,11 +119,21 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
     /** The drop target under the pointer (null: none), without changing anything. */
     const hitTest = (): Hit | null => {
       if (!src) return null;
-      const el = document.elementFromPoint(pointer.x, pointer.y)?.closest<HTMLElement>("[data-drop-prefix]") ?? null;
-      if (!el) return null;
-      const bucket = el.dataset.dropBucket ?? src.bucket;
-      const prefix = el.dataset.dropPrefix ?? "";
-      return { el, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
+      const under = document.elementFromPoint(pointer.x, pointer.y);
+      const el = under?.closest<HTMLElement>("[data-drop-prefix]") ?? null;
+      if (el) {
+        const bucket = el.dataset.dropBucket ?? src.bucket;
+        const prefix = el.dataset.dropPrefix ?? "";
+        return { el, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
+      }
+      // The other pane's table (its empty area or an object row): the folder that pane shows. The
+      // pane the drag started in is not a target this way (its own folder is a no-op).
+      const body = under?.closest<HTMLElement>("[data-pane-drop]") ?? null;
+      const other = body?.dataset.paneDrop as PaneId | undefined;
+      if (!body || !other || other === src.pane) return null;
+      const { bucket, prefix, search } = getPane(other);
+      if (!bucket || search.open) return null;
+      return { el: body, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
     };
 
     /** Hit-test what is under the pointer and update the highlight and the badge. */
@@ -159,9 +171,9 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
     };
 
     const begin = (): boolean => {
-      const { bucket, prefix } = useApp.getState();
+      const { bucket, prefix } = getPane(pane);
       if (!bucket || bucket !== pressed.bucket || prefix !== pressed.prefix) return false;
-      const rows = getViewRows();
+      const rows = getViewRows(pane);
       // Resolve the pressed row by its id. Gone (the listing changed under the pointer): no drag.
       const row = rows.find((r) => r.id === pressed.rowId);
       if (!row) {
@@ -177,7 +189,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
         tooMany(items.length, "move");
         return false;
       }
-      src = Object.freeze({ bucket, prefix, items, ids: new Set(items.map((i) => i.key)) });
+      src = Object.freeze({ pane, bucket, prefix, items, ids: new Set(items.map((i) => i.key)) });
       document.body.classList.add("row-dragging");
       window.getSelection()?.removeAllRanges();
       useRowDragView.setState({ ids: src.ids, count: items.length, copy, x: pointer.x, y: pointer.y, target: null });
@@ -279,12 +291,12 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>) {
   return { onPointerDown, onClickCapture };
 }
 
-const pick = (s: ReturnType<typeof useApp.getState>) => ({ bucket: s.bucket, prefix: s.prefix, selection: s.selection });
+const pick = (s: PaneState) => ({ bucket: s.bucket, prefix: s.prefix, selection: s.selection });
 
 /** A drop: the same request as paste, then the confirmation setting decides whether to ask. */
 async function drop(src: Source, bucket: string, prefix: string, copy: boolean) {
   // Archived objects that aren't restored can't be copied or moved: left out, with a toast.
-  const items = await withoutArchived(src.bucket, [...src.items], copy ? "copy" : "move");
+  const items = await withoutArchived(src.bucket, [...src.items], copy ? "copy" : "move", src.pane);
   if (!items) return;
   const built = buildTransferRequest({ mode: copy ? "copy" : "cut", bucket: src.bucket, prefix: src.prefix, items }, { bucket, prefix });
   if (!built.ok) {

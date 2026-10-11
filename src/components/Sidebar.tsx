@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Archive, ArchiveX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
-import { loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, writePref } from "../store/app";
+import { loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, usePane, writePref } from "../store/app";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
 import { PopupMenu } from "./PopupMenu";
@@ -117,7 +117,7 @@ export function Sidebar() {
   const added = useApp((s) => s.addedBuckets);
   const addedLoading = useApp((s) => s.addedLoading);
   const addedError = useApp((s) => s.addedError);
-  const selected = useApp((s) => s.bucket);
+  const selected = usePane((s) => s.bucket);
   const [filter, setFilter] = useState("");
   const [menu, setMenu] = useState<{ b: BucketEntry; x: number; y: number } | null>(null);
   const split = useSplit();

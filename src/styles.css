@@ -1640,7 +1640,7 @@ input[type="checkbox"] {
   display: flex;
   flex-direction: column;
 }
-@container browser (max-width: 620px) {
+@container pane (max-width: 620px) {
   .object-table {
     --cols: minmax(140px, 1fr) 84px 112px;
   }
@@ -5585,4 +5585,112 @@ mark.hl {
   border-radius: 4px;
   background: var(--bg-active);
   color: var(--text);
+}
+
+/* ==========================================================================
+   Panes (v0.7.0): one explorer pane, or two side by side. The active pane's path bar and border
+   take the accent; the other pane is dimmed slightly.
+   ========================================================================== */
+.panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+}
+.panes.split {
+  grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr);
+}
+.pane-divider {
+  background: var(--border-strong);
+}
+.pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  container-type: inline-size;
+  container-name: pane;
+  outline: none;
+}
+.panes.split .pane .breadcrumbs {
+  transition: background 0.12s, box-shadow 0.12s;
+}
+.panes.split .pane.active .breadcrumbs {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.panes.split .pane.active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  pointer-events: none;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+.panes.split .pane.inactive > * {
+  opacity: 0.78;
+  transition: opacity 0.12s;
+}
+.panes.split .pane.inactive:hover > * {
+  opacity: 0.9;
+}
+.welcome-pane h1 {
+  font-size: 20px;
+}
+.welcome-pane .welcome-lead {
+  font-size: 13px;
+  max-width: 300px;
+}
+/* The other pane's table as a drop target (its current folder). */
+.tbody[data-drop-target="move"] {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.tbody[data-drop-target="copy"] {
+  background: color-mix(in srgb, var(--drop-copy) 7%, transparent);
+  box-shadow: inset 0 0 0 2px var(--drop-copy);
+}
+.tbody[data-drop-target="refused"] {
+  background: var(--danger-soft);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--danger) 60%, transparent);
+}
+.split-toggle.hidden-pane {
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+@container pane (max-width: 440px) {
+  .object-table {
+    --cols: minmax(120px, 1fr) 80px;
+  }
+  .col-modified {
+    display: none !important;
+  }
+}
+/* Split view: the toolbar carries two more buttons, so its secondary labels go sooner (as below
+   820 px in single view). */
+@container browser (max-width: 1120px) {
+  .toolbar.split .btn-label.secondary {
+    display: none;
+  }
+  .toolbar.split .btn:has(.btn-label.secondary) {
+    width: 30px;
+    padding: 0;
+  }
+}
+/* A narrow pane (two panes beside the details panel): the path bar's info gives way to the path. */
+@container pane (max-width: 440px) {
+  .crumb-copy {
+    display: none;
+  }
+  .crumbs {
+    flex-shrink: 0;
+    max-width: 100%;
+  }
+  .crumb-info {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: right;
+  }
 }

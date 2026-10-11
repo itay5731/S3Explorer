@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
-import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp } from "../store/app";
-import { useSearch } from "../store/search";
-import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
+import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane } from "../store/app";
+import { usePaneSearch } from "../store/search";
+import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { getSelected } from "../store/view";
 import { useClipboard } from "../store/clipboard";
-import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
+import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "../store/ops";
+import { useOtherPaneDest } from "./Toolbar";
 import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlocked } from "../store/archive";
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
@@ -24,10 +25,10 @@ interface Item {
 
 export function ContextMenu() {
   const menu = useApp((s) => s.contextMenu);
-  const bucket = useApp((s) => s.bucket);
+  const bucket = usePane((s) => s.bucket);
   const clip = useClipboard((s) => s.clip);
   // Over search results the menu acts on the selected hits; there is no folder to upload or paste into.
-  const inResults = useSearch((s) => s.open);
+  const inResults = usePaneSearch((s) => s.open);
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   // One archived object that isn't restored: actions that read it are disabled, with the reason.
@@ -35,6 +36,8 @@ export function ContextMenu() {
   const single = current && current.folders.length === 0 && current.objects.length === 1 ? current.objects[0] : null;
   const blocked = useArchiveBlocked(bucket, single);
   const singleInfo = useArchive((s) => (bucket && single ? s.byId[archiveId(bucket, single.key)] : undefined));
+  // Split view: the other pane's folder is a destination for the selection.
+  const dest = useOtherPaneDest();
 
   useLayoutEffect(() => {
     if (!menu || !ref.current) {
@@ -100,6 +103,26 @@ export function ContextMenu() {
       { label: n > 1 ? `Copy ${n} items` : "Copy", icon: <CopyPlus size={14} />, action: () => void copySelection("copy"), hint: "Ctrl+C", ...why },
       { label: n > 1 ? `Cut ${n} items` : "Cut", icon: <Scissors size={14} />, action: () => void copySelection("cut"), hint: "Ctrl+X", ...why },
       ...(n === 1 ? [{ label: "Rename…", icon: <PencilLine size={14} />, action: () => void requestRename(), hint: "F2", ...why }] : []),
+      ...(dest
+        ? [
+            {
+              label: "Copy to other pane",
+              icon: <CopyPlus size={14} />,
+              action: () => void requestTransferToOther("copy"),
+              hint: "F5",
+              title: `Copy to ${s3Uri(dest.bucket, dest.prefix)}`,
+              ...why,
+            },
+            {
+              label: "Move to other pane",
+              icon: <FolderInput size={14} />,
+              action: () => void requestTransferToOther("cut"),
+              hint: "F6",
+              title: `Move to ${s3Uri(dest.bucket, dest.prefix)}`,
+              ...why,
+            },
+          ]
+        : []),
     ];
   };
   const restoreItem = (label: string): Item => ({ label, icon: <ArchiveRestore size={14} />, action: () => requestRestoreArchived() });
@@ -115,7 +138,7 @@ export function ContextMenu() {
     groups.push([
       { label: "Upload files…", icon: <Upload size={14} />, action: () => void pickAndUpload() },
       { label: "Upload folder…", icon: <FolderUp size={14} />, action: () => void pickAndUploadFolder() },
-      { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openModal({ kind: "newFolder" }) },
+      { label: "New folder…", icon: <FolderPlus size={14} />, action: () => openNewFolder() },
     ]);
     groups.push([pasteItem]);
     groups.push([{ label: "Refresh", icon: <RefreshCw size={14} />, action: () => refresh() }]);

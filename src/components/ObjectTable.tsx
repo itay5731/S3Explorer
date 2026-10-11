@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, type MouseEvent as ReactMouseEven
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { AlertCircle, ArrowDown, ArrowUp, FolderOpen, Loader2, RefreshCw, Upload } from "lucide-react";
 import {
+  getPane,
   loadMore,
   navigate,
   openContextMenu,
@@ -10,6 +11,8 @@ import {
   setSelection,
   setSort,
   useApp,
+  usePane,
+  usePaneId,
   type SortKey,
 } from "../store/app";
 import { getViewRows, useViewRows, type Row } from "../store/view";
@@ -90,25 +93,27 @@ function isTypingTarget(t: EventTarget | null) {
 }
 
 export function ObjectTable() {
+  // The pane this table belongs to: every action below names it explicitly.
+  const pane = usePaneId();
   const rows = useViewRows();
-  const bucket = useApp((s) => s.bucket);
-  const prefix = useApp((s) => s.prefix);
-  const selection = useApp((s) => s.selection);
-  const focus = useApp((s) => s.focus);
-  const sort = useApp((s) => s.sort);
-  const filter = useApp((s) => s.filter);
-  const loading = useApp((s) => s.listing.loading);
-  const loadingMore = useApp((s) => s.listing.loadingMore);
-  const truncated = useApp((s) => s.listing.truncated);
-  const error = useApp((s) => s.listing.error);
+  const bucket = usePane((s) => s.bucket);
+  const prefix = usePane((s) => s.prefix);
+  const selection = usePane((s) => s.selection);
+  const focus = usePane((s) => s.focus);
+  const sort = usePane((s) => s.sort);
+  const filter = usePane((s) => s.filter);
+  const loading = usePane((s) => s.listing.loading);
+  const loadingMore = usePane((s) => s.listing.loadingMore);
+  const truncated = usePane((s) => s.listing.truncated);
+  const error = usePane((s) => s.listing.error);
   const hasRows = rows.length > 0;
   // Rows on the clipboard in "cut" mode get a subtle indicator (only for this bucket).
   const cutIds = useClipboard((s) => (s.clip && s.clip.mode === "cut" && s.clip.bucket === bucket ? s.clip.ids : null));
 
   const scrollRef = useRef<HTMLDivElement>(null);
-  const drag = useRowDrag(scrollRef);
+  const drag = useRowDrag(scrollRef, pane);
   const dragIds = useRowDragView((s) => s.ids);
-  const scrollTo = useApp((s) => s.scrollTo);
+  const scrollTo = usePane((s) => s.scrollTo);
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -125,48 +130,56 @@ export function ObjectTable() {
   // Bring a revealed row (a newest file opened from the sidebar) into view once it is loaded.
   useEffect(() => {
     if (!scrollTo) return;
-    const index = getViewRows().findIndex((r) => r.id === scrollTo.id);
+    const index = getViewRows(pane).findIndex((r) => r.id === scrollTo.id);
     if (index >= 0) requestAnimationFrame(() => virtualizer.scrollToIndex(index, { align: "center" }));
-  }, [scrollTo, virtualizer]);
+  }, [scrollTo, virtualizer, pane]);
 
   // Infinite scroll (only without a filter, otherwise we'd page through everything looking for matches).
   const items = virtualizer.getVirtualItems();
   const lastIndex = items.length ? items[items.length - 1].index : -1;
   useEffect(() => {
-    if (!filter && truncated && !loadingMore && !loading && lastIndex >= rows.length - 40) void loadMore();
-  }, [lastIndex, rows.length, truncated, loadingMore, loading, filter]);
+    if (!filter && truncated && !loadingMore && !loading && lastIndex >= rows.length - 40) void loadMore(pane);
+  }, [lastIndex, rows.length, truncated, loadingMore, loading, filter, pane]);
 
-  const openRow = useCallback((row: Row) => {
-    const { bucket } = useApp.getState();
-    if (!bucket) return;
-    if (row.kind === "folder") navigate(bucket, row.folder.prefix);
-    else {
-      setSelection(new Set([row.id]), row.id, row.id);
-      setDetailsOpen(true);
-    }
-  }, []);
+  const openRow = useCallback(
+    (row: Row) => {
+      const { bucket } = getPane(pane);
+      if (!bucket) return;
+      if (row.kind === "folder") navigate(bucket, row.folder.prefix, pane);
+      else {
+        setSelection(new Set([row.id]), row.id, row.id, pane);
+        setDetailsOpen(true);
+      }
+    },
+    [pane],
+  );
 
-  const selectIndex = useCallback((index: number, mode: "single" | "toggle" | "range" | "range-add") => {
-    const rows = getViewRows();
-    const row = rows[index];
-    if (!row) return;
-    const { selection, anchor } = useApp.getState();
-    if (mode === "toggle") {
-      const next = new Set(selection);
-      if (next.has(row.id)) next.delete(row.id);
-      else next.add(row.id);
-      setSelection(next, row.id, row.id);
-    } else if (mode === "range" || mode === "range-add") {
-      const a = anchor ? rows.findIndex((r) => r.id === anchor) : -1;
-      const from = a < 0 ? index : Math.min(a, index);
-      const to = a < 0 ? index : Math.max(a, index);
-      const next = mode === "range-add" ? new Set(selection) : new Set<string>();
-      for (let i = from; i <= to; i++) next.add(rows[i].id);
-      setSelection(next, a < 0 ? row.id : anchor, row.id);
-    } else {
-      setSelection(new Set([row.id]), row.id, row.id);
-    }
-  }, []);
+  const select = useCallback((selection: Set<string>, anchor: string | null, focus: string | null) => setSelection(selection, anchor, focus, pane), [pane]);
+
+  const selectIndex = useCallback(
+    (index: number, mode: "single" | "toggle" | "range" | "range-add") => {
+      const rows = getViewRows(pane);
+      const row = rows[index];
+      if (!row) return;
+      const { selection, anchor } = getPane(pane);
+      if (mode === "toggle") {
+        const next = new Set(selection);
+        if (next.has(row.id)) next.delete(row.id);
+        else next.add(row.id);
+        select(next, row.id, row.id);
+      } else if (mode === "range" || mode === "range-add") {
+        const a = anchor ? rows.findIndex((r) => r.id === anchor) : -1;
+        const from = a < 0 ? index : Math.min(a, index);
+        const to = a < 0 ? index : Math.max(a, index);
+        const next = mode === "range-add" ? new Set(selection) : new Set<string>();
+        for (let i = from; i <= to; i++) next.add(rows[i].id);
+        select(next, a < 0 ? row.id : anchor, row.id);
+      } else {
+        select(new Set([row.id]), row.id, row.id);
+      }
+    },
+    [pane, select],
+  );
 
   const rowIndexFromEvent = (e: ReactMouseEvent) => {
     const el = (e.target as HTMLElement).closest<HTMLElement>("[data-index]");
@@ -176,7 +189,7 @@ export function ObjectTable() {
   const onClick = (e: ReactMouseEvent) => {
     const index = rowIndexFromEvent(e);
     if (index < 0) {
-      if (!e.ctrlKey && !e.metaKey && !e.shiftKey) setSelection(new Set(), null, null);
+      if (!e.ctrlKey && !e.metaKey && !e.shiftKey) select(new Set(), null, null);
       return;
     }
     const multi = e.ctrlKey || e.metaKey;
@@ -193,17 +206,17 @@ export function ObjectTable() {
     const index = rowIndexFromEvent(e);
     if (index >= 0) {
       const row = rows[index];
-      if (!useApp.getState().selection.has(row.id)) selectIndex(index, "single");
+      if (!getPane(pane).selection.has(row.id)) selectIndex(index, "single");
     } else {
-      setSelection(new Set(), null, null);
+      select(new Set(), null, null);
     }
     openContextMenu({ x: e.clientX, y: e.clientY });
   };
 
   const moveFocus = (delta: number | "home" | "end", extend: boolean) => {
-    const rows = getViewRows();
+    const rows = getViewRows(pane);
     if (!rows.length) return;
-    const { focus } = useApp.getState();
+    const { focus } = getPane(pane);
     const cur = focus ? rows.findIndex((r) => r.id === focus) : -1;
     let next: number;
     if (delta === "home") next = 0;
@@ -235,8 +248,8 @@ export function ObjectTable() {
         moveFocus("end", e.shiftKey);
         break;
       case "Enter": {
-        const rows = getViewRows();
-        const { focus, selection } = useApp.getState();
+        const rows = getViewRows(pane);
+        const { focus, selection } = getPane(pane);
         const row =
           rows.find((r) => r.id === focus && selection.has(r.id)) ??
           (selection.size === 1 ? rows.find((r) => selection.has(r.id)) : undefined);
@@ -244,26 +257,26 @@ export function ObjectTable() {
         break;
       }
       case "Backspace": {
-        const { bucket, prefix } = useApp.getState();
-        if (bucket && prefix) navigate(bucket, parentPrefix(prefix));
+        const { bucket, prefix } = getPane(pane);
+        if (bucket && prefix) navigate(bucket, parentPrefix(prefix), pane);
         break;
       }
       case "Escape":
-        setSelection(new Set(), null, null);
+        select(new Set(), null, null);
         break;
       case "Delete":
-        if (e.ctrlKey || e.metaKey || e.altKey || !useApp.getState().selection.size) return;
+        if (e.ctrlKey || e.metaKey || e.altKey || !getPane(pane).selection.size) return;
         requestDelete();
         break;
       case "F2":
-        if (useApp.getState().selection.size !== 1) return;
+        if (getPane(pane).selection.size !== 1) return;
         void requestRename();
         break;
       case "a":
       case "A":
         if (e.ctrlKey || e.metaKey) {
-          const rows = getViewRows();
-          setSelection(new Set(rows.map((r) => r.id)), rows[0]?.id ?? null, useApp.getState().focus);
+          const rows = getViewRows(pane);
+          select(new Set(rows.map((r) => r.id)), rows[0]?.id ?? null, getPane(pane).focus);
           break;
         }
         return;
@@ -279,8 +292,8 @@ export function ObjectTable() {
         const text = window.getSelection();
         if (!inTable && text && !text.isCollapsed && text.toString()) return;
         const k = e.key.toLowerCase();
-        if (k === "v") requestPaste();
-        else if (!useApp.getState().selection.size) return;
+        if (k === "v") requestPaste(pane);
+        else if (!getPane(pane).selection.size) return;
         else void copySelection(k === "x" ? "cut" : "copy");
         break;
       }
@@ -290,14 +303,14 @@ export function ObjectTable() {
     e.preventDefault();
   };
 
-  // Global shortcuts (when focus isn't in an input and no modal is open).
+  // Global shortcuts (when focus isn't in an input and no modal is open), for the active pane only.
   const handleKeyRef = useRef(handleKey);
   handleKeyRef.current = handleKey;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented || isTypingTarget(e.target)) return;
       const st = useApp.getState();
-      if (st.modal || st.contextMenu || !st.bucket) return;
+      if (st.modal || st.contextMenu || st.activePane !== pane || !getPane(pane).bucket) return;
       const target = e.target as HTMLElement;
       const inTable = scrollRef.current?.contains(target);
       if (!inTable && target !== document.body) {
@@ -313,7 +326,7 @@ export function ObjectTable() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [pane]);
 
   if (!bucket) return <Welcome />;
 
@@ -321,7 +334,7 @@ export function ObjectTable() {
     <div className="object-table" role="grid" aria-rowcount={rows.length}>
       <div className="thead" role="row">
         {COLUMNS.map((c) => (
-          <button key={c.key} className={`th ${c.className} ${sort.key === c.key ? "sorted" : ""}`} onClick={() => setSort(c.key)} role="columnheader">
+          <button key={c.key} className={`th ${c.className} ${sort.key === c.key ? "sorted" : ""}`} onClick={() => setSort(c.key, pane)} role="columnheader">
             <span>{c.label}</span>
             {sort.key === c.key && (sort.dir === 1 ? <ArrowUp size={12} /> : <ArrowDown size={12} />)}
           </button>
@@ -331,6 +344,7 @@ export function ObjectTable() {
         className="tbody"
         ref={scrollRef}
         tabIndex={0}
+        data-pane-drop={pane}
         onClick={onClick}
         onClickCapture={drag.onClickCapture}
         onPointerDown={drag.onPointerDown}
@@ -357,7 +371,7 @@ export function ObjectTable() {
             <AlertCircle size={32} strokeWidth={1.25} className="err-icon" />
             <div className="empty-title">{isDenied(error) ? `${permissionText("list objects")}` : "Couldn’t list this folder"}</div>
             <div className="muted">{error.message}</div>
-            <button className="btn" onClick={() => refresh()}>
+            <button className="btn" onClick={() => refresh(pane)}>
               <RefreshCw size={14} /> Try again
             </button>
           </div>
@@ -399,7 +413,7 @@ export function ObjectTable() {
                     <Loader2 size={14} className="spin" /> Loading more…
                   </>
                 ) : (
-                  <button className="btn btn-ghost" onClick={() => void loadMore()}>
+                  <button className="btn btn-ghost" onClick={() => void loadMore(pane)}>
                     Load more
                   </button>
                 )}

@@ -52,10 +52,16 @@ import {
 export type Unlisten = () => void;
 
 /** OS file drag & drop, normalized from the Tauri webview drag-drop event. */
+/** Where the pointer is, in CSS pixels of the page (the pane under it receives a drop). */
+export interface DropPoint {
+  x: number;
+  y: number;
+}
+
 export type FileDropEvent =
-  | { type: "enter"; paths: string[] }
-  | { type: "over" }
-  | { type: "drop"; paths: string[] }
+  | { type: "enter"; paths: string[]; position?: DropPoint }
+  | { type: "over"; position?: DropPoint }
+  | { type: "drop"; paths: string[]; position?: DropPoint }
   | { type: "leave" };
 
 /** The window's size when the app starts (mirrors `app.windows[0]` in src-tauri/tauri.conf.json). */
@@ -182,6 +188,13 @@ export function toAppError(e: unknown): AppError {
   }
   if (typeof e === "string") return { code: "Unknown", message: e };
   return { code: "Unknown", message: "Unknown error" };
+}
+
+/** The webview reports drop positions in physical pixels; the page works in CSS pixels. */
+function toCssPoint(p: { x: number; y: number } | undefined): DropPoint | undefined {
+  if (!p) return undefined;
+  const scale = window.devicePixelRatio || 1;
+  return { x: p.x / scale, y: p.y / scale };
 }
 
 const tauriBackend: Backend = {
@@ -311,13 +324,13 @@ const tauriBackend: Backend = {
       const p = event.payload;
       switch (p.type) {
         case "enter":
-          cb({ type: "enter", paths: p.paths });
+          cb({ type: "enter", paths: p.paths, position: toCssPoint(p.position) });
           break;
         case "over":
-          cb({ type: "over" });
+          cb({ type: "over", position: toCssPoint(p.position) });
           break;
         case "drop":
-          cb({ type: "drop", paths: p.paths });
+          cb({ type: "drop", paths: p.paths, position: toCssPoint(p.position) });
           break;
         case "leave":
           cb({ type: "leave" });

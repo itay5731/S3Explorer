@@ -5,7 +5,8 @@ import * as api from "../lib/api";
 import type { AppError, Batch, FolderEntry } from "../lib/types";
 import { basename } from "../lib/format";
 import { plural, touchesPrefix } from "../lib/ops";
-import { openModal, setTransfersOpen, useApp } from "./app";
+import { activePane, getPane, openModal, setTransfersOpen } from "./app";
+import { PANE_IDS, type PaneId } from "./panes";
 import { uploadPaths } from "./actions";
 import { batchRequest, isBatchActive, onBatchUpdate, useBatches } from "./batches";
 import { notifyInBackground } from "./notify";
@@ -22,7 +23,7 @@ export function defaultUploadPrefix(prefix: string, localPath: string): string {
 
 /** Toolbar / context menu: choose a local folder, then confirm the upload. */
 export async function pickAndUploadFolder() {
-  const { bucket, prefix } = useApp.getState();
+  const { bucket, prefix } = getPane();
   if (!bucket) {
     toast.info("Select a bucket first", "Uploads go into the folder you are viewing.");
     return;
@@ -46,8 +47,8 @@ let dropSeq = 0;
  * upload-folder confirmation, anything the backend says is not a folder is uploaded as a file,
  * exactly as before.
  */
-export async function handleOsDrop(paths: string[]) {
-  const { bucket, prefix } = useApp.getState();
+export async function handleOsDrop(paths: string[], pane: PaneId = activePane()) {
+  const { bucket, prefix } = getPane(pane);
   if (!bucket) {
     toast.info("Select a bucket first", "Uploads go into the folder you are viewing.");
     return;
@@ -74,14 +75,14 @@ export async function handleOsDrop(paths: string[]) {
     document.body.classList.remove("busy-cursor");
   }
   // The user may have moved on (another drop, another folder) while the paths were checked.
-  const now = useApp.getState();
+  const now = getPane(pane);
   if (seq !== dropSeq || now.bucket !== bucket || now.prefix !== prefix) {
     toast.info("Nothing was uploaded", "The open folder changed while the dropped items were being checked. Drop them again.");
     return;
   }
   const files = results.filter((r) => r.kind === "file").map((r) => r.path);
   const folders = results.filter((r) => r.kind === "folder");
-  if (files.length) await uploadPaths(files);
+  if (files.length) await uploadPaths(files, pane);
   if (!folders.length) return;
   const first = folders[0];
   if (folders.length > 1) {
@@ -95,7 +96,7 @@ export async function handleOsDrop(paths: string[]) {
 
 /** Toolbar / context menu: choose where to save, then confirm one batch per folder. */
 export async function requestDownloadFolders(folders: FolderEntry[]) {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   if (!bucket || !folders.length) return;
   let dir: string | null;
   try {
@@ -136,10 +137,10 @@ function reportFinished(b: Batch) {
   else toast.success(`${Verb}ed ${plural(b.doneFiles, "file")}`, b.label);
 }
 
-/** Does this batch write into the folder on screen? (Downloads never change the listing.) */
-function touchesView(b: Batch): boolean {
+/** Does this batch write into the folder a pane shows? (Downloads never change the listing.) */
+function touchesView(b: Batch, pane: PaneId): boolean {
   if (b.kind !== "upload") return false;
-  const { bucket, prefix } = useApp.getState();
+  const { bucket, prefix } = getPane(pane);
   const req = batchRequest(b.id);
   const destBucket = req?.bucket ?? b.bucket;
   const destPrefix = req?.prefix ?? b.prefix;
@@ -157,8 +158,10 @@ export function installBatchEffects(): () => void {
         notifyInBackground(`${Verb} ${b.status === "failed" ? "finished with problems" : "finished"}`, b.label);
       }
     }
-    if (!touchesView(b)) return;
-    if (finished) scheduleRefresh(true);
-    else if (b.status === "running" && (!prev || prev.doneFiles !== b.doneFiles)) scheduleRefresh(false);
+    for (const pane of PANE_IDS) {
+      if (!touchesView(b, pane)) continue;
+      if (finished) void scheduleRefresh(true, pane);
+      else if (b.status === "running" && (!prev || prev.doneFiles !== b.doneFiles)) void scheduleRefresh(false, pane);
+    }
   });
 }

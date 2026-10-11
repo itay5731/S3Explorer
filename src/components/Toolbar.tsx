@@ -20,14 +20,18 @@ import {
   Archive,
   ArchiveRestore,
   ArrowUp,
+  Columns2,
+  CopyPlus,
   Folder,
+  FolderInput,
 } from "lucide-react";
-import { navigate, openModal, readPref, refresh, setDetailsOpen, setFilter, useApp, writePref } from "../store/app";
-import { leaveSearch, rerunSearch, runSearch, setSearchScope, useSearch } from "../store/search";
+import { navigate, readPref, refresh, setDetailsOpen, setFilter, setSplit, useApp, usePane, usePaneId, writePref } from "../store/app";
+import { otherPane, usePanes } from "../store/panes";
+import { leaveSearch, rerunSearch, runSearch, setSearchScope, usePaneSearch, useSearch } from "../store/search";
 import { clearClipboard, useClipboard } from "../store/clipboard";
-import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
+import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, useArchiveBlocked } from "../store/archive";
-import { copyText, downloadObjects, pickAndUpload } from "../store/actions";
+import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { PopupMenu } from "./PopupMenu";
 import { getSelected, useSelectionInfo, useViewRows } from "../store/view";
@@ -100,11 +104,11 @@ const HINT_KEY = "s3x.searchHintDismissed";
  * focuses it, Esc clears it and leaves the results. The scope control sits beside it.
  */
 function SearchBox() {
-  const bucket = useApp((s) => s.bucket);
-  const prefix = useApp((s) => s.prefix);
-  const filter = useApp((s) => s.filter);
+  const bucket = usePane((s) => s.bucket);
+  const prefix = usePane((s) => s.prefix);
+  const filter = usePane((s) => s.filter);
   const scope = useSearch((s) => s.scope);
-  const searchOpen = useSearch((s) => s.open);
+  const searchOpen = usePaneSearch((s) => s.open);
   const input = useRef<HTMLInputElement>(null);
   const [focused, setFocused] = useState(false);
   const [hintDismissed, setHintDismissed] = useState(() => readPref<boolean>(HINT_KEY, false));
@@ -123,7 +127,7 @@ function SearchBox() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const clear = leaveSearch;
+  const clear = () => leaveSearch();
   const dismissHint = () => {
     setHintDismissed(true);
     writePref(HINT_KEY, true);
@@ -198,19 +202,53 @@ function SearchBox() {
   );
 }
 
+/** The other pane's destination when two panes are on screen: its bucket and folder, or null. */
+export function useOtherPaneDest(): { bucket: string; prefix: string } | null {
+  const shown = useApp((s) => s.split && !s.narrow);
+  const other = otherPane(useApp((s) => s.activePane));
+  const bucket = usePanes((s) => s[other].bucket);
+  const prefix = usePanes((s) => s[other].prefix);
+  return shown && bucket ? { bucket, prefix } : null;
+}
+
+/** Split / Single: one toggle, pressed while two panes are open (Ctrl+2 / Ctrl+1). */
+function SplitButton() {
+  const split = useApp((s) => s.split);
+  const narrow = useApp((s) => s.narrow);
+  const title = split
+    ? narrow
+      ? "Single view (Ctrl+1). The second pane is hidden: the window is too narrow for two panes."
+      : "Single view (Ctrl+1): keep only the active pane"
+    : "Split view (Ctrl+2): two panes side by side";
+  return (
+    <button
+      className={`icon-btn lg split-toggle ${split ? "active" : ""} ${split && narrow ? "hidden-pane" : ""}`}
+      onClick={() => setSplit(!split)}
+      title={title}
+      aria-label={split ? "Single view" : "Split view"}
+      aria-pressed={split}
+    >
+      <Columns2 size={15} />
+    </button>
+  );
+}
+
 export function Toolbar() {
-  const bucket = useApp((s) => s.bucket);
-  const prefix = useApp((s) => s.prefix);
-  const loading = useApp((s) => s.listing.loading);
+  const bucket = usePane((s) => s.bucket);
+  const prefix = usePane((s) => s.prefix);
+  const loading = usePane((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
-  const searchOpen = useSearch((s) => s.open);
-  const searching = useSearch((s) => s.loading);
+  const searchOpen = usePaneSearch((s) => s.open);
+  const searching = usePaneSearch((s) => s.loading);
   const sel = useSelectionInfo();
   const selCount = sel.folders + sel.objects;
   const clip = useClipboard((s) => s.clip);
   const disabled = !bucket;
   // One archived object that isn't restored can't be downloaded, copied, moved or renamed.
   const blocked = useArchiveBlocked(bucket, sel.object);
+  const dest = useOtherPaneDest();
+  const splitShown = useApp((s) => s.split && !s.narrow);
+  const destUri = dest ? s3Uri(dest.bucket, dest.prefix) : "";
   const why = (title: string) => (blocked ? ARCHIVED_REASON : title);
   // Restore is offered only when the selection holds archived objects (folders: context menu).
   const archivedCount = useMemo(
@@ -219,11 +257,11 @@ export function Toolbar() {
   );
 
   return (
-    <div className="toolbar">
+    <div className={`toolbar ${dest || splitShown ? "split" : ""}`}>
       <div className="tool-group">
         {/* No folder is in view while search results are open: nothing to upload or create into. */}
         <UploadButton disabled={disabled || searchOpen} />
-        <button className="btn" disabled={disabled || searchOpen} onClick={() => openModal({ kind: "newFolder" })} title={searchOpen ? "Go back to a folder to create one" : "New folder"}>
+        <button className="btn" disabled={disabled || searchOpen} onClick={() => openNewFolder()} title={searchOpen ? "Go back to a folder to create one" : "New folder"}>
           <FolderPlus size={14} />
           <span className="btn-label secondary">New folder</span>
         </button>
@@ -288,6 +326,28 @@ export function Toolbar() {
         >
           <PencilLine size={15} />
         </button>
+        {dest && (
+          <>
+            <button
+              className="icon-btn lg"
+              disabled={disabled || selCount === 0 || blocked}
+              onClick={() => void requestTransferToOther("copy")}
+              title={blocked ? ARCHIVED_REASON : `Copy to other pane (F5): ${destUri}`}
+              aria-label="Copy to other pane"
+            >
+              <CopyPlus size={15} />
+            </button>
+            <button
+              className="icon-btn lg"
+              disabled={disabled || selCount === 0 || blocked}
+              onClick={() => void requestTransferToOther("cut")}
+              title={blocked ? ARCHIVED_REASON : `Move to other pane (F6): ${destUri}`}
+              aria-label="Move to other pane"
+            >
+              <FolderInput size={15} />
+            </button>
+          </>
+        )}
         {archivedCount > 0 && (
           <button
             className="icon-btn lg"
@@ -337,6 +397,7 @@ export function Toolbar() {
           </div>
         )}
         <SearchBox />
+        <SplitButton />
         <button
           className={`icon-btn lg ${detailsOpen ? "active" : ""}`}
           onClick={() => setDetailsOpen(!detailsOpen)}
@@ -350,16 +411,17 @@ export function Toolbar() {
 }
 
 export function Breadcrumbs() {
-  const bucket = useApp((s) => s.bucket);
-  const prefix = useApp((s) => s.prefix);
-  const truncated = useApp((s) => s.listing.truncated);
-  const loading = useApp((s) => s.listing.loading);
-  const total = useApp((s) => s.listing.folders.length + s.listing.objects.length);
+  const pane = usePaneId();
+  const bucket = usePane((s) => s.bucket);
+  const prefix = usePane((s) => s.prefix);
+  const truncated = usePane((s) => s.listing.truncated);
+  const loading = usePane((s) => s.listing.loading);
+  const total = usePane((s) => s.listing.folders.length + s.listing.objects.length);
   const rows = useViewRows();
-  const filter = useApp((s) => s.filter);
+  const filter = usePane((s) => s.filter);
   const sel = useSelectionInfo();
   // While search results are open they say what they hold; the folder's counts would only confuse.
-  const searchOpen = useSearch((s) => s.open);
+  const searchOpen = usePaneSearch((s) => s.open);
   if (!bucket) return null;
   const segs = prefixSegments(prefix);
   const selCount = sel.folders + sel.objects;
@@ -368,7 +430,7 @@ export function Breadcrumbs() {
       <nav className="crumbs" aria-label="Path">
         <button
           className={`crumb ${segs.length === 0 ? "current" : ""}`}
-          onClick={() => navigate(bucket, "")}
+          onClick={() => navigate(bucket, "", pane)}
           title={`s3://${bucket}/`}
           data-drop-bucket={bucket}
           data-drop-prefix=""
@@ -381,7 +443,7 @@ export function Breadcrumbs() {
             <ChevronRight size={13} className="crumb-sep" />
             <button
               className={`crumb ${i === segs.length - 1 ? "current" : ""}`}
-              onClick={() => navigate(bucket, s.prefix)}
+              onClick={() => navigate(bucket, s.prefix, pane)}
               title={`s3://${bucket}/${s.prefix}`}
               data-drop-bucket={bucket}
               data-drop-prefix={s.prefix}

@@ -2,8 +2,9 @@
 
 import { useMemo } from "react";
 import type { FolderEntry, ObjectEntry, SearchHit } from "../lib/types";
-import { matchesFilter, useApp, type SortState } from "./app";
-import { hitId, useSearch } from "./search";
+import { activePane, getPane, matchesFilter, usePaneId, type PaneId, type SortState } from "./app";
+import { usePanes } from "./panes";
+import { hitId, usePaneSearch } from "./search";
 
 export type Row =
   | { kind: "folder"; id: string; name: string; folder: FolderEntry }
@@ -11,15 +12,19 @@ export type Row =
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
-let cache: {
+interface RowsCache {
   folders: FolderEntry[];
   objects: ObjectEntry[];
   filter: string;
   sort: SortState;
   rows: Row[];
-} | null = null;
+}
 
-export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filter: string, sort: SortState): Row[] {
+/** One cache per pane, so two panes never evict each other's rows. */
+const caches: Record<PaneId, RowsCache | null> = { a: null, b: null };
+
+export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filter: string, sort: SortState, pane: PaneId): Row[] {
+  const cache = caches[pane];
   if (cache && cache.folders === folders && cache.objects === objects && cache.filter === filter && cache.sort === sort) {
     return cache.rows;
   }
@@ -57,21 +62,24 @@ export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filt
     });
   }
   const rows = fr.concat(or);
-  cache = { folders, objects, filter, sort, rows };
+  caches[pane] = { folders, objects, filter, sort, rows };
   return rows;
 }
 
-export function useViewRows(): Row[] {
-  const folders = useApp((s) => s.listing.folders);
-  const objects = useApp((s) => s.listing.objects);
-  const filter = useApp((s) => s.filter);
-  const sort = useApp((s) => s.sort);
-  return computeRows(folders, objects, filter, sort);
+/** Hook: the rows of a pane (default: this component's pane, see usePaneId). */
+export function useViewRows(pane?: PaneId): Row[] {
+  const fallback = usePaneId();
+  const id = pane ?? fallback;
+  const folders = usePanes((s) => s[id].listing.folders);
+  const objects = usePanes((s) => s[id].listing.objects);
+  const filter = usePanes((s) => s[id].filter);
+  const sort = usePanes((s) => s[id].sort);
+  return computeRows(folders, objects, filter, sort, id);
 }
 
-export function getViewRows(): Row[] {
-  const s = useApp.getState();
-  return computeRows(s.listing.folders, s.listing.objects, s.filter, s.sort);
+export function getViewRows(pane: PaneId = activePane()): Row[] {
+  const s = getPane(pane);
+  return computeRows(s.listing.folders, s.listing.objects, s.filter, s.sort, pane);
 }
 
 /** The selected search hits, in result order (the results view is open). */
@@ -94,12 +102,11 @@ function selectedHits(selection: Set<string>, hits: SearchHit[]): { folders: Fol
  * While search results are open, the selected result rows are the selection: their entries are
  * returned exactly as the search reported them (keys and prefixes byte-for-byte).
  */
-export function getSelected(): { folders: FolderEntry[]; objects: ObjectEntry[] } {
-  const search = useSearch.getState();
+export function getSelected(pane: PaneId = activePane()): { folders: FolderEntry[]; objects: ObjectEntry[] } {
+  const { selection, listing, search } = getPane(pane);
   if (search.open) return selectedHits(search.selection, search.result?.hits ?? []);
-  const { selection, listing } = useApp.getState();
   if (!selection.size) return { folders: [], objects: [] };
-  const visible = new Set(getViewRows().map((r) => r.id));
+  const visible = new Set(getViewRows(pane).map((r) => r.id));
   return {
     folders: listing.folders.filter((f) => selection.has(f.prefix) && visible.has(f.prefix)),
     objects: listing.objects.filter((o) => selection.has(o.key) && visible.has(o.key)),
@@ -108,11 +115,12 @@ export function getSelected(): { folders: FolderEntry[]; objects: ObjectEntry[] 
 
 /** Hook: counts of selected visible folders/objects (same rule as getSelected, results included). */
 export function useSelectionInfo() {
-  const selection = useApp((s) => s.selection);
-  const rows = useViewRows();
-  const searchOpen = useSearch((s) => s.open);
-  const searchSelection = useSearch((s) => s.selection);
-  const hits = useSearch((s) => s.result?.hits);
+  const id = usePaneId();
+  const selection = usePanes((s) => s[id].selection);
+  const rows = useViewRows(id);
+  const searchOpen = usePaneSearch((s) => s.open);
+  const searchSelection = usePaneSearch((s) => s.selection);
+  const hits = usePaneSearch((s) => s.result?.hits);
   return useMemo(() => {
     if (!searchOpen) return summarize(selection, rows);
     const { folders, objects } = selectedHits(searchSelection, hits ?? []);
@@ -128,11 +136,10 @@ export function useSelectionInfo() {
  * The folder the selected items are listed in: the open folder, or (search results) the folder all
  * selected hits share, else the deepest folder that contains them all.
  */
-export function getSelectionPrefix(): string {
-  const search = useSearch.getState();
-  const { prefix } = useApp.getState();
+export function getSelectionPrefix(pane: PaneId = activePane()): string {
+  const { prefix, search } = getPane(pane);
   if (!search.open) return prefix;
-  const { folders, objects } = getSelected();
+  const { folders, objects } = getSelected(pane);
   const parents = [
     ...folders.map((f) => f.prefix.slice(0, f.prefix.length - f.name.length - 1)),
     ...objects.map((o) => o.key.slice(0, o.key.length - o.name.length)),

@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Download, RefreshCw, Search, X } from "lucide-react";
 import type { ObjectEntry } from "../lib/types";
 import { extension, formatExact, formatRelative } from "../lib/format";
 import { downloadObjects } from "../store/actions";
-import { readPref, revealObject, useApp, writePref } from "../store/app";
+import { readPref, revealObject, useApp, usePane, writePref } from "../store/app";
 import { onJobUpdate } from "../store/jobs";
 import { isBatchActive, onBatchUpdate } from "../store/batches";
-import { loadRecent, useRecent } from "../store/recent";
+import { forgetRecent, loadRecent, showRecent, useRecent } from "../store/recent";
 import { onTransferFinished } from "../store/transfers";
 import { isJobActive } from "../lib/ops";
 import { ExtensionFilter } from "./ExtensionFilter";
@@ -30,19 +30,30 @@ const RESCAN_DELAY_MS = 800;
  * are in it, so a fresh upload or build can be reached without browsing down to it.
  */
 export function RecentFiles() {
-  const bucket = useApp((s) => s.bucket);
+  const bucket = usePane((s) => s.bucket);
   const recent = useRecent();
   const [filter, setFilter] = useState("");
   const [rangeId, setRangeId] = useState(() => readPref<RangeId | null>(RANGE_KEY, DEFAULT_RANGE));
   /** File extensions to show; empty means every type. */
   const [types, setTypes] = useState<Set<string>>(new Set());
 
+  // Search and type filters belong to the bucket they were set in, and come back with it (another
+  // pane becoming active switches the watched bucket back and forth).
+  const filters = useRef(new Map<string, { filter: string; types: Set<string> }>());
+  // The filters as rendered; still the old bucket's while the effect below cleans up after it.
+  const latest = useRef({ filter, types });
+  latest.current = { filter, types };
   useEffect(() => {
-    // Search and type filters belong to the bucket they were set in.
-    setFilter("");
-    setTypes(new Set());
-    if (bucket) void loadRecent(bucket);
+    if (!bucket) return;
+    const saved = filters.current.get(bucket);
+    setFilter(saved?.filter ?? "");
+    setTypes(saved?.types ?? new Set());
+    showRecent(bucket);
+    return () => void filters.current.set(bucket, latest.current);
   }, [bucket]);
+  // A new connection starts over.
+  const connection = useApp((s) => s.connection);
+  useEffect(() => filters.current.clear(), [connection]);
 
   // An upload into the open bucket is new by definition, and a copy, move, delete or tag job there
   // changes what is newest: look again when one finishes. These often finish in bursts, so wait a
@@ -54,18 +65,25 @@ export function RecentFiles() {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => void loadRecent(bucket), RESCAN_DELAY_MS);
     };
+    // A change in the watched bucket scans again; one in another bucket drops that bucket's cached scan.
+    const changed = (b: string | null) => {
+      if (b === bucket) rescan();
+      else if (b) forgetRecent(b);
+    };
     const stopTransfers = onTransferFinished((t) => {
-      if (t.kind === "upload" && t.status === "completed" && t.bucket === bucket) rescan();
+      if (t.kind === "upload" && t.status === "completed") changed(t.bucket);
     });
     const stopJobs = onJobUpdate((j, prev) => {
       const finished = !isJobActive(j) && (!prev || isJobActive(prev));
       // A cancelled job may still have changed some objects.
-      if (finished && (j.srcBucket === bucket || j.destBucket === bucket)) rescan();
+      if (!finished) return;
+      changed(j.srcBucket);
+      if (j.destBucket !== j.srcBucket) changed(j.destBucket);
     });
-    // A folder upload into this bucket: once, when it finishes (also when cancelled part way).
+    // A folder upload into a bucket: once, when it finishes (also when cancelled part way).
     const stopBatches = onBatchUpdate((b, prev) => {
       const finished = !isBatchActive(b) && (!prev || isBatchActive(prev));
-      if (finished && b.kind === "upload" && b.bucket === bucket && b.doneFiles > 0) rescan();
+      if (finished && b.kind === "upload" && b.doneFiles > 0) changed(b.bucket);
     });
     return () => {
       window.clearTimeout(timer);

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArchiveRestore, ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, RefreshCw, Snowflake, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
-import { navigate, openModal, setDetailsOpen, useApp } from "../store/app";
+import { navigate, openModal, setDetailsOpen, usePane } from "../store/app";
 import { requestBulkTags, requestDelete, requestRestoreArchived } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, rememberArchiveMeta, useArchiveBlocked } from "../store/archive";
 import { bumpObject, useObjectRev } from "../store/versions";
@@ -136,8 +136,8 @@ function ObjectTagsSection({ bucket, objKey }: { bucket: string; objKey: string 
 }
 
 export function DetailsPanel() {
-  const bucket = useApp((s) => s.bucket);
-  const prefix = useApp((s) => s.prefix);
+  const bucket = usePane((s) => s.bucket);
+  const prefix = usePane((s) => s.prefix);
   const sel = useSelectionInfo();
   const obj = sel.object;
   const [meta, setMeta] = useState<ObjectMeta | null>(null);

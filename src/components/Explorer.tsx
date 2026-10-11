@@ -1,7 +1,22 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
-import { readPref, requestDisconnect, useApp, writePref } from "../store/app";
+import {
+  activePane,
+  getPane,
+  isSplitShown,
+  readPref,
+  requestDisconnect,
+  setActivePane,
+  setNarrow,
+  setSplit,
+  shownOtherPane,
+  useApp,
+  writePref,
+} from "../store/app";
+import { PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
+import { requestTransferToOther } from "../store/ops";
+import { useSettings } from "../store/settings";
 import { installTransferEffects } from "../store/actions";
 import { handleOsDrop, installBatchEffects } from "../store/folders";
 import { installJobEffects } from "../store/ops";
@@ -12,7 +27,6 @@ import { Sidebar } from "./Sidebar";
 import { Breadcrumbs, Toolbar } from "./Toolbar";
 import { ObjectTable } from "./ObjectTable";
 import { SearchResults } from "./SearchResults";
-import { useSearch } from "../store/search";
 import { toast } from "../store/toasts";
 import { DetailsPanel } from "./DetailsPanel";
 import { ActivityPanel } from "./TransfersPanel";
@@ -82,22 +96,37 @@ function ConnectionChip() {
   );
 }
 
-function useFileDrop() {
-  const [dragging, setDragging] = useState(false);
+/** The pane under a point of the page, if any. */
+function paneAt(p: api.DropPoint | undefined): PaneId | null {
+  if (!p) return null;
+  const el = document.elementFromPoint(p.x, p.y)?.closest<HTMLElement>("[data-pane]");
+  const id = el?.dataset.pane;
+  return id === "a" || id === "b" ? id : null;
+}
+
+/**
+ * OS files dragged over the window: which pane they would land in (the pane under the pointer, else
+ * the active pane), or null while nothing is dragged.
+ */
+function useFileDrop(): PaneId | null {
+  const [target, setTarget] = useState<PaneId | null>(null);
   useEffect(() => {
     let unlisten: api.Unlisten | null = null;
     let disposed = false;
     api
       .onFileDrop((e) => {
-        if (e.type === "enter" || e.type === "over") setDragging(true);
-        else if (e.type === "leave") setDragging(false);
+        if (e.type === "enter" || e.type === "over") setTarget(paneAt(e.position) ?? activePane());
+        else if (e.type === "leave") setTarget(null);
         else {
-          setDragging(false);
+          setTarget(null);
           // Files upload right away; a folder opens the upload-folder confirmation. Not while search
-          // results are open: no folder is in view to upload into.
+          // results are open in that pane: no folder is in view to upload into.
           if (!e.paths.length) return;
-          if (useSearch.getState().open) toast.info("Go back to a folder to upload", "Search results are open; nothing was uploaded.");
-          else void handleOsDrop(e.paths);
+          const pane = paneAt(e.position) ?? activePane();
+          // The pane that receives the drop becomes the active one (its dialogs and toolbar follow).
+          if (!useApp.getState().modal) setActivePane(pane);
+          if (getPane(pane).search.open) toast.info("Go back to a folder to upload", "Search results are open; nothing was uploaded.");
+          else void handleOsDrop(e.paths, pane);
         }
       })
       .then((u) => (disposed ? u() : (unlisten = u)))
@@ -109,7 +138,111 @@ function useFileDrop() {
       unlisten?.();
     };
   }, []);
-  return dragging;
+  return target;
+}
+
+/** Below this main-area width the second pane is hidden (not closed). */
+const SPLIT_MIN_WIDTH = 560;
+
+/** Watch the main area's width and hide the second pane when two would not fit. */
+function useNarrowWatch() {
+  const ref = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(([entry]) => setNarrow(entry.contentRect.width < SPLIT_MIN_WIDTH));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return ref;
+}
+
+/** Give a pane the keyboard: its table (or results list), else the pane itself. */
+function focusPane(id: PaneId) {
+  setActivePane(id);
+  const root = document.querySelector<HTMLElement>(`[data-pane="${id}"]`);
+  (root?.querySelector<HTMLElement>(".tbody") ?? root)?.focus();
+}
+
+/**
+ * Window shortcuts for the panes: Ctrl+2 / Ctrl+1 split and unsplit; F5 / F6 copy and move the active
+ * pane's selection to the other pane (split view only; F5 never reloads the page then).
+ */
+function usePaneShortcuts() {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const st = useApp.getState();
+      const ctrl = e.ctrlKey || e.metaKey;
+      const transfer = (e.key === "F5" || e.key === "F6") && !ctrl && !e.altKey && !e.shiftKey;
+      // With the split on, F5/F6 belong to the panes: never let the webview reload the page, even
+      // while a dialog is open or the second pane is hidden for width.
+      if (transfer && st.split) e.preventDefault();
+      if (e.defaultPrevented && !transfer) return;
+      // The same guard as the table shortcuts: not while typing, in a dialog, menu or popover, or
+      // while Settings is open.
+      const el = e.target as HTMLElement | null;
+      const typing = !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      const inOverlay = !!el?.closest?.(".modal, .context-menu, .popover");
+      if (st.modal || st.contextMenu || useSettings.getState().open || typing || inOverlay) return;
+      if (ctrl && !e.altKey && !e.shiftKey && (e.key === "1" || e.key === "2")) {
+        e.preventDefault();
+        setSplit(e.key === "2");
+        return;
+      }
+      if (transfer && isSplitShown() && getPane().bucket) void requestTransferToOther(e.key === "F5" ? "copy" : "cut");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+}
+
+/** One explorer pane: its path bar and its table (or search results), and the OS-drop overlay. */
+function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
+  const bucket = usePanes((s) => s[id].bucket);
+  const prefix = usePanes((s) => s[id].prefix);
+  const searchOpen = usePanes((s) => s[id].search.open) && bucket !== null;
+  const split = useApp((s) => s.split && !s.narrow);
+  const active = useApp((s) => s.activePane === id);
+
+  // Tab / Shift+Tab in a table or results list moves to the other pane (split view only).
+  const onKeyDown = (e: ReactKeyboardEvent) => {
+    if (e.key !== "Tab" || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (!(e.target as HTMLElement).classList.contains("tbody")) return;
+    const other = shownOtherPane();
+    if (!other) return;
+    e.preventDefault();
+    focusPane(other);
+  };
+
+  return (
+    <PaneContext.Provider value={id}>
+      <section
+        className={`pane ${split ? (active ? "active" : "inactive") : ""}`}
+        data-pane={id}
+        tabIndex={-1}
+        aria-label={split ? (id === "a" ? "Left pane" : "Right pane") : undefined}
+        onPointerDownCapture={() => setActivePane(id)}
+        onFocusCapture={() => setActivePane(id)}
+        onKeyDown={onKeyDown}
+      >
+        {bucket && <Breadcrumbs />}
+        <div className="table-wrap">
+          {searchOpen ? <SearchResults /> : <ObjectTable />}
+          {dropping && (
+            <div className={`drop-overlay ${bucket ? "" : "disabled"}`}>
+              <div className="drop-card">
+                <UploadCloud size={34} strokeWidth={1.5} />
+                <div className="drop-title">
+                  {!bucket ? "Select a bucket first" : searchOpen ? "Go back to a folder to upload" : "Drop files or a folder to upload"}
+                </div>
+                {bucket && <div className="muted mono small">s3://{bucket}/{prefix}</div>}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    </PaneContext.Provider>
+  );
 }
 
 const SIDEBAR_WIDTH_KEY = "s3x.sidebarWidth";
@@ -155,13 +288,18 @@ function useSidebarResize() {
 }
 
 export function Explorer() {
-  const bucket = useApp((s) => s.bucket);
+  const active = useApp((s) => s.activePane);
+  const split = useApp((s) => s.split);
+  const shown = useApp((s) => s.split && !s.narrow);
+  const bucket = usePanes((s) => s[active].bucket);
   // Details describe an item inside a bucket, so the panel stays closed until one is open.
   const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
-  const prefix = useApp((s) => s.prefix);
-  const searchOpen = useSearch((s) => s.open) && bucket !== null;
-  const dragging = useFileDrop();
+  const dropTarget = useFileDrop();
   const sidebar = useSidebarResize();
+  const main = useNarrowWatch();
+  usePaneShortcuts();
+  // Two panes side by side, or only the active one.
+  const panes = shown ? PANE_IDS : [active];
 
   useEffect(() => installTransferEffects(), []);
   useEffect(() => installJobEffects(), []);
@@ -192,22 +330,16 @@ export function Explorer() {
           onPointerDown={sidebar.onPointerDown}
           onDoubleClick={sidebar.reset}
         />
-        <main className="browser">
-          {bucket && <Toolbar />}
-          {bucket && <Breadcrumbs />}
-          <div className="table-wrap">
-            {searchOpen ? <SearchResults /> : <ObjectTable />}
-            {dragging && (
-              <div className={`drop-overlay ${bucket ? "" : "disabled"}`}>
-                <div className="drop-card">
-                  <UploadCloud size={34} strokeWidth={1.5} />
-                  <div className="drop-title">
-                    {!bucket ? "Select a bucket first" : searchOpen ? "Go back to a folder to upload" : "Drop files or a folder to upload"}
-                  </div>
-                  {bucket && <div className="muted mono small">s3://{bucket}/{prefix}</div>}
-                </div>
-              </div>
-            )}
+        <main className="browser" ref={main}>
+          {/* The toolbar acts on the active pane; in split view it stays (the Split button lives there). */}
+          {(bucket || split) && <Toolbar />}
+          <div className={`panes ${shown ? "split" : ""}`}>
+            {panes.map((id, i) => (
+              <Fragment key={id}>
+                {i > 0 && <div className="pane-divider" aria-hidden="true" />}
+                <Pane id={id} dropping={dropTarget === id} />
+              </Fragment>
+            ))}
           </div>
         </main>
         {detailsOpen && <DetailsPanel />}

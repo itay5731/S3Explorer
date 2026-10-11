@@ -4,8 +4,9 @@
 import * as api from "../lib/api";
 import { JOB_MAX_ITEMS, type AppError, type Job, type JobItem, type JobRequest } from "../lib/types";
 import { copyName, isJobActive, KIND_VERB, plural, touchesPrefix } from "../lib/ops";
-import { s3Uri } from "../lib/format";
-import { openModal, refreshInPlace, setTransfersOpen, useApp } from "./app";
+import { parentPrefix, s3Uri } from "../lib/format";
+import { activePane, getPane, navigate, openModal, refreshInPlace, setTransfersOpen, shownOtherPane } from "./app";
+import { PANE_IDS, type PaneId } from "./panes";
 import { clearClipboard, setClipboard, useClipboard, type ClipItem } from "./clipboard";
 import { jobRequest, onJobUpdate, rememberJobRequest, useJobs } from "./jobs";
 import { notifyInBackground } from "./notify";
@@ -14,9 +15,9 @@ import { toast, toastFailure } from "./toasts";
 import { getSelected, getSelectionPrefix } from "./view";
 import { ARCHIVED_MESSAGE, isArchiveClass, splitReadable, toastArchivedSkipped } from "./archive";
 
-/** The current selection as clip items (exact keys/prefixes), folders first. */
-export function selectedItems(): ClipItem[] {
-  const { folders, objects } = getSelected();
+/** A pane's selection (default: the active pane) as clip items (exact keys/prefixes), folders first. */
+export function selectedItems(pane: PaneId = activePane()): ClipItem[] {
+  const { folders, objects } = getSelected(pane);
   return [
     ...folders.map((f) => ({ key: f.prefix, isPrefix: true, name: f.name })),
     ...objects.map((o) => ({ key: o.key, isPrefix: false, name: o.name })),
@@ -36,7 +37,7 @@ export function tooMany(count: number, what: string): boolean {
 // ---- delete ---------------------------------------------------------------------------
 
 export function requestDelete() {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   const items = selectedItems();
   if (!bucket || !items.length) return;
   if (tooMany(items.length, "delete")) return;
@@ -55,7 +56,7 @@ export function requestDelete() {
 
 /** Edit the tags of the selection: one object opens its tag editor; anything else a bulk tag job. */
 export function requestBulkTags() {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   const prefix = getSelectionPrefix();
   const items = selectedItems();
   if (!bucket || !items.length) return;
@@ -76,9 +77,9 @@ export function requestBulkTags() {
  * toast naming how many. Folders are kept: the backend fails archived objects inside per object.
  * Returns null when nothing is left.
  */
-export async function withoutArchived(bucket: string, items: ClipItem[], action: string): Promise<ClipItem[] | null> {
-  // The storage class as listed: the open folder's rows, or the selected search hits.
-  const listed = new Map([...useApp.getState().listing.objects, ...getSelected().objects].map((o) => [o.key, o]));
+export async function withoutArchived(bucket: string, items: ClipItem[], action: string, pane: PaneId = activePane()): Promise<ClipItem[] | null> {
+  // The storage class as listed: the pane's folder rows, or its selected search hits.
+  const listed = new Map([...getPane(pane).listing.objects, ...getSelected(pane).objects].map((o) => [o.key, o]));
   const objects = items.filter((i) => !i.isPrefix).map((i) => ({ key: i.key, storageClass: listed.get(i.key)?.storageClass ?? null }));
   const { blocked } = await splitReadable(bucket, objects);
   if (!blocked.length) return items;
@@ -97,7 +98,7 @@ export async function withoutArchived(bucket: string, items: ClipItem[], action:
  * anything else (several, or folders) a "restore" job over the selected folders and archived objects.
  */
 export function requestRestoreArchived() {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   const prefix = getSelectionPrefix();
   const { folders, objects } = getSelected();
   if (!bucket) return;
@@ -123,7 +124,7 @@ export function requestRestoreArchived() {
 // ---- rename -------------------------------------------------------------------------------
 
 export async function requestRename() {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   const items = selectedItems();
   if (!bucket || items.length !== 1) return;
   if (!(await withoutArchived(bucket, items, "rename"))) return;
@@ -141,7 +142,7 @@ export async function requestRename() {
 // ---- clipboard ------------------------------------------------------------------------------
 
 export async function copySelection(mode: "copy" | "cut") {
-  const { bucket } = useApp.getState();
+  const { bucket } = getPane();
   // Search results can come from several folders: the clipboard names the folder they share.
   const prefix = getSelectionPrefix();
   const selected = selectedItems();
@@ -242,8 +243,8 @@ export function buildTransferRequest(
 }
 
 /** Build the paste request for the current folder, or explain why it can’t be done. */
-export function requestPaste() {
-  const { bucket, prefix, listing } = useApp.getState();
+export function requestPaste(pane: PaneId = activePane()) {
+  const { bucket, prefix, listing } = getPane(pane);
   const clip = useClipboard.getState().clip;
   if (!bucket || !clip || !clip.items.length) return;
   if (tooMany(clip.items.length, "paste")) return;
@@ -265,6 +266,40 @@ export function requestPaste() {
     renamed: built.renamed,
     clearCut: clip.mode === "cut",
   });
+}
+
+/**
+ * Copy or move the active pane's selection into the other pane's folder (F5 / F6, the toolbar and
+ * the context menu). The source items and the destination are captured now, before anything waits;
+ * then the same request, preview and confirmation as a paste (without the "(copy)" renaming: the
+ * same folder on both sides is refused as a no-op).
+ */
+export async function requestTransferToOther(mode: "copy" | "cut") {
+  const src = activePane();
+  const dest = shownOtherPane();
+  if (!dest) return;
+  const { bucket } = getPane(src);
+  const destBucket = getPane(dest).bucket;
+  const destPrefix = getPane(dest).prefix;
+  // Like a drag: a pane showing search results has no folder in view to receive anything.
+  if (destBucket && getPane(dest).search.open) {
+    toast.info("Close the search results in the other pane first", "Its folder is behind the results; nothing was copied or moved.");
+    return;
+  }
+  const prefix = getSelectionPrefix(src);
+  const selected = selectedItems(src);
+  if (!bucket || !destBucket || !selected.length) return;
+  const action = mode === "copy" ? "copy" : "move";
+  if (tooMany(selected.length, action)) return;
+  const items = await withoutArchived(bucket, selected, action, src);
+  if (!items) return;
+  const built = buildTransferRequest({ mode, bucket, prefix, items }, { bucket: destBucket, prefix: destPrefix });
+  if (!built.ok) {
+    if (built.info) toast.info(built.title, built.detail);
+    else toast.error(built.title, built.detail);
+    return;
+  }
+  void confirmOrStart({ request: built.request, mode, srcPrefix: prefix, destPrefix, renamed: false, clearCut: false });
 }
 
 let checking = false;
@@ -353,8 +388,8 @@ export async function startConfirmedJob(
 
 // ---- effects: keep the listing in sync and report results -----------------------------------
 
-function touchesView(job: Job): boolean {
-  const { bucket, prefix } = useApp.getState();
+function touchesView(job: Job, pane: PaneId): boolean {
+  const { bucket, prefix } = getPane(pane);
   if (!bucket) return false;
   const req = jobRequest(job.id);
   if (!req) return job.srcBucket === bucket || job.destBucket === bucket;
@@ -408,28 +443,65 @@ function reportFinished(j: Job) {
 }
 
 const REFRESH_EVERY_MS = 2000;
-let lastRefresh = 0;
-let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+const lastRefresh: Record<PaneId, number> = { a: 0, b: 0 };
+const refreshTimer: Record<PaneId, ReturnType<typeof setTimeout> | null> = { a: null, b: null };
 
-/** Refresh the open listing in place: right away (`now`), or at most every 2 s while work is running. */
-export function scheduleRefresh(now: boolean) {
+function clearRefreshTimer(pane: PaneId) {
+  const t = refreshTimer[pane];
+  if (t) clearTimeout(t);
+  refreshTimer[pane] = null;
+}
+
+/** Refresh a pane's listing in place: right away (`now`), or at most every 2 s while work is running. */
+export function scheduleRefresh(now: boolean, pane: PaneId = activePane()): Promise<void> | undefined {
   if (now) {
-    if (refreshTimer) clearTimeout(refreshTimer);
-    refreshTimer = null;
-    lastRefresh = Date.now();
-    void refreshInPlace();
-    return;
+    clearRefreshTimer(pane);
+    lastRefresh[pane] = Date.now();
+    return refreshInPlace(pane);
   }
-  if (refreshTimer) return;
-  const wait = Math.max(0, lastRefresh + REFRESH_EVERY_MS - Date.now());
-  refreshTimer = setTimeout(() => {
-    refreshTimer = null;
-    lastRefresh = Date.now();
-    void refreshInPlace();
+  if (refreshTimer[pane]) return;
+  const wait = Math.max(0, lastRefresh[pane] + REFRESH_EVERY_MS - Date.now());
+  refreshTimer[pane] = setTimeout(() => {
+    refreshTimer[pane] = null;
+    lastRefresh[pane] = Date.now();
+    void refreshInPlace(pane);
   }, wait);
 }
 
-/** Install once (Explorer): listing refresh while jobs touch the visible folder, and completion toasts. */
+/** Did this finished job move or delete the folder a pane shows, or one of its ancestors? */
+function movedViewFolder(job: Job, pane: PaneId): boolean {
+  if (job.kind !== "move" && job.kind !== "delete") return false;
+  const { bucket, prefix } = getPane(pane);
+  const req = jobRequest(job.id);
+  if (!bucket || !prefix || !req || req.srcBucket !== bucket) return false;
+  return req.items.some((it) => it.isPrefix && prefix.startsWith(it.from));
+}
+
+/**
+ * After a move or delete took a pane's folder away (its refreshed listing is empty): open the
+ * nearest ancestor that still holds something (else the bucket root), with a toast. A folder that
+ * still has content (failed items stay) is left alone.
+ */
+async function leaveVanishedFolder(pane: PaneId) {
+  const { bucket, prefix, listing } = getPane(pane);
+  if (!bucket || !prefix || listing.loading || listing.error || listing.folders.length || listing.objects.length) return;
+  let at = parentPrefix(prefix);
+  while (at) {
+    try {
+      const page = await api.listObjects(bucket, at, null, 1);
+      if (page.folders.length || page.objects.length || page.isTruncated) break;
+    } catch {
+      break;
+    }
+    at = parentPrefix(at);
+  }
+  const now = getPane(pane);
+  if (now.bucket !== bucket || now.prefix !== prefix) return; // the user moved on meanwhile
+  navigate(bucket, at, pane);
+  toast.info("This folder no longer exists", `${s3Uri(bucket, prefix)} was moved or deleted. Showing ${s3Uri(bucket, at)} instead.`);
+}
+
+/** Install once (Explorer): refresh of every pane whose folder a job touches, and completion toasts. */
 export function installJobEffects(): () => void {
   const off = onJobUpdate((j, prev) => {
     const finished = !isJobActive(j) && (!prev || isJobActive(prev));
@@ -439,13 +511,20 @@ export function installJobEffects(): () => void {
         notifyInBackground(`${KIND_VERB[j.kind].present} ${j.status === "failed" ? "failed" : "finished"}`, j.label);
       }
     }
-    if (!touchesView(j)) return;
-    if (finished) scheduleRefresh(true);
-    else if (j.status === "running" && j.phase === "working" && (!prev || prev.doneItems !== j.doneItems)) scheduleRefresh(false);
+    for (const pane of PANE_IDS) {
+      if (!touchesView(j, pane)) continue;
+      if (finished) {
+        // Only a job that moved or deleted something can have taken the folder away.
+        const vanished = j.doneItems > 0 && movedViewFolder(j, pane);
+        const done = scheduleRefresh(true, pane);
+        if (vanished && done) void done.then(() => leaveVanishedFolder(pane));
+      } else if (j.status === "running" && j.phase === "working" && (!prev || prev.doneItems !== j.doneItems)) {
+        scheduleRefresh(false, pane);
+      }
+    }
   });
   return () => {
     off();
-    if (refreshTimer) clearTimeout(refreshTimer);
-    refreshTimer = null;
+    for (const pane of PANE_IDS) clearRefreshTimer(pane);
   };
 }

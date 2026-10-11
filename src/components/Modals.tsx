@@ -2,7 +2,7 @@ import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type FormE
 import { AlertCircle, AlertTriangle, ArrowRight, ClipboardPaste, FolderPlus, Loader2, LogOut, PencilLine, RotateCw, Trash2 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ConflictPolicy, JobPreview, JobRequest } from "../lib/types";
-import { BUCKETLESS_MODALS, disconnect, openModal, useApp, type RenameTarget } from "../store/app";
+import { BUCKETLESS_MODALS, disconnect, openModal, useApp, usePane, type RenameTarget } from "../store/app";
 import { isDenied, permissionText } from "../store/toasts";
 import { AddBucketModal, RemoveBucketModal } from "./BucketDialogs";
 import { createFolder } from "../store/actions";
@@ -60,7 +60,11 @@ export function ModalShell({
       requestAnimationFrame(() => {
         if (el?.isConnected) return;
         if (opener && opener.isConnected && opener !== document.body) opener.focus();
-        else document.querySelector<HTMLElement>(".tbody")?.focus();
+        else {
+          // The active pane's table (never the first table on the page: that could be the other pane).
+          const pane = document.querySelector<HTMLElement>(`[data-pane="${useApp.getState().activePane}"]`);
+          (pane?.querySelector<HTMLElement>(".tbody") ?? pane)?.focus();
+        }
       });
     };
   }, [opener]);
@@ -104,9 +108,8 @@ export function ModalShell({
   );
 }
 
-function NewFolderModal() {
-  const bucket = useApp((s) => s.bucket)!;
-  const prefix = useApp((s) => s.prefix);
+/** `bucket`/`prefix`: the folder the dialog was opened for, captured then. */
+function NewFolderModal({ bucket, prefix }: { bucket: string; prefix: string }) {
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
   const [touched, setTouched] = useState(false);
@@ -119,7 +122,7 @@ function NewFolderModal() {
     setTouched(true);
     if (error || busy) return;
     setBusy(true);
-    const ok = await createFolder(name);
+    const ok = await createFolder(name, bucket, prefix);
     setBusy(false);
     if (ok) close();
   };
@@ -364,8 +367,8 @@ function RenameModal({ target }: { target: RenameTarget }) {
   const close = () => openModal(null);
 
   // Names of the same kind already loaded in this folder (the preview is the authority).
-  const listing = useApp((s) => s.listing);
-  const viewing = useApp((s) => s.bucket === bucket && s.prefix === parent);
+  const listing = usePane((s) => s.listing);
+  const viewing = usePane((s) => s.bucket === bucket && s.prefix === parent);
   const existing = useMemo(
     () => new Set(viewing ? (isPrefix ? listing.folders.map((f) => f.name) : listing.objects.map((o) => o.name)) : []),
     [viewing, isPrefix, listing],
@@ -692,10 +695,12 @@ export function Modals() {
 
 function ModalSwitch() {
   const modal = useApp((s) => s.modal);
-  const bucket = useApp((s) => s.bucket);
+  const bucket = usePane((s) => s.bucket);
   if (!modal) return null;
-  // Most dialogs act on the open bucket; these don't need one.
-  if (!bucket && !BUCKETLESS_MODALS.has(modal.kind)) return null;
+  // Most dialogs act on the open bucket; these don't need one. A dialog that names its own bucket
+  // (a drop into the other pane, for one) is shown whatever the active pane holds.
+  const own = "bucket" in modal ? modal.bucket : null;
+  if (!own && !bucket && !BUCKETLESS_MODALS.has(modal.kind)) return null;
   switch (modal.kind) {
     case "addBucket":
       return <AddBucketModal />;
@@ -744,7 +749,7 @@ function ModalSwitch() {
         </Suspense>
       );
     case "newFolder":
-      return <NewFolderModal />;
+      return <NewFolderModal bucket={modal.bucket} prefix={modal.prefix} />;
     case "delete":
       return <DeleteModal request={modal.request} />;
     case "rename":
