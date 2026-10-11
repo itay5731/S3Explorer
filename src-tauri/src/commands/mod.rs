@@ -4,6 +4,7 @@ pub mod batches;
 pub mod browse;
 pub mod buckets;
 pub mod connection;
+pub mod files;
 pub mod folders;
 pub mod jobs;
 pub mod lifecycle;

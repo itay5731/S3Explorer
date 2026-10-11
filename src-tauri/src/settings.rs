@@ -149,7 +149,8 @@ mod tests {
                 "textWeight": 400,
                 "accent": "yellow",
                 "confirmCopyMove": true,
-                "fileManagerCommand": null
+                "fileManagerCommand": null,
+                "keybindings": {}
             })
         );
         assert!(d.validate().is_ok());
@@ -192,6 +193,7 @@ mod tests {
         o.entry("accent").or_insert(json!("yellow"));
         o.entry("confirmCopyMove").or_insert(json!(true));
         o.entry("fileManagerCommand").or_insert(serde_json::Value::Null);
+        o.entry("keybindings").or_insert(json!({}));
         v
     }
 
@@ -232,7 +234,7 @@ mod tests {
     #[test]
     fn strict_parse_theme_and_update_flag() {
         let base =
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null});
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -373,6 +375,94 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_field() {
+        use std::collections::BTreeMap;
+        let with = |value: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match value {
+                Some(value) => o.insert("keybindings".into(), value),
+                None => o.remove("keybindings"),
+            };
+            v
+        };
+        let map = |pairs: &[(&str, &[&str])]| -> BTreeMap<String, Vec<String>> {
+            pairs.iter().map(|(k, c)| (k.to_string(), c.iter().map(|c| c.to_string()).collect())).collect()
+        };
+        assert!(AppSettings::default().keybindings.is_empty());
+
+        // Valid, including an empty array (unbind) and an unknown id.
+        let ok = json!({"refresh": ["Mod+R", "F5"], "search.focus": [], "future_action-2": ["/"]});
+        let got = AppSettings::from_json_strict(&with(Some(ok.clone()))).expect("valid");
+        let want = map(&[("refresh", &["Mod+R", "F5"]), ("search.focus", &[]), ("future_action-2", &["/"])]);
+        assert_eq!(got.keybindings, want);
+        assert_eq!(AppSettings::from_json_lenient(&with(Some(ok))).keybindings, want);
+
+        // Limits at the boundary.
+        let many = |n: usize| serde_json::Value::Object((0..n).map(|i| (format!("a{i}"), json!(["F1"]))).collect());
+        let id64 = "i".repeat(64);
+        let chord40 = "c".repeat(40);
+        let boundary = [
+            many(200),
+            json!({ id64.clone(): ["F1"] }),
+            json!({"x": ["F1", "F2", "F3", "F4"]}),
+            json!({"x": [chord40.clone()]}),
+            json!({"x": [" ~"]}),
+        ];
+        for v in boundary {
+            let got = AppSettings::from_json_strict(&with(Some(v.clone()))).unwrap_or_else(|e| panic!("{v}: {}", e.message));
+            assert!(got.validate().is_ok());
+        }
+        let bad = [
+            many(201),
+            json!({ format!("{id64}i"): ["F1"] }),
+            json!({"": ["F1"]}),
+            json!({"has space": ["F1"]}),
+            json!({"a/b": ["F1"]}),
+            json!({"é": ["F1"]}),
+            json!({"x": ["F1", "F2", "F3", "F4", "F5"]}),
+            json!({"x": [format!("{chord40}c")]}),
+            json!({"x": [""]}),
+            json!({"x": ["Ctrl+é"]}),
+            json!({"x": ["Ctrl+\u{7f}"]}),
+            json!({"x": ["a\tb"]}),
+            json!({"x": "F1"}),
+            json!({"x": [1]}),
+            json!({"x": null}),
+            json!(["F1"]),
+            json!("x"),
+            serde_json::Value::Null,
+        ];
+        for b in bad {
+            let v = with(Some(b.clone()));
+            let e = AppSettings::from_json_strict(&v).expect_err(&b.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with("keybindings"), "{b} -> {}", e.message);
+            // Leniently: only this field falls back to no overrides.
+            assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{b}");
+        }
+
+        // update_settings requires it; the on-disk file without it loads {}.
+        let e = AppSettings::from_json_strict(&with(None)).expect_err("missing");
+        assert!(e.message.starts_with("keybindings"), "{}", e.message);
+        assert_eq!(AppSettings::from_json_lenient(&with(None)), AppSettings::default());
+
+        // validate() / sanitized() on the in-memory value.
+        let too_many_chords = AppSettings { keybindings: map(&[("x", &["1", "2", "3", "4", "5"])]), ..AppSettings::default() };
+        assert!(err_msg(too_many_chords.validate()).starts_with("keybindings"));
+        assert!(too_many_chords.sanitized().keybindings.is_empty());
+
+        // Round trip through the settings file.
+        let dir = temp_dir("keybindings");
+        let path = dir.join(SETTINGS_FILE);
+        let saved = AppSettings { keybindings: want.clone(), ..AppSettings::default() };
+        save(&path, &saved).expect("save");
+        assert!(std::fs::read_to_string(&path).expect("read").contains("\"keybindings\""));
+        assert_eq!(load(&path), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn confirm_copy_move_flag() {
         let with = |flag: Option<serde_json::Value>| {
             let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
@@ -439,6 +529,7 @@ mod tests {
                 accent: AccentColor::Blue,
                 confirm_copy_move: true,
                 file_manager_command: None,
+                keybindings: Default::default(),
             }
         );
         // Saved again, the file carries the new field.
@@ -494,6 +585,7 @@ mod tests {
                 accent: AccentColor::Yellow,
                 confirm_copy_move: true,
                 file_manager_command: None,
+                keybindings: Default::default(),
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
@@ -522,6 +614,7 @@ mod tests {
                     accent: AccentColor::Yellow,
                     confirm_copy_move: true,
                     file_manager_command: None,
+                    keybindings: Default::default(),
                 },
             ),
             // Non-boolean flag: only the flag falls back.

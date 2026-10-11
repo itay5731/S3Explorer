@@ -163,6 +163,8 @@ pub fn run() {
             commands::transfers::open_local,
             commands::transfers::reveal_local,
             commands::transfers::try_file_manager,
+            commands::files::write_text_file,
+            commands::files::read_text_file,
         ])
         .run(context)
         .expect("error while running tauri application");

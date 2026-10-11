@@ -1,6 +1,6 @@
 //! Wire types. Mirrors `src/lib/types.ts` exactly (camelCase JSON).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -314,7 +314,17 @@ pub struct AppSettings {
     /// manager (see `file_manager.rs`); `None` = the system file manager.
     #[serde(default)]
     pub file_manager_command: Option<String>,
+    /// v0.7.0: keyboard binding overrides, action id -> chords (an empty list unbinds). Only
+    /// actions whose chords differ from the frontend defaults; unknown ids are kept.
+    #[serde(default)]
+    pub keybindings: BTreeMap<String, Vec<String>>,
 }
+
+/// Limits on `keybindings` (mirror `KEYBINDING_LIMITS` in `types.ts`).
+pub const KEYBINDINGS_MAX_ACTIONS: usize = 200;
+pub const KEYBINDING_ID_MAX_CHARS: usize = 64;
+pub const KEYBINDING_MAX_CHORDS: usize = 4;
+pub const KEYBINDING_CHORD_MAX_CHARS: usize = 40;
 
 /// Longest accepted `fileManagerCommand`, in characters.
 pub const FILE_MANAGER_COMMAND_MAX: usize = 1024;
@@ -367,6 +377,7 @@ impl Default for AppSettings {
             accent: AccentColor::Yellow,
             confirm_copy_move: default_confirm_copy_move(),
             file_manager_command: None,
+            keybindings: BTreeMap::new(),
         }
     }
 }
@@ -431,6 +442,61 @@ pub fn normalize_file_manager_command(v: Option<&str>) -> crate::error::AppResul
     Ok(Some(t.to_string()))
 }
 
+fn keybindings_error(detail: impl std::fmt::Display) -> crate::error::AppError {
+    crate::error::AppError::invalid(format!("keybindings {detail}"))
+}
+
+/// Checks the `keybindings` limits; `InvalidInput` starting with "keybindings" naming the rule.
+pub fn validate_keybindings(map: &BTreeMap<String, Vec<String>>) -> crate::error::AppResult<()> {
+    if map.len() > KEYBINDINGS_MAX_ACTIONS {
+        return Err(keybindings_error(format_args!("may hold at most {KEYBINDINGS_MAX_ACTIONS} actions")));
+    }
+    for (id, chords) in map {
+        let id_ok = (1..=KEYBINDING_ID_MAX_CHARS).contains(&id.len())
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+        if !id_ok {
+            return Err(keybindings_error(format_args!(
+                "action ids must be 1 to {KEYBINDING_ID_MAX_CHARS} characters of A-Z, a-z, 0-9, '_', '.' or '-'"
+            )));
+        }
+        if chords.len() > KEYBINDING_MAX_CHORDS {
+            return Err(keybindings_error(format_args!(
+                "may hold at most {KEYBINDING_MAX_CHORDS} chords per action ({id})"
+            )));
+        }
+        for chord in chords {
+            let ok = (1..=KEYBINDING_CHORD_MAX_CHARS).contains(&chord.len())
+                && chord.bytes().all(|b| (0x20..=0x7e).contains(&b));
+            if !ok {
+                return Err(keybindings_error(format_args!(
+                    "chords must be 1 to {KEYBINDING_CHORD_MAX_CHARS} printable ASCII characters ({id})"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Strict parse of a `keybindings` JSON value: an object of arrays of strings, within the limits.
+fn keybindings_from_json(v: Option<&serde_json::Value>) -> crate::error::AppResult<BTreeMap<String, Vec<String>>> {
+    let shape = || keybindings_error("must be an object mapping action ids to arrays of chord strings");
+    let obj = v.and_then(serde_json::Value::as_object).ok_or_else(shape)?;
+    if obj.len() > KEYBINDINGS_MAX_ACTIONS {
+        return Err(keybindings_error(format_args!("may hold at most {KEYBINDINGS_MAX_ACTIONS} actions")));
+    }
+    let mut map = BTreeMap::new();
+    for (id, chords) in obj {
+        let arr = chords.as_array().ok_or_else(shape)?;
+        let chords = arr
+            .iter()
+            .map(|c| c.as_str().map(str::to_string).ok_or_else(shape))
+            .collect::<crate::error::AppResult<Vec<_>>>()?;
+        map.insert(id.clone(), chords);
+    }
+    validate_keybindings(&map)?;
+    Ok(map)
+}
+
 fn accent_error() -> crate::error::AppError {
     crate::error::AppError::invalid(r#"accent must be "yellow", "green", "blue" or "red""#)
 }
@@ -482,6 +548,7 @@ impl AppSettings {
         if normalize_file_manager_command(self.file_manager_command.as_deref())? != self.file_manager_command {
             return Err(file_manager_error());
         }
+        validate_keybindings(&self.keybindings)?;
         Ok(())
     }
 
@@ -503,6 +570,7 @@ impl AppSettings {
             text_size: if text_size_ok(self.text_size) { self.text_size } else { d.text_size },
             text_weight: if text_weight_ok(self.text_weight) { self.text_weight } else { d.text_weight },
             file_manager_command: normalize_file_manager_command(self.file_manager_command.as_deref()).unwrap_or(None),
+            keybindings: if validate_keybindings(&self.keybindings).is_ok() { self.keybindings } else { d.keybindings },
             ..self
         }
     }
@@ -559,11 +627,14 @@ impl AppSettings {
                 .get("fileManagerCommand")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|c| normalize_file_manager_command(Some(c)).ok().flatten()),
+            // Missing or malformed (any rule broken) -> no overrides.
+            keybindings: keybindings_from_json(obj.get("keybindings")).unwrap_or_default(),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all eleven fields must be present
-    /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`). Transfer
+    /// Strict parse of the `update_settings` argument: all twelve fields must be present
+    /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`; `keybindings` an
+    /// object of chord arrays within [`validate_keybindings`]'s limits). Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
     /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
     /// `notifyOnFinish` and `confirmCopyMove` booleans. Anything else is
@@ -614,6 +685,7 @@ impl AppSettings {
                 }
                 _ => return Err(file_manager_error()),
             },
+            keybindings: keybindings_from_json(obj.get("keybindings"))?,
         };
         s.validate()?;
         Ok(s)
