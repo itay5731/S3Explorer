@@ -1345,8 +1345,9 @@ Frontend only. No new command, type or event; copy and move between panes use th
 - `Tab` while focus is in a pane's table (or results list) moves focus and activity to the other pane and
   restores its focused row; `Shift+Tab` goes back. Everything else about `Tab` is unchanged.
 - Closing the split keeps the **active** pane and drops the other. Disconnecting resets both panes; the
-  split preference stays. Below a main-area width of 760 px the second pane is hidden (not closed) and a
-  note in the toolbar button's tooltip says why.
+  split preference stays. Below a main-area width of 560 px the second pane is hidden (not closed) and a
+  note in the toolbar button's tooltip says why; at the default window size with the details panel open
+  (about 748 px) both panes must be visible, with each pane's columns adapting to its own width.
 
 ### Copy and move between panes
 
@@ -1376,9 +1377,14 @@ Pane state (`bucket`, `prefix`, `listing`, `selection`, `anchor`, `focus`, `sort
 React context; the existing exported actions (`navigate`, `setSelection`, `setFilter`, `getSelected`,
 `refresh`, `loadMore`, `revealObject`, search run/close …) keep their signatures and act on the active
 pane, with an optional explicit pane parameter where a caller needs the other one (drag drop, F5/F6,
-"go to" from Activity). `useApp` consumers of pane fields become pane-store consumers. The mock needs no
-change. The invariants that already hold per listing (selection pruned by filter, `reveal` cleared on
+"go to" from Activity). `useApp` consumers of pane fields become pane-store consumers. The mock changes only to pass the
+pointer position of a simulated OS file drop (`FileDropEvent.position`, filled from Tauri's drag-drop payload in the real app). The invariants that already hold per listing (selection pruned by filter, `reveal` cleared on
 user selection, results closed on navigation) hold per pane.
+
+Settled after the first implementation: the Split button is one toggle with a pressed state (lucide has a single
+columns icon); the search scope control is shared by both panes while results, selection and filter are per pane;
+after a reconnect with the split remembered, opening a bucket while the other pane is empty opens the same place
+in both panes.
 
 ### Verification specific to this version
 
