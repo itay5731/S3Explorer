@@ -1539,6 +1539,13 @@ export const KEYBINDING_LIMITS = { maxActions: 200, idMaxChars: 64, maxChordsPer
 at most 4 chords per id; each chord 1..=40 printable ASCII chars; a `settings.json` without the field
 loads `{}`.
 
+#### Profiles from `aws login`
+
+A profile whose only credential key is `login_session` (written by `aws login`, AWS CLI 2.32+) counts as
+`hasCredentials: true`. The SDK's `credentials-login` provider resolves and refreshes it from
+`~/.aws/login/cache`; an expired session surfaces as an `Auth` error whose message tells the user to run
+`aws login` again.
+
 #### IAM permissions added in this version
 
 None.

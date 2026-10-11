@@ -13,6 +13,7 @@ The section for a version becomes the text of its GitHub Release.
 
 ### Fixed
 
+- **Profiles signed in with `aws login` were shown as having no credentials.** The AWS CLI's newer `aws login` command (2.32+) stores a `login_session` in the profile instead of keys; the app now recognises it and uses the signed-in session, refreshing it as the CLI does.
 - **`F5` reloaded the whole window.** It now refreshes the folder, like the Refresh button, and no key can reload the app any more.
 
 ## [0.6.0] - 2026-10-08

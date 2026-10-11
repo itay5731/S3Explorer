@@ -59,7 +59,9 @@ pub fn merge_profiles(config_text: &str, credentials_text: &str) -> Vec<ProfileI
             || kv.contains_key("sso_account_id")
             || kv.contains_key("credential_process")
             || kv.contains_key("role_arn")
-            || kv.contains_key("web_identity_token_file");
+            || kv.contains_key("web_identity_token_file")
+            // `aws login` (CLI 2.32+) writes a login_session; the SDK resolves it from ~/.aws/login/cache.
+            || kv.contains_key("login_session");
         let entry = merged.entry(name.clone()).or_insert(ProfileInfo { name, region: None, has_credentials: false });
         if let Some(r) = kv.get("region").filter(|r| !r.is_empty()) {
             entry.region = Some(r.clone());
@@ -119,16 +121,19 @@ mod tests {
 
     #[test]
     fn merges() {
-        let config = "[default]\nregion = eu-west-1\n\n[profile dev]\nsso_session = x\nregion=us-east-2\n[sso-session x]\nsso_region = us-east-1\n[profile nocreds]\nregion = ap-south-1\ns3 =\n  endpoint_url = http://x\n";
+        let config = "[default]\nregion = eu-west-1\n\n[profile dev]\nsso_session = x\nregion=us-east-2\n[sso-session x]\nsso_region = us-east-1\n[profile nocreds]\nregion = ap-south-1\ns3 =\n  endpoint_url = http://x\n[profile signedin]\nlogin_session = arn:aws:iam::123456789012:user/Admin\nregion = us-east-1\n";
         let creds = "[default]\naws_access_key_id = A\naws_secret_access_key = B\n[other]\naws_access_key_id=C\n";
         let p = merge_profiles(config, creds);
         let names: Vec<_> = p.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["default", "dev", "nocreds", "other"]);
+        assert_eq!(names, vec!["default", "dev", "nocreds", "other", "signedin"]);
         assert_eq!(p[0].region.as_deref(), Some("eu-west-1"));
         assert!(p[0].has_credentials);
         assert!(p[1].has_credentials);
         assert!(!p[2].has_credentials);
         assert_eq!(p[3].region, None);
         assert!(p[3].has_credentials);
+        // A profile created by `aws login` has credentials even though it holds no key or SSO fields.
+        assert!(p[4].has_credentials);
+        assert_eq!(p[4].region.as_deref(), Some("us-east-1"));
     }
 }
