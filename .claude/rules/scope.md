@@ -43,7 +43,9 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     user-chosen program (`{path}` / `{dir}` placeholders, no shell).
 
 26. (v0.7.0) Two explorer panes side by side on one connection, with copy and move between them by
-    drag and drop, F5/F6 and the context menu (see "v0.7.0 additions" in `docs/CONTRACT.md`).
+    drag and drop, keyboard and the context menu (see "v0.7.0 additions" in `docs/CONTRACT.md`).
+27. (v0.7.0) Every action has a keyboard binding, all rebindable in Settings → Keyboard with export/import to a
+    file; search runs as you type; type-to-search from the file list; per-pane back/forward history.
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

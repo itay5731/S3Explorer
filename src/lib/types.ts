@@ -139,6 +139,11 @@ export interface AppSettings extends TransferSettings {
    * (see "File manager override" in docs/CONTRACT.md); null = the system file manager.
    */
   fileManagerCommand: string | null;
+  /**
+   * v0.7.0: keyboard binding overrides, action id → chords (e.g. "Mod+R"); only actions that differ
+   * from the defaults (see "Keyboard" in docs/CONTRACT.md). Default {}.
+   */
+  keybindings: Record<string, string[]>;
 }
 
 /** Ranges and slider steps for the text settings (the backend enforces the same ranges). */
@@ -157,6 +162,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   accent: "yellow",
   confirmCopyMove: true,
   fileManagerCommand: null,
+  keybindings: {},
 };
 
 // Saved connections
@@ -464,6 +470,15 @@ export interface SearchResult {
 }
 
 export const FILE_MANAGER_COMMAND_MAX = 1024;
+
+/** Limits for `AppSettings.keybindings` and the export/import file (see "Keyboard" in docs/CONTRACT.md). */
+export const KEYBINDING_LIMITS = {
+  maxActions: 200,
+  idMaxChars: 64,
+  maxChordsPerAction: 4,
+  chordMaxChars: 40,
+  fileMaxBytes: 65_536,
+} as const;
 
 export const SEARCH_LIMITS = {
   /** Keys scanned per search before the result is truncated. */

@@ -1330,7 +1330,7 @@ Frontend only. No new command, type or event; copy and move between panes use th
 - The main area can show **one or two explorer panes side by side**, each with its own bucket, folder,
   listing, sort, filter, selection, scroll position and search results, on the **same connection** (two
   connections at once are out of scope). A toolbar button (**Split**, icon `Columns2`) and `Ctrl+2`
-  open the second pane; the same button (**Single**) and `Ctrl+1` close it. The choice persists
+  open the second pane; the same button (**Single**) and `Ctrl+1` close it (`Mod+1`/`Mod+2` in the keyboard registry). The choice persists
   (`s3x.split`). The second pane opens at the first pane's bucket and folder.
 - Exactly one pane is **active** at any time: the last one clicked, focused or navigated. The active pane
   has a visible marker (its path bar and table border take the accent; the other pane is dimmed slightly).
@@ -1351,7 +1351,7 @@ Frontend only. No new command, type or event; copy and move between panes use th
 
 ### Copy and move between panes
 
-- In split view the toolbar gains **Copy to other pane** (`F5`) and **Move to other pane** (`F6`),
+- In split view the toolbar gains **Copy to other pane** and **Move to other pane** (default keys `Mod+Shift+C` / `Mod+Shift+X`, see "Keyboard" below; `F5`/`F6` were the first choice and were dropped because `F5` is Refresh),
   enabled when the active pane has a selection and the other pane shows a bucket. The row context menu
   gets the same two items. Both call the existing paste flow with the selection of the active pane as the
   source and the other pane's bucket + folder as the destination: the same preview, the same conflict
@@ -1398,3 +1398,147 @@ same-pane drag rules unchanged; OS-file drop uploading into the pane under the p
 open in one pane while the other browses; closing the split keeping the active pane; disconnect resetting
 both; keyboard shortcuts (`Delete`, `F2`, `Ctrl+C/X/V`, `Backspace`, `Ctrl+F`) applying to the active
 pane; no transfer-progress re-renders of either table.
+
+### Keyboard: configurable bindings, search as you type, no mouse needed
+
+Also in v0.7.0. Backend: one settings field and two file commands. Frontend: one key dispatcher that
+replaces the scattered `keydown` handlers, a Keyboard tab in Settings, search debounce, type-to-search,
+and per-pane history.
+
+#### Chords and actions
+
+A **chord** is written `Mod+Shift+K`: zero or more modifiers from `Mod`, `Ctrl`, `Alt`, `Shift`, `Meta`
+in that order, then one key name. `Mod` means `Ctrl` on Windows and Linux and `Cmd` (`Meta`) on macOS, and
+is what defaults and exported files use so they stay portable; `Ctrl` and `Meta` are literal. Key names
+are `KeyboardEvent.key` normalised: letters upper-case (`K`), digits, `F1`..`F24`, `Enter`, `Escape`,
+`Backspace`, `Delete`, `Insert`, `Tab`, `Space`, `ArrowUp/Down/Left/Right`, `Home`, `End`, `PageUp`,
+`PageDown`, and punctuation as typed (`/`, `?`, `,`, `.`, `\`, `[`, `]`). Display uses the platform's
+symbols on macOS (⌘ ⌥ ⇧ ⌃) and words elsewhere.
+
+Every action has an id, a label, a group, a **context** and a list of default chords (at most 4 chords per
+action). Contexts decide where a chord fires:
+
+| Context | Fires when |
+|---|---|
+| `global` | anywhere in the explorer except inside a text field, unless the chord has `Mod`, `Alt` or is an F-key; never while a dialog, context menu or Settings is open (except `settings.open`, `help.shortcuts` and `escape`) |
+| `files` | focus is in a pane's table or results list (the active pane) |
+| `search` | focus is in the toolbar search box |
+
+Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of truth; this table must match it):
+
+| Group / action id | Label | Context | Defaults |
+|---|---|---|---|
+| **Navigate** `nav.open` | Open folder / go to object | files | `Enter` |
+| `nav.up` | Up one level | global | `Backspace`, `Alt+ArrowUp` |
+| `nav.back` / `nav.forward` | Back / Forward (per-pane history) | global | `Alt+ArrowLeft` / `Alt+ArrowRight` |
+| `nav.root` | Bucket root | global | `Mod+Home` |
+| `nav.refresh` | Refresh | global | `F5`, `Mod+R` |
+| `nav.focusFiles` | Focus the file list | global | `Mod+E` |
+| `nav.focusBuckets` | Focus the bucket list | global | `Mod+B` |
+| `nav.focusSearch` | Search | global | `Mod+F`, `/` |
+| `nav.searchScope` | Toggle search scope (this folder / whole bucket) | global | `Mod+Shift+F` |
+| `nav.nextPane` / `nav.prevPane` | Next / previous pane | files | `Tab` / `Shift+Tab` |
+| `view.single` / `view.split` | Single view / Split view | global | `Mod+1` / `Mod+2` |
+| `view.details` | Toggle details panel | global | `Mod+I` |
+| `view.activity` | Toggle Activity panel | global | `Mod+J` |
+| `view.settings` | Settings | global | `Mod+,` |
+| `help.shortcuts` | Keyboard shortcuts (cheat sheet) | global | `F1`, `?` |
+| **Select** `sel.up` / `sel.down` | Move focus up / down | files | `ArrowUp` / `ArrowDown` |
+| `sel.pageUp` / `sel.pageDown` | Page up / down | files | `PageUp` / `PageDown` |
+| `sel.first` / `sel.last` | First / last row | files | `Home` / `End` |
+| `sel.toggle` | Toggle selection of the focused row | files | `Space` |
+| `sel.toggleNext` | Toggle and move down | files | `Insert` |
+| `sel.all` | Select all | files | `Mod+A` |
+| `sel.none` | Clear selection (or close results) | files | `Escape` |
+| `sel.menu` | Context menu | files | `ContextMenu`, `Shift+F10` |
+| **Act** `act.upload` | Upload files | global | `Mod+U` |
+| `act.uploadFolder` | Upload folder | global | `Mod+Shift+U` |
+| `act.download` | Download (objects or folders) | global | `Mod+D` |
+| `act.newFolder` | New folder | global | `F7` |
+| `act.delete` | Delete | files | `Delete`, `F8` |
+| `act.rename` | Rename | files | `F2` |
+| `act.copy` / `act.cut` / `act.paste` | Copy / Cut / Paste (in-app clipboard) | files | `Mod+C` / `Mod+X` / `Mod+V` |
+| `act.copyToOther` / `act.moveToOther` | Copy / Move to other pane | global | `Mod+Shift+C` / `Mod+Shift+X` |
+| `act.copyKey` | Copy key | files | `Mod+Shift+K` |
+| `act.copyUri` | Copy S3 URI | files | `Mod+Shift+L` |
+| `act.tags` | Tags | files | `Mod+T` |
+| `act.versions` | Show versions (details panel, Versions section) | files | `Mod+Shift+V` |
+| `act.restore` | Restore archived | files | (none) |
+| `act.disconnect` | Disconnect | global | `Mod+Shift+Q` |
+
+`Shift` held with `sel.up/down/pageUp/pageDown/first/last` extends the selection (a fixed rule, not a
+separate binding). **`F5` and `F6` are no longer Copy/Move to other pane**; `F5` refreshes the active pane
+exactly like the Refresh button (fixes the "F5 reloads the window" bug). The webview's own reload, print,
+find and view-source shortcuts (`F5`, `Ctrl+F5`, `Ctrl+Shift+R`, `Ctrl+R`, `Ctrl+P`, `Ctrl+U`,
+`Ctrl+F`, `F3`, `F7`, `F12`-less) are always prevented at the window level, whether or not a binding
+uses them, so no key can ever reload or leave the page.
+
+#### Dispatcher rules
+
+- One capture-phase `keydown` listener in `Explorer.tsx` builds the chord from the event, finds the
+  action bound to it in the current context, calls `preventDefault()` and runs it. Handlers in
+  `ObjectTable.tsx`, `SearchResults.tsx`, `Toolbar.tsx`, `Sidebar.tsx` and `Explorer.tsx` that
+  hard-code keys are removed in favour of the registry (dialogs, menus, the game and the connect screen
+  keep their own local keys).
+- A chord bound in `files` wins over the same chord in `global` when focus is in the file list.
+- An action that is not available right now (no selection, no bucket, no other pane, archived object)
+  does nothing and shows the same disabled reason the toolbar shows, as a toast, when the key has no
+  other meaning.
+- **Type to search:** a printable character typed in the file list with no modifier (or only `Shift`)
+  that is not bound to an action focuses the search box with that character typed, so searching starts
+  without `Mod+F`.
+- `Escape` in the search box clears it and returns focus to the active pane's list (unchanged).
+
+#### Search as you type
+
+- The toolbar box runs the bucket search **500 ms after the last keystroke** when the text is non-empty,
+  instead of waiting for `Enter`; `Enter` still runs it immediately. Typing more cancels the running
+  search (existing `searchId` rule) and schedules a new one. During the 500 ms the instant row filter
+  still applies as today. Clearing the box closes the results and cancels. The hint says "searches as
+  you type". Results keep focus where it was: the box keeps focus while typing; `ArrowDown` or `Enter`
+  from the box moves focus to the first result row.
+
+#### History
+
+Each pane keeps a history of `{bucket, prefix}` it navigated to (cap 100), browser-style: `nav.back`
+and `nav.forward` move through it; a new navigation truncates the forward list. The sidebar's bucket
+click, breadcrumbs, `nav.up`, `nav.open`, "Go to …" and reveals all push; Back/Forward do not. History is
+per pane and cleared on disconnect.
+
+#### Settings → Keyboard
+
+- Lists every action by group with its chords as removable chips, a **Record** button per action (press
+  the chord; `Escape` cancels; shows the chord live), a per-action **Reset**, **Reset all**, and
+  **Export…** / **Import…**.
+- A chord may be bound to only one action per context (`files` and `global` count as the same context for
+  this check, since `files` wins silently otherwise); a conflict is shown inline on both actions and Save is
+  disabled until resolved. A chord that is only a printable character without modifiers is allowed (like
+  `/` and `?`) but shown with a note that it disables type-to-search for that character. `Tab` without
+  modifiers can only be bound to pane switching.
+- Saved in `AppSettings.keybindings` as **overrides only**: `{ "<action id>": ["Mod+R", "F5"] }` for
+  actions whose chords differ from the defaults (an empty array unbinds). Unknown action ids are kept
+  (a newer version may know them) but shown under "Unknown actions" with a Remove button.
+- **Export** writes `{ "s3explorer": "keybindings", "version": 1, "bindings": { <every action id>: [chords] } }`
+  (all actions, not only overrides) to a `.json` file the user picks with the save dialog.
+  **Import** reads such a file, validates it (ids, chord syntax, limits), shows a preview of what changes
+  and what is unknown, and applies on confirm (as overrides vs the defaults). Both go through the backend
+  commands below; the frontend never touches the file system directly.
+
+```ts
+// AppSettings (v0.7.0)
+keybindings: Record<string, string[]>;   // overrides only; default {}
+export const KEYBINDING_LIMITS = { maxActions: 200, idMaxChars: 64, maxChordsPerAction: 4, chordMaxChars: 40, fileMaxBytes: 65_536 } as const;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `write_text_file` | `{ path, content }` | `void`. Writes `content` (UTF-8, at most 65,536 bytes) to `path`, which must be absolute, end in `.json`, and whose parent directory must exist; overwrites. Used by Export after the save dialog. `InvalidInput` otherwise, `Io` on failure. |
+| `read_text_file` | `{ path }` | `string`. Reads an absolute `.json` path of at most 65,536 bytes as UTF-8 (`InvalidInput` for anything else, including a larger file). Used by Import after the open dialog. |
+
+`update_settings` validates `keybindings`: at most 200 entries; ids 1..=64 chars of `[A-Za-z0-9_.-]`;
+at most 4 chords per id; each chord 1..=40 printable ASCII chars; a `settings.json` without the field
+loads `{}`.
+
+#### IAM permissions added in this version
+
+None.
