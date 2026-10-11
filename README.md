@@ -29,10 +29,12 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 
 ## What it does
 
-- **Connect** with an AWS profile from `~/.aws`, or with access keys. A custom endpoint makes it work with MinIO, Cloudflare R2, SeaweedFS, LocalStack and friends.
+- **Connect** with an AWS profile from `~/.aws` (including profiles signed in with `aws sso login` or the newer `aws login`), or with access keys. A custom endpoint makes it work with MinIO, Cloudflare R2, SeaweedFS, LocalStack and friends.
 - **List buckets**, including buckets in other regions. A bucket shared with you from another account can be added by name, `s3://` address or ARN (the "+" above the bucket list) and used like any other.
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
-- **Search a bucket.** Type in the toolbar and press Enter: words, `"a phrase"`, `-not`, `tag:key=value` and a `folder/part` path all combine, over the current folder or the whole bucket. Folders and objects both show up, you can paste a full path or an `s3://` address to jump straight to it, and the results can be downloaded, deleted, tagged or moved like any other rows. S3 has no search of its own, so this is a bounded scan that tells you when it stopped early.
+- **Search a bucket.** Start typing in the toolbar (or just type in the file list) and results appear as you type: words, `"a phrase"`, `-not`, `tag:key=value` and a `folder/part` path all combine, over the current folder or the whole bucket. Folders and objects both show up, you can paste a full path or an `s3://` address to jump straight to it, and the results can be downloaded, deleted, tagged or moved like any other rows. S3 has no search of its own, so this is a bounded scan that tells you when it stopped early.
+- **Two panes.** Split the window into two explorer panes, each on its own folder or bucket, and copy or move between them by dragging rows across, with `Ctrl+Shift+C` / `Ctrl+Shift+X`, or from the right-click menu. Same previews and confirmations as everywhere else.
+- **Keyboard for everything.** Every action has a shortcut (`F1` shows the list), the bucket list and file list are fully keyboard-navigable, `Alt+Left` / `Alt+Right` and the mouse's back and forward buttons walk each pane's history, and Settings → Keyboard lets you rebind any of it and export or import your bindings as a file.
 - **Download in parallel parts.** Large objects are split into byte ranges and fetched over several connections at once.
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
 - **Whole folders in and out.** Upload a folder (or drop one from your desktop) and download folders into a directory. You see how many files, how much data and what already exists before anything moves; existing files are skipped unless you choose Overwrite; file names are made safe for your disk and a transfer never writes outside the folder you chose.
@@ -262,7 +264,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.6.0`:
+Honest status, as of `v0.7.0`:
 
 | | |
 |---|---|
@@ -272,7 +274,8 @@ Honest status, as of `v0.6.0`:
 | Independent AI code review of the delete, move and download code, with every finding fixed | yes |
 | Builds and packages in CI for Windows, macOS and Linux | yes |
 | Used against real AWS S3 by the author (browsing, transfers, and the v0.3.0 features) | yes |
-| Shared buckets, tags, lifecycle rules, folder transfers, versions and search tested against real AWS S3 | **not yet** |
+| Shared buckets, tags, lifecycle rules, folder transfers, versions, search and the two-pane view tested against real AWS S3 | **not yet** |
+| Connecting with a profile signed in through `aws login` tested against a real session | **not yet** |
 | Restoring from Glacier tested against a server that supports it (the local test server does not) | **unit tests only** |
 | Lifecycle storage-class transitions tested against any server (the local test server refuses them) | **unit tests only** |
 | In-app update installed for real on any platform | **not yet** |

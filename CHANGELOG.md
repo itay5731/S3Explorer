@@ -5,10 +5,12 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-11
+
 ### New
 
 - **Two panes.** Split the window into two explorer panes (toolbar button or `Ctrl+2`), browse a different folder or bucket in each, and copy or move between them by dragging rows across, with `Ctrl+Shift+C` / `Ctrl+Shift+X`, or from the right-click menu. Same previews and confirmations as before; `Tab` switches panes.
-- **Keyboard for everything, your way.** Every action has a shortcut (press `F1` or `?` for the list), and Settings → Keyboard lets you rebind any of them, export them to a file and import them back. Typing in the file list starts a search; `Alt+Left` / `Alt+Right` go back and forward; `F5` refreshes.
+- **Keyboard for everything, your way.** Every action has a shortcut (press `F1` or `?` for the list), and Settings → Keyboard lets you rebind any of them, export them to a file and import them back. Typing in the file list starts a search; `Alt+Left` / `Alt+Right` and the mouse's back and forward buttons go back and forward; `F5` refreshes.
 - **Search as you type.** Results appear half a second after you stop typing; `Enter` still searches at once.
 
 ### Fixed
