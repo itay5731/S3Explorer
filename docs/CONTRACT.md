@@ -1412,7 +1412,12 @@ in that order, then one key name. `Mod` means `Ctrl` on Windows and Linux and `C
 is what defaults and exported files use so they stay portable; `Ctrl` and `Meta` are literal. Key names
 are `KeyboardEvent.key` normalised: letters upper-case (`K`), digits, `F1`..`F24`, `Enter`, `Escape`,
 `Backspace`, `Delete`, `Insert`, `Tab`, `Space`, `ArrowUp/Down/Left/Right`, `Home`, `End`, `PageUp`,
-`PageDown`, and punctuation as typed (`/`, `?`, `,`, `.`, `\`, `[`, `]`). Display uses the platform's
+`PageDown`, punctuation as typed (`/`, `?`, `,`, `.`, `\`, `[`, `]`), and the extra mouse buttons `Mouse4`
+(`MouseEvent.button === 3`, the browser's Back button) and `Mouse5` (`button === 4`, Forward), with modifiers.
+A mouse-button chord fires on `mousedown` in the explorer (the webview's own history navigation is
+prevented on `mousedown`, `mouseup` and `auxclick` for those buttons, bound or not), acts on the pane under
+the pointer (else the active pane), is recordable in Settings → Keyboard like a key, and belongs to the
+`global` context. Display uses the platform's
 symbols on macOS (⌘ ⌥ ⇧ ⌃) and words elsewhere.
 
 Every action has an id, a label, a group, a **context** and a list of default chords (at most 4 chords per
@@ -1430,7 +1435,7 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 |---|---|---|---|
 | **Navigate** `nav.open` | Open folder / go to object | files | `Enter` |
 | `nav.up` | Up one level | global | `Backspace`, `Alt+ArrowUp` |
-| `nav.back` / `nav.forward` | Back / Forward (per-pane history) | global | `Alt+ArrowLeft` / `Alt+ArrowRight` |
+| `nav.back` / `nav.forward` | Back / Forward (per-pane history) | global | `Alt+ArrowLeft`, `Mouse4` / `Alt+ArrowRight`, `Mouse5` |
 | `nav.root` | Bucket root | global | `Mod+Home` |
 | `nav.refresh` | Refresh | global | `F5`, `Mod+R` |
 | `nav.focusFiles` | Focus the file list | global | `Mod+E` |
