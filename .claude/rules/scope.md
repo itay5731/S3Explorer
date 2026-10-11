@@ -42,6 +42,9 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
 25. (v0.6.0) A setting that replaces the system file manager for "Show in folder" / "Open folder" with a
     user-chosen program (`{path}` / `{dir}` placeholders, no shell).
 
+26. (v0.7.0) Two explorer panes side by side on one connection, with copy and move between them by
+    drag and drop, F5/F6 and the context menu (see "v0.7.0 additions" in `docs/CONTRACT.md`).
+
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.
 If a task seems to need one of these, stop and ask the user instead of adding it.

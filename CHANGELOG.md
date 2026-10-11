@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Two panes.** Split the window into two explorer panes (toolbar button or `Ctrl+2`), browse a different folder or bucket in each, and copy or move between them by dragging rows across, with `F5` / `F6`, or from the right-click menu. Same previews and confirmations as before; `Tab` switches panes.
+
 ## [0.6.0] - 2026-10-08
 
 ### New

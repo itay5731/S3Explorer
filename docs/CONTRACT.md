@@ -1318,3 +1318,77 @@ connection that auto-connects, the window being closed). Implement as an unmount
 
 None. Search uses `s3:ListBucket`, `s3:GetObject` (HeadObject) and `s3:GetObjectTagging`, which browsing,
 downloading and tag viewing already require.
+
+## v0.7.0 additions — two panes
+
+Frontend only. No new command, type or event; copy and move between panes use the existing `copy` and
+`move` jobs (`start_job`) with their previews and confirmations, so every rule in "Object operations
+(jobs)" and "Confirmations for copy and move" applies unchanged.
+
+### Split view
+
+- The main area can show **one or two explorer panes side by side**, each with its own bucket, folder,
+  listing, sort, filter, selection, scroll position and search results, on the **same connection** (two
+  connections at once are out of scope). A toolbar button (**Split**, icon `Columns2`) and `Ctrl+2`
+  open the second pane; the same button (**Single**) and `Ctrl+1` close it. The choice persists
+  (`s3x.split`). The second pane opens at the first pane's bucket and folder.
+- Exactly one pane is **active** at any time: the last one clicked, focused or navigated. The active pane
+  has a visible marker (its path bar and table border take the accent; the other pane is dimmed slightly).
+  Everything that acted on "the current folder" before acts on the active pane: the toolbar (Upload, New
+  folder, Download, Delete, Copy, Cut, Paste, Rename, Tags, Up, Refresh, the search box and scope), the
+  details panel, the sidebar's bucket click and "Newest files", drops of OS files onto the window (they
+  upload into the pane under the pointer, else the active pane), notifications' "go to", keyboard
+  shortcuts, the context menu, and the Activity menu's "Go to …" items (which open in the active pane).
+- Each pane has its own **path bar** (breadcrumbs, item count, truncation note) above its table; the
+  toolbar stays single, at the top, and acts on the active pane. In split view the path bars carry the
+  pane's bucket name as the first crumb so two buckets are distinguishable at a glance.
+- `Tab` while focus is in a pane's table (or results list) moves focus and activity to the other pane and
+  restores its focused row; `Shift+Tab` goes back. Everything else about `Tab` is unchanged.
+- Closing the split keeps the **active** pane and drops the other. Disconnecting resets both panes; the
+  split preference stays. Below a main-area width of 760 px the second pane is hidden (not closed) and a
+  note in the toolbar button's tooltip says why.
+
+### Copy and move between panes
+
+- In split view the toolbar gains **Copy to other pane** (`F5`) and **Move to other pane** (`F6`),
+  enabled when the active pane has a selection and the other pane shows a bucket. The row context menu
+  gets the same two items. Both call the existing paste flow with the selection of the active pane as the
+  source and the other pane's bucket + folder as the destination: the same preview, the same conflict
+  handling, the same confirmation (and the same skipping of it when `confirmCopyMove` is off and nothing
+  conflicts), the same refusal to write into a source.
+- **Drag and drop across panes:** rows dragged from one pane can be dropped on a folder row of the other
+  pane (into that folder), on its path bar crumbs (into that crumb), or on the **empty area / any object
+  row of the other pane's table** (into the pane's current folder). The badge and `Ctrl`/`Option`-to-copy
+  behave as in "Drag and drop to move or copy". Dropping on the pane the drag started in follows the
+  existing rules (folder rows and crumbs only; the current folder is refused as a no-op).
+- The source selection is captured when the action starts (keys/prefixes byte-for-byte); the destination
+  is the other pane's bucket and prefix at that moment; neither is recomputed later.
+- When a job finishes, **both** panes refresh in place if they show a bucket the job touched (source or
+  destination), so the moved rows disappear on one side and appear on the other. A pane whose folder was
+  moved or deleted out from under it navigates to the nearest existing ancestor with a toast.
+- The in-app clipboard is shared: copy/cut in one pane, paste in the other, works as today.
+
+### State shape (for the implementation)
+
+Pane state (`bucket`, `prefix`, `listing`, `selection`, `anchor`, `focus`, `sort`, `filter`, `reveal`,
+`scrollTo`, search results) moves out of the single app store into a pane store keyed by pane id
+(`"a" | "b"`), with `activePane` in the app store. Components inside a pane get their pane id from a
+React context; the existing exported actions (`navigate`, `setSelection`, `setFilter`, `getSelected`,
+`refresh`, `loadMore`, `revealObject`, search run/close …) keep their signatures and act on the active
+pane, with an optional explicit pane parameter where a caller needs the other one (drag drop, F5/F6,
+"go to" from Activity). `useApp` consumers of pane fields become pane-store consumers. The mock needs no
+change. The invariants that already hold per listing (selection pruned by filter, `reveal` cleared on
+user selection, results closed on navigation) hold per pane.
+
+### Verification specific to this version
+
+Browser click-through against the mock, in both themes and at 1000 / 1280 / 1700 px: split and single
+toggles and persistence; independent navigation, filter, sort, selection and search per pane; the active
+marker following clicks, focus and `Tab`; toolbar actions targeting the active pane only (download starts
+for the active pane's selection; New folder creates in the active pane); F5/F6 and cross-pane drag onto a
+folder row, a crumb and the empty area, each starting a job whose request is exactly the captured keys and
+the other pane's folder; a move's rows leaving one pane and arriving in the other on completion; the
+same-pane drag rules unchanged; OS-file drop uploading into the pane under the pointer; search results
+open in one pane while the other browses; closing the split keeping the active pane; disconnect resetting
+both; keyboard shortcuts (`Delete`, `F2`, `Ctrl+C/X/V`, `Backspace`, `Ctrl+F`) applying to the active
+pane; no transfer-progress re-renders of either table.
