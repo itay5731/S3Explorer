@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **History.** The Activity panel has a History tab next to Now: every finished upload and download, folder transfers, and file operations too (copy, move, rename, delete, tag changes and archive restores), kept after you close the app (the last 500). Show all, only transfers or only file operations, filter by name or path, and see when each one finished and what failed. From a transfer you can open the file, show it in its folder, go to the object, download or upload it again; from a file operation you can go to where it went and copy its source or destination path. Clear history empties the list without touching any file.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

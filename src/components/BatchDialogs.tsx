@@ -191,13 +191,16 @@ export function UploadFolderModal({
   prefix,
   localPath,
   initialPreview,
+  initialDest,
 }: {
   bucket: string;
   prefix: string;
   localPath: string;
   initialPreview?: BatchPreview;
+  /** The destination prefix to start from (verbatim), e.g. "Upload again" from the history. */
+  initialDest?: string;
 }) {
-  const initial = defaultUploadPrefix(prefix, localPath);
+  const initial = initialDest ?? defaultUploadPrefix(prefix, localPath);
   const [value, setValue] = useState(initial);
   const [policy, setPolicy] = useState<ConflictPolicy | null>(null);
   const [busy, setBusy] = useState(false);

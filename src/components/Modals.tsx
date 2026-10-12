@@ -739,7 +739,7 @@ function ModalSwitch() {
     case "uploadFolder":
       return (
         <Suspense fallback={null}>
-          <UploadFolderModal key={modal.localPath} bucket={modal.bucket} prefix={modal.prefix} localPath={modal.localPath} initialPreview={modal.initialPreview} />
+          <UploadFolderModal key={modal.localPath} bucket={modal.bucket} prefix={modal.prefix} localPath={modal.localPath} initialPreview={modal.initialPreview} initialDest={modal.initialDest} />
         </Suspense>
       );
     case "downloadFolders":

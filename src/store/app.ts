@@ -49,7 +49,7 @@ export type Modal =
   /** Tag several objects at once (a "tag" job). `items` are exact keys/prefixes from the selection. */
   | { kind: "bulkTags"; bucket: string; prefix: string; items: JobItem[] }
   /** Upload a local folder (a batch). `localPath` came from the picker or an OS drop. */
-  | { kind: "uploadFolder"; bucket: string; prefix: string; localPath: string; initialPreview?: BatchPreview }
+  | { kind: "uploadFolder"; bucket: string; prefix: string; localPath: string; initialPreview?: BatchPreview; initialDest?: string }
   /** Download folders (one batch each) into `dir`. `folders` are exact prefixes from the listing. */
   | { kind: "downloadFolders"; bucket: string; folders: FolderEntry[]; dir: string }
   /** Disconnect while transfers or jobs are still running. */
