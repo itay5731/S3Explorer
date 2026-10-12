@@ -235,7 +235,7 @@ interface AppSettings {
   maxConcurrentParts: number;
   maxConcurrentTransfers: number;
   theme: ThemeMode;                 // default "system"
-  checkUpdatesOnStartup: boolean;   // default false
+  checkUpdatesOnStartup: boolean;   // default false until v0.7.0, true from v0.8.0 (see "Update popup")
 }
 ```
 
@@ -1550,6 +1550,56 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 `hasCredentials: true`. The SDK's `credentials-login` provider resolves and refreshes it from
 `~/.aws/login/cache`; an expired session surfaces as an `Auth` error whose message tells the user to run
 `aws login` again.
+
+#### IAM permissions added in this version
+
+None.
+
+## v0.8.0 additions — the update popup, and the search row
+
+### Update popup
+
+Users did not notice new versions: the startup check was off by default and, when on, only raised a
+toast. From v0.8.0:
+
+- `checkUpdatesOnStartup` **defaults to true** (backend default and `DEFAULT_APP_SETTINGS`). A
+  `settings.json` that lacks the field loads `true`; one that says `false` is respected. The
+  Updates tab's switch is unchanged.
+- At launch everything about versions goes into **one dialog** (`.version-modal`, `UpdateDialog.tsx`).
+  When the silent startup check finds a newer version it holds the **update offer**: the running version, the new version, its release notes (the
+  `notes` markdown from `UpdateInfo`, rendered by the same safe `Markdown`), and the same card as
+  Settings → Updates, with **Later** and **Install and restart** (or **Open download page** when
+  `canInstall` is false; the running-transfers warning stays in the card).
+  - Later closes it; it comes back at the next launch. While the popup is dismissed a pill in the
+    title bar (explorer and start screen) reads "vX.Y.Z available" and reopens it.
+  - Esc and the backdrop close it, except while an install is in progress.
+- **What's new after an update.** `CHANGELOG.md` is bundled into the frontend at build time
+  (`import ... from "../../CHANGELOG.md?raw"`, `src/lib/changelog.ts`). At every launch the frontend
+  compares the running version (`app_version`) with `localStorage` `s3x.seenVersion`: the very first
+  launch only records it; a launch on a different version records it and opens **What's new in vX**
+  with that version's `## [X.Y.Z]` section. No section, no dialog. If the startup check then finds an
+  update, the dialog shows the update offer instead (a newer version's notes matter more than the
+  running one's); the two are never shown together.
+- Nothing is ever installed without the user clicking Install; the backend commands are unchanged.
+
+Consequence for releases: the `## [X.Y.Z]` section of `CHANGELOG.md` is what users read in the app,
+before and after updating. Every tag must come with one that explains each change (see
+`.claude/rules/versioning.md`).
+
+### Search row
+
+The search box leaves the toolbar's right group and gets its **own row** between the toolbar and the
+panes' path bars (`SearchRow` in `Toolbar.tsx`, `.search-row`), full width, with the scope control
+("This folder" / "Whole bucket") at its right. In split view the row spans both panes and, as before,
+acts on the active pane. The toolbar's right group keeps the clipboard chip, the split toggle and the
+details toggle.
+
+The placeholder names the scope ("Search this folder · as you type, Enter searches now"). While the
+box has text and the focus, a dismissable hint under it says what is being searched: this folder only
+(and that **Whole bucket** on the right searches everything) or the whole bucket, that results come
+half a second after typing stops, and that Enter searches right away. Dismissing it is remembered
+(`localStorage` `s3x.searchTypingHintDismissed`), like the syntax hint shown while the box is empty.
+Search behaviour itself is unchanged.
 
 #### IAM permissions added in this version
 

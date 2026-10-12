@@ -46,7 +46,8 @@ function InstallProgress({ install }: { install: InstallState }) {
   );
 }
 
-function Available({ info }: { info: UpdateInfo }) {
+/** The "version X is available" card. With `buttons` false the caller places Install itself. */
+export function Available({ info, buttons = true }: { info: UpdateInfo; buttons?: boolean }) {
   const install = useUpdates((s) => s.install);
   const installError = useUpdates((s) => s.installError);
   const activeTransfers = useTransfers(selectActiveCount);
@@ -95,19 +96,23 @@ function Available({ info }: { info: UpdateInfo }) {
               </span>
             </div>
           )}
-          <div className="upd-actions">
-            <button type="button" className="btn btn-primary" onClick={() => void installUpdate()}>
-              <Download size={14} /> Install and restart
-            </button>
-          </div>
+          {buttons && (
+            <div className="upd-actions">
+              <button type="button" className="btn btn-primary" onClick={() => void installUpdate()}>
+                <Download size={14} /> Install and restart
+              </button>
+            </div>
+          )}
         </>
       ) : (
         <>
-          <div className="upd-actions">
-            <button type="button" className="btn btn-primary" onClick={() => void openDownloadPage()}>
-              <ExternalLink size={14} /> Open download page
-            </button>
-          </div>
+          {buttons && (
+            <div className="upd-actions">
+              <button type="button" className="btn btn-primary" onClick={() => void openDownloadPage()}>
+                <ExternalLink size={14} /> Open download page
+              </button>
+            </div>
+          )}
           <p className="muted small">Automatic install isn't available for this build. Download and install it manually.</p>
         </>
       )}

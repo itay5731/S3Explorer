@@ -370,7 +370,7 @@ impl Default for AppSettings {
             max_concurrent_parts: DEFAULT_MAX_CONCURRENT_PARTS,
             max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
             theme: ThemeMode::System,
-            check_updates_on_startup: false,
+            check_updates_on_startup: true,
             notify_on_finish: default_notify_on_finish(),
             text_size: DEFAULT_TEXT_SIZE,
             text_weight: DEFAULT_TEXT_WEIGHT,

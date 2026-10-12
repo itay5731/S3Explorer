@@ -5,6 +5,16 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **You are told about updates.** When a newer version is out, a window pops up at startup with what changed and an Install button; Later brings it back next time, and a small "vX.Y.Z available" pill in the title bar reopens it. The startup check is now on by default (turn it off in Settings → Updates).
+- **What's new after an update.** The first launch of a new version shows its patch notes, so you know what changed in what you just installed.
+
+### Improved
+
+- **The workspace is complete as soon as you connect.** The toolbar, the search row and the details panel are there before you open a bucket (greyed out until you do), with "Pick a bucket" in the middle, so nothing jumps around when you pick one.
+- **The search box has its own row** under the toolbar, as wide as the window, with the folder / whole-bucket choice at its right. While you type, a hint says whether you are searching this folder or the whole bucket, that results come half a second after you stop, and that Enter searches right away.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

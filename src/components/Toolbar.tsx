@@ -101,11 +101,14 @@ function UploadButton({ disabled }: { disabled: boolean }) {
 }
 
 const HINT_KEY = "s3x.searchHintDismissed";
+const TYPING_HINT_KEY = "s3x.searchTypingHintDismissed";
 
 /**
- * The toolbar box: typing filters the loaded rows at once and searches the bucket 500 ms after the
- * last keystroke (Enter searches right away); Esc clears it and leaves the results. The scope
- * control sits beside it. Mod+F, `/` and typing in the file list focus it (key dispatcher).
+ * The search box, on its own row under the toolbar: typing filters the loaded rows at once and
+ * searches 500 ms after the last keystroke (Enter searches right away); Esc clears it and leaves
+ * the results. The scope control sits beside it. Mod+F, `/` and typing in the file list focus it
+ * (key dispatcher). While the box is empty a hint shows the query syntax; while there is text, one
+ * says what is being searched and that Enter searches now, since the scope is easy to miss.
  */
 function SearchBox() {
   const pane = usePaneId();
@@ -117,6 +120,7 @@ function SearchBox() {
   const input = useRef<HTMLInputElement>(null);
   const [focused, setFocused] = useState(false);
   const [hintDismissed, setHintDismissed] = useState(() => readPref<boolean>(HINT_KEY, false));
+  const [typingHintDismissed, setTypingHintDismissed] = useState(() => readPref<boolean>(TYPING_HINT_KEY, false));
   const disabled = !bucket;
   const searchKey = useKeyHint("nav.focusSearch");
 
@@ -128,7 +132,13 @@ function SearchBox() {
     setHintDismissed(true);
     writePref(HINT_KEY, true);
   };
+  const dismissTypingHint = () => {
+    setTypingHintDismissed(true);
+    writePref(TYPING_HINT_KEY, true);
+  };
   const folderTitle = `Search this folder: s3://${bucket ?? ""}/${prefix}`;
+  // At the bucket root "this folder" is the whole bucket, so say so (as the results header does).
+  const wholeBucket = scope === "bucket" || !prefix;
 
   return (
     <div className="search-wrap">
@@ -141,8 +151,8 @@ function SearchBox() {
             setFilter(e.target.value, pane);
             scheduleSearch(e.target.value, pane);
           }}
-          placeholder="Filter · searches as you type"
-          aria-label="Filter loaded items; searches the bucket as you type"
+          placeholder={wholeBucket ? "Search the whole bucket · as you type, Enter searches now" : "Search this folder · as you type, Enter searches now"}
+          aria-label="Filter loaded items; searches as you type"
           title={withKey("Search", searchKey)}
           spellCheck={false}
           disabled={disabled}
@@ -170,6 +180,24 @@ function SearchBox() {
           <button className="icon-btn" onClick={clear} aria-label="Clear" title="Clear (Esc)">
             <X size={12} />
           </button>
+        )}
+        {focused && filter && !typingHintDismissed && (
+          <div className="search-hint typing" role="note" onMouseDown={(e) => e.preventDefault()}>
+            <span>
+              {wholeBucket ? (
+                <>
+                  Searching the <strong>whole bucket</strong>. <kbd>Enter</kbd> searches now.
+                </>
+              ) : (
+                <>
+                  Searching <strong>this folder only</strong>. <kbd>Enter</kbd> searches now · <strong>Whole bucket</strong> is on the right.
+                </>
+              )}
+            </span>
+            <button className="icon-btn" onClick={dismissTypingHint} aria-label="Dismiss hint" title="Got it, don't show again">
+              <X size={11} />
+            </button>
+          </div>
         )}
         {focused && !filter && !hintDismissed && (
           <div className="search-hint" role="note" onMouseDown={(e) => e.preventDefault()}>
@@ -206,6 +234,15 @@ function SearchBox() {
           <span className="seg-short">Bucket</span>
         </button>
       </div>
+    </div>
+  );
+}
+
+/** The row under the toolbar that holds the search box and its scope, full width. */
+export function SearchRow() {
+  return (
+    <div className="search-row">
+      <SearchBox />
     </div>
   );
 }
@@ -438,7 +475,6 @@ export function Toolbar() {
             </button>
           </div>
         )}
-        <SearchBox />
         <SplitButton />
         <button
           className={`icon-btn lg ${detailsOpen ? "active" : ""}`}

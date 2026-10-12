@@ -5,6 +5,7 @@ import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNar
 import { PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
 import { onExplorerKeyDown, onExplorerMouseDown } from "../store/keyActions";
 import { ShortcutsDialog } from "./ShortcutsDialog";
+import { UpdatePill } from "./UpdateDialog";
 import { installTransferEffects } from "../store/actions";
 import { handleOsDrop, installBatchEffects } from "../store/folders";
 import { installJobEffects } from "../store/ops";
@@ -12,7 +13,7 @@ import { installTagEffects } from "../store/tags";
 import { installArchiveEffects } from "../store/archive";
 import { DragBadge } from "./RowDrag";
 import { Sidebar } from "./Sidebar";
-import { Breadcrumbs, Toolbar } from "./Toolbar";
+import { Breadcrumbs, SearchRow, Toolbar } from "./Toolbar";
 import { ObjectTable } from "./ObjectTable";
 import { SearchResults } from "./SearchResults";
 import { toast } from "../store/toasts";
@@ -242,11 +243,9 @@ function useSidebarResize() {
 
 export function Explorer() {
   const active = useApp((s) => s.activePane);
-  const split = useApp((s) => s.split);
   const shown = useApp((s) => s.split && !s.narrow);
-  const bucket = usePanes((s) => s[active].bucket);
-  // Details describe an item inside a bucket, so the panel stays closed until one is open.
-  const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
+  // The details panel is there from the start too (empty until an item is selected).
+  const detailsOpen = useApp((s) => s.detailsOpen);
   const dropTarget = useFileDrop();
   const sidebar = useSidebarResize();
   const main = useNarrowWatch();
@@ -268,6 +267,7 @@ export function Explorer() {
           <span>S3 Explorer</span>
         </button>
         <div className="spacer" />
+        <UpdatePill />
         <ConnectionChip />
         <ThemeToggle />
         <SettingsButton />
@@ -284,8 +284,10 @@ export function Explorer() {
           onDoubleClick={sidebar.reset}
         />
         <main className="browser" ref={main}>
-          {/* The toolbar acts on the active pane; in split view it stays (the Split button lives there). */}
-          {(bucket || split) && <Toolbar />}
+          {/* The toolbar and the search row are always there (disabled until a bucket is open), so the
+              workspace looks the same before and after picking one; the toolbar acts on the active pane. */}
+          <Toolbar />
+          <SearchRow />
           <div className={`panes ${shown ? "split" : ""}`}>
             {panes.map((id, i) => (
               <Fragment key={id}>
