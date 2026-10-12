@@ -23,6 +23,7 @@ import type {
   LifecycleConfiguration,
   LifecycleRule,
   ListPage,
+  MetadataEdit,
   ObjectEntry,
   ObjectMeta,
   ProfileInfo,
@@ -43,6 +44,7 @@ import { BATCH_LIMITS, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE
 import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
+import { MAX_EDIT_BYTES, metadataEditError } from "./metadata";
 import { validateLifecycleConfig } from "./lifecycleCheck";
 import { sameConfiguration } from "./lifecycle";
 import { sanitizeFileName } from "./format";
@@ -91,6 +93,8 @@ interface MockObject {
   metadata: Record<string, string>;
   versionId: string | null;
   tags?: Tag[];
+  cacheControl?: string;
+  contentDisposition?: string;
 }
 
 interface MockBucket {
@@ -708,6 +712,29 @@ function needsRestore(bucket: string, key: string, o: MockObject): boolean {
   const st = restoreStateOf(bucket, key);
   return !(st && !st.inProgress && st.expiresAt);
 }
+
+/** What head_object returns for a mock object. */
+function objectMeta(bucket: string, key: string, o: MockObject): ObjectMeta {
+  const st = restoreStateOf(bucket, key);
+  return {
+    key,
+    name: key.split("/").filter(Boolean).pop() ?? key,
+    size: o.size,
+    lastModified: o.lastModified,
+    etag: o.etag,
+    storageClass: o.storageClass,
+    contentType: o.contentType,
+    metadata: { ...o.metadata },
+    versionId: versioningOf(bucket) === "Off" ? o.versionId : historyOf(bucket, key)[0]?.versionId ?? o.versionId,
+    restore: isArchiveClass(o.storageClass) && st ? { inProgress: st.inProgress, expiresAt: st.expiresAt } : null,
+    archived: needsRestore(bucket, key, o),
+    cacheControl: o.cacheControl ?? null,
+    contentDisposition: o.contentDisposition ?? null,
+  };
+}
+
+/** Every update_object_metadata call, for checks from the browser console. */
+const metadataCallLog: { edit: MetadataEdit; at: string }[] = [];
 
 function validateRestoreRequest(req: RestoreRequest | undefined | null) {
   if (!req || typeof req !== "object") throw fail("InvalidInput", "restore is required");
@@ -1501,6 +1528,20 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
   localExists: (path: string) => localExisting.has(path.toLowerCase()),
   batchTransfers: (id: string) => (batchSims.get(id)?.transferIds ?? []).map((t) => (sims.get(t) ? { ...sims.get(t)!.t } : null)),
   tagCalls: tagCallLog,
+  metadataCalls: metadataCallLog,
+  /** Rewrite an object behind the UI's back (new ETag), to exercise the metadata edit's Conflict. */
+  touchObject: (bucket: string, key: string) => {
+    const o = buckets.get(bucket)?.objects.get(key);
+    if (o) o.etag = hex(32);
+  },
+  /** Another client edits only the metadata (same ETag, new LastModified), to exercise the same Conflict. */
+  touchObjectMetadata: (bucket: string, key: string) => {
+    const o = buckets.get(bucket)?.objects.get(key);
+    if (o) {
+      o.metadata = { ...o.metadata, "changed-elsewhere": "yes" };
+      o.lastModified = new Date(Date.parse(o.lastModified) + 2000).toISOString();
+    }
+  },
   objectTags: (bucket: string, key: string) => copyTags(buckets.get(bucket)?.objects.get(key)?.tags),
   bucketTags: (bucket: string) => copyTags(buckets.get(bucket)?.tags),
   /** Make the next tag / lifecycle save fail (see InjectedFailure). */
@@ -2568,24 +2609,44 @@ export const mockBackend: Backend = {
 
   async headObject(bucket, key): Promise<ObjectMeta> {
     await latency();
-    const b = requireBucket(bucket);
-    const o = b.objects.get(key);
+    const o = requireBucket(bucket).objects.get(key);
     if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
-    const name = key.split("/").filter(Boolean).pop() ?? key;
-    const st = restoreStateOf(bucket, key);
-    return {
-      key,
-      name,
-      size: o.size,
-      lastModified: o.lastModified,
-      etag: o.etag,
-      storageClass: o.storageClass,
-      contentType: o.contentType,
-      metadata: { ...o.metadata },
-      versionId: versioningOf(bucket) === "Off" ? o.versionId : historyOf(bucket, key)[0]?.versionId ?? o.versionId,
-      restore: isArchiveClass(o.storageClass) && st ? { inProgress: st.inProgress, expiresAt: st.expiresAt } : null,
-      archived: needsRestore(bucket, key, o),
+    return objectMeta(bucket, key, o);
+  },
+
+  async updateObjectMetadata(edit: MetadataEdit): Promise<ObjectMeta> {
+    await delay(250 + rand() * 250);
+    metadataCallLog.push({ edit: { ...edit, metadata: { ...edit.metadata } }, at: new Date().toISOString() });
+    const why = metadataEditError(edit);
+    if (why) throw fail("InvalidInput", why);
+    const b = requireBucket(edit.bucket);
+    const o = b.objects.get(edit.key);
+    if (!o) throw fail("NoSuchKey", `The key “${edit.key}” does not exist.`);
+    const expectedLm = Date.parse(edit.expectedLastModified);
+    if (Number.isNaN(expectedLm)) throw fail("InvalidInput", "The object's last-modified time is missing or not an ISO-8601 timestamp.");
+    // Whole seconds, like S3.
+    if (o.etag !== edit.expectedEtag.replace(/"/g, "") || Math.floor(Date.parse(o.lastModified) / 1000) !== Math.floor(expectedLm / 1000)) {
+      throw fail("Conflict", "The object changed since the dialog opened, so nothing was written. Reload to edit the current version.");
+    }
+    if (o.size > MAX_EDIT_BYTES) throw fail("InvalidInput", "The object is larger than 5 GiB, the most S3 can copy in one request, so its metadata cannot be edited here.");
+    if (needsRestore(edit.bucket, edit.key, o)) throw fail("InvalidInput", "The object is archived; restore it first to edit its metadata.");
+    if (b.readOnly) throw fail("AccessDenied", DENIED_WRITE.slice("AccessDenied: ".length));
+    // A copy onto itself: a new object (and version) with the same body, storage class and tags.
+    const next: MockObject = {
+      ...o,
+      // A multipart ETag becomes a single-part one; a single-part ETag (the body's MD5) stays.
+      etag: o.etag.includes("-") ? hex(32) : o.etag,
+      lastModified: new Date().toISOString(),
+      contentType: edit.contentType,
+      metadata: { ...edit.metadata },
+      tags: o.tags ? copyTags(o.tags) : undefined,
+      cacheControl: edit.cacheControl ?? undefined,
+      contentDisposition: edit.contentDisposition ?? undefined,
     };
+    recordWrite(b, edit.key, next);
+    b.objects.set(edit.key, next);
+    b.sorted = null;
+    return objectMeta(edit.bucket, edit.key, next);
   },
 
   async createFolder(bucket, prefix) {

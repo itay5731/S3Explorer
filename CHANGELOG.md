@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Edit content type and metadata.** In an object's details, More details → Edit changes its content type, Cache-Control, Content-Disposition and user metadata. You see every change (before → after) before it is applied; the content, storage class, encryption and tags stay as they are, and if someone changed the object since you opened the dialog nothing is written. On a versioned bucket the edit is saved as a new version.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

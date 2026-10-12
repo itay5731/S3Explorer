@@ -33,6 +33,7 @@ import {
   type LifecycleConfiguration,
   type LifecycleIssue,
   type ListPage,
+  type MetadataEdit,
   type ObjectEntry,
   type ObjectMeta,
   type ProfileInfo,
@@ -89,6 +90,8 @@ export interface Backend {
   putBucketTags(bucket: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
   getObjectTags(bucket: string, key: string): Promise<Tag[]>;
   putObjectTags(bucket: string, key: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
+  /** Copy the object onto itself with new headers (conditional on `edit.expectedEtag`); the object as read back. */
+  updateObjectMetadata(edit: MetadataEdit): Promise<ObjectMeta>;
   // Lifecycle configuration
   getLifecycle(bucket: string): Promise<LifecycleConfiguration | null>;
   validateLifecycle(config: LifecycleConfiguration): Promise<LifecycleIssue[]>;
@@ -227,6 +230,7 @@ const tauriBackend: Backend = {
   putBucketTags: (bucket, tags, expected) => invoke<Tag[]>("put_bucket_tags", { bucket, tags, expected }),
   getObjectTags: (bucket, key) => invoke<Tag[]>("get_object_tags", { bucket, key }),
   putObjectTags: (bucket, key, tags, expected) => invoke<Tag[]>("put_object_tags", { bucket, key, tags, expected }),
+  updateObjectMetadata: (edit) => invoke<ObjectMeta>("update_object_metadata", { edit }),
   getLifecycle: (bucket) => invoke<LifecycleConfiguration | null>("get_lifecycle", { bucket }),
   validateLifecycle: (config) => invoke<LifecycleIssue[]>("validate_lifecycle", { config }),
   putLifecycle: (bucket, config, expected) => invoke<LifecycleConfiguration | null>("put_lifecycle", { bucket, config, expected }),
@@ -402,6 +406,7 @@ export const getObjectTags = (bucket: string, key: string) => call("getObjectTag
 /** Replace the object's tag set; fails with `Conflict` when the current set differs from `expected`. */
 export const putObjectTags = (bucket: string, key: string, tags: Tag[], expected: Tag[]) =>
   call("putObjectTags", bucket, key, tags, expected);
+export const updateObjectMetadata = (edit: MetadataEdit) => call("updateObjectMetadata", edit);
 /** `null` when the bucket has no lifecycle configuration; `NotSupported` when the server has no lifecycle. */
 export const getLifecycle = (bucket: string) => call("getLifecycle", bucket);
 /** Every problem with `config`, placed by rule index and field; `[]` = valid. Local, no network. */

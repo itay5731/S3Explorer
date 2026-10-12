@@ -1554,3 +1554,78 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## Edit content type and metadata (added on request after v0.7.0)
+
+S3 cannot change an object's headers in place; the app copies the object onto itself with the new headers.
+
+```ts
+interface MetadataEdit {
+  bucket: string;
+  key: string;                       // verbatim
+  expectedEtag: string;              // the ETag the dialog showed; the copy is conditional on it
+  expectedLastModified: string;      // the LastModified the dialog showed (ISO-8601, as in ObjectMeta); also a condition
+  contentType: string;               // 1..=255 printable ASCII
+  cacheControl: string | null;       // null = no Cache-Control header
+  contentDisposition: string | null; // null = no Content-Disposition header
+  metadata: Record<string, string>;  // user metadata, replaces the old set entirely
+}
+export const METADATA_LIMITS = { maxTotalBytes: 2048, maxKeyChars: 128 } as const;
+
+// ObjectMeta gains (read by head_object, shown as "before" in the dialog):
+cacheControl: string | null;
+contentDisposition: string | null;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `update_object_metadata` | `{ edit: MetadataEdit }` | `ObjectMeta` (fresh, after the copy). |
+
+Rules:
+- `HeadObject` first; its ETag must equal `expectedEtag` (compared without quotes) and its LastModified must equal
+  `expectedLastModified` (to the second), otherwise `Conflict`. An unparsable `expectedLastModified` is `InvalidInput`.
+- One `CopyObject` with the object as both source and destination (current version, copy source
+  percent-encoded like the jobs), `MetadataDirective=REPLACE`, `CopySourceIfMatch=expectedEtag`,
+  `CopySourceIfUnmodifiedSince=expectedLastModified`,
+  `TaggingDirective=COPY`, keeping the storage class and the server-side encryption settings
+  (`ServerSideEncryption`, `SSEKMSKeyId`, `BucketKeyEnabled`) read by that `HeadObject`. Headers the dialog
+  does not edit but `REPLACE` would drop are carried over unchanged: `Content-Encoding`, `Content-Language`,
+  `Expires`, `x-amz-website-redirect-location`. The copy is not cancellable and its timeout scales with the
+  size like job copies. A response without a `CopyObjectResult` ETag is not a success.
+- Afterwards `HeadObject` verifies the result; "no error" is not confirmation. Content type, Cache-Control,
+  Content-Disposition and the user metadata must equal what was sent, the size and storage class must be
+  unchanged, the ETag must equal the copy's, and the tag count must be unchanged when the server reports it.
+  A mismatch is `Unknown` naming the field ("the edit was written but ..."); a failed read-back is
+  `saved_but_unread` (keeps the code). The frontend then reloads the details and never says nothing changed.
+- Refused with `InvalidInput` and a clear message, before anything is written: objects over 5 GiB
+  (single-request copy limit), archived objects that are not restored, objects encrypted with a customer key
+  (SSE-C), an `Expires` header that cannot be parsed back, metadata keys that are not lowercase ASCII
+  `[a-z0-9-]` or longer than 128 chars, empty metadata keys or values, values that are not printable ASCII
+  (control characters, and non-ASCII, which S3 would store RFC 2047-encoded so the read-back could not match),
+  values or header fields with leading or trailing spaces (HTTP trims them), more than 2 KiB of user metadata in
+  total (keys + values in UTF-8 bytes, as S3 counts it), an empty content type, an empty string for
+  Cache-Control or Content-Disposition (send `null`), and header fields that are not printable ASCII.
+- If the object changed (the `HeadObject` check, or a 412 from either copy condition), the error is `Conflict`:
+  the object changed since the dialog opened and nothing was written.
+  Why both conditions: a single-part object's ETag is the MD5 of its body, so another client's metadata-only edit
+  keeps the ETag and only LastModified reveals it. Limits, stated plainly rather than claimed airtight:
+  - S3 compares LastModified at one-second resolution, so a change within the same second as the dialog's read
+    can still slip through.
+  - AWS evaluates the pair per RFC 7232: when `CopySourceIfMatch` holds, `CopySourceIfUnmodifiedSince` is ignored
+    and the copy proceeds. On AWS the LastModified guard is therefore the backend's `HeadObject` check, which leaves
+    the milliseconds between that `HeadObject` and the `CopyObject` unguarded for metadata-only changes. Body changes
+    are always caught by `CopySourceIfMatch`.
+- On a versioned bucket this creates a new version (the old one remains); the dialog says so. A restored
+  archived object is written back to its archive storage class, so the new copy needs a new restore to be read;
+  the dialog says so too. Object ACLs, Object Lock retention and legal holds are not carried over (ACL editing
+  and object lock are out of scope).
+
+Frontend: in the details panel's "More details", an **Edit** button next to the metadata opens a dialog:
+Content type (text field with a datalist of common types), Cache-Control, Content-Disposition, and a
+key/value list of user metadata (add, edit, remove rows), with inline validation mirroring the rules above
+and a live byte counter (`n of 2,048 bytes`). Save shows a confirmation summarising what changes
+(before → after for each changed field, byte-for-byte what will be sent), then runs; success refreshes the
+details. Errors show in the dialog; `Conflict` offers to reload the current values.
+
+IAM: `s3:GetObject` and `s3:PutObject` on the object, plus `s3:GetObjectTagging` and `s3:PutObjectTagging`
+for `TaggingDirective=COPY`; with SSE-KMS, `kms:Decrypt` and `kms:GenerateDataKey` on the key.

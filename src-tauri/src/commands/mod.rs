@@ -8,6 +8,7 @@ pub mod files;
 pub mod folders;
 pub mod jobs;
 pub mod lifecycle;
+pub mod metadata;
 pub mod saved;
 pub mod search;
 pub mod settings;

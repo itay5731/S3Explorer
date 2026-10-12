@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod keychain;
 pub mod lifecycle;
 pub mod local_open;
+pub mod metadata;
 pub mod models;
 pub mod ops;
 pub mod profiles;
@@ -149,6 +150,7 @@ pub fn run() {
             commands::tags::put_bucket_tags,
             commands::tags::get_object_tags,
             commands::tags::put_object_tags,
+            commands::metadata::update_object_metadata,
             commands::lifecycle::get_lifecycle,
             commands::lifecycle::validate_lifecycle,
             commands::lifecycle::put_lifecycle,

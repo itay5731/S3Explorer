@@ -176,6 +176,27 @@ pub struct ObjectMeta {
     pub restore: Option<RestoreStatus>,
     /// v0.5.0: true when the object must be restored before it can be read.
     pub archived: bool,
+    /// Edit metadata (after v0.7.0): shown as "before" in the edit dialog.
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+}
+
+/// One object's headers to write by copying it onto itself (`MetadataEdit` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataEdit {
+    pub bucket: String,
+    /// Verbatim.
+    pub key: String,
+    /// The ETag the dialog showed; the copy is conditional on it.
+    pub expected_etag: String,
+    /// The LastModified the dialog showed (ISO-8601); the copy is conditional on it too.
+    pub expected_last_modified: String,
+    pub content_type: String,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    /// User metadata; replaces the old set entirely.
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -46,6 +46,8 @@ export type Modal =
   /** The bucket's lifecycle rules (load, edit, confirm, save the whole configuration). */
   | { kind: "lifecycle"; bucket: string }
   | { kind: "objectTags"; bucket: string; key: string }
+  /** Edit one object's content type and metadata (a copy onto itself, confirmed before it runs). */
+  | { kind: "editMetadata"; bucket: string; key: string }
   /** Tag several objects at once (a "tag" job). `items` are exact keys/prefixes from the selection. */
   | { kind: "bulkTags"; bucket: string; prefix: string; items: JobItem[] }
   /** Upload a local folder (a batch). `localPath` came from the picker or an OS drop. */
