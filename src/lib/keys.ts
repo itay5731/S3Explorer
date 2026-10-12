@@ -41,6 +41,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("nav.focusBuckets", "Focus the bucket list", "Navigate", "global", "Mod+B"),
   a("nav.focusSearch", "Search", "Navigate", "global", "Mod+F", "/"),
   a("nav.searchScope", "Toggle search scope (this folder / whole bucket)", "Navigate", "global", "Mod+Shift+F"),
+  a("nav.bookmark", "Bookmark this folder", "Navigate", "global", "Mod+Shift+D"),
   a("nav.nextPane", "Next pane", "Navigate", "files", "Tab"),
   a("nav.prevPane", "Previous pane", "Navigate", "files", "Shift+Tab"),
   a("view.single", "Single view", "Navigate", "global", "Mod+1"),

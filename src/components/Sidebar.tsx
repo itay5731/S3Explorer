@@ -1,11 +1,12 @@
 import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Archive, ArchiveX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
+import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
 import { activePane, loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, usePane, writePref } from "../store/app";
 import { focusPaneListSoon } from "../store/keyboard";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
 import { PopupMenu } from "./PopupMenu";
 import { RecentFiles } from "./RecentFiles";
+import { isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
 
 const SHARE_KEY = "s3x.bucketsShare";
 /** The part of the sidebar's height the bucket list takes; the newest files get the rest. */
@@ -152,6 +153,7 @@ export function Sidebar() {
   const [filter, setFilter] = useState("");
   const [menu, setMenu] = useState<{ b: BucketEntry; x: number; y: number } | null>(null);
   const split = useSplit();
+  const bookmarks = useBookmarks((s) => s.items);
 
   const canList = connection?.canListBuckets ?? true;
 
@@ -298,7 +300,12 @@ export function Sidebar() {
           label={`Actions for ${menu.b.name}`}
           onClose={() => setMenu(null)}
           groups={[
-            [{ label: "Open", icon: <FolderOpen size={14} />, action: () => openBucket(menu.b.name) }],
+            [
+              { label: "Open", icon: <FolderOpen size={14} />, action: () => openBucket(menu.b.name) },
+              isBookmarked(bookmarks, menu.b.name, "")
+                ? { label: "Remove bookmark", icon: <BookmarkX size={14} />, action: () => toggleBookmark(menu.b.name, "") }
+                : { label: "Bookmark bucket", icon: <Bookmark size={14} />, action: () => toggleBookmark(menu.b.name, "") },
+            ],
             [
               { label: "Bucket tags…", icon: <Tags size={14} />, action: () => openModal({ kind: "bucketTags", bucket: menu.b.name }) },
               { label: "Lifecycle rules…", icon: <CalendarClock size={14} />, action: () => openModal({ kind: "lifecycle", bucket: menu.b.name }) },

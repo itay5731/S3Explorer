@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Bookmarks bar.** Star a folder in the path bar, press `Ctrl+Shift+D`, or right-click folders or a bucket and choose Bookmark, and it appears as a chip in a bookmarks bar under the toolbar, one click away (middle-click or `Ctrl`+click opens it in the other pane). Chips that don't fit wait under » at the end of the bar. Bookmarks are kept per connection; drag chips to reorder, and rename or remove them from the right-click menu.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

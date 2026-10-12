@@ -1442,6 +1442,7 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `nav.focusBuckets` | Focus the bucket list | global | `Mod+B` |
 | `nav.focusSearch` | Search | global | `Mod+F`, `/` |
 | `nav.searchScope` | Toggle search scope (this folder / whole bucket) | global | `Mod+Shift+F` |
+| `nav.bookmark` | Bookmark this folder (see "Bookmarks") | global | `Mod+Shift+D` |
 | `nav.nextPane` / `nav.prevPane` | Next / previous pane | files | `Tab` / `Shift+Tab` |
 | `view.single` / `view.split` | Single view / Split view | global | `Mod+1` / `Mod+2` |
 | `view.details` | Toggle details panel | global | `Mod+I` |
@@ -1550,6 +1551,59 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 `hasCredentials: true`. The SDK's `credentials-login` provider resolves and refreshes it from
 `~/.aws/login/cache`; an expired session surfaces as an `Auth` error whose message tells the user to run
 `aws login` again.
+
+#### IAM permissions added in this version
+
+None.
+
+## Bookmarks (added on request after v0.7.0)
+
+Folders you go back to often, one click away. Frontend only: no new command, type or event.
+
+```ts
+/** A bookmarked folder. Frontend-only (localStorage), never sent to the backend. */
+export interface Bookmark {
+  bucket: string;
+  prefix: string;   // verbatim from the server (as the pane had it), "" for a bucket root
+  label: string;    // defaults to the folder name, or the bucket name at a root
+}
+export const BOOKMARKS_MAX = 100;   // per connection
+```
+
+- **Storage.** Per connection in `localStorage` under `s3x.bookmarks.<connection key>`, as a JSON array in
+  the user's order. The key is the saved connection's id when connected through a saved connection;
+  otherwise `<label>|<region>|<endpoint or "">` from `ConnectionInfo` (the label is `profile:<name>` or
+  `static:<first 8 characters of the access key id>`; never a secret). After a window reload the app is
+  reconnected without a saved id, so the saved id in use is also kept in `sessionStorage` and reused when the
+  reconnected `ConnectionInfo` matches it. At most 100 per connection; a bookmark is identified by
+  `bucket` + `prefix` (no duplicates). Reads and writes never throw; an unreadable or malformed entry is
+  ignored. Deleting a saved connection also removes its bookmarks (`s3x.bookmarks.<id>`).
+- **Prefixes are used verbatim** (see "Data safety"): the stored prefix is exactly the pane's prefix, and
+  opening a bookmark navigates to exactly that prefix.
+- **Path bar.** A star button at the end of the path bar toggles a bookmark for that pane's current folder
+  (filled when bookmarked). Key action `nav.bookmark` "Bookmark this folder" (group Navigate, context
+  `global`, default `Mod+Shift+D`) does the same for the active pane.
+- **Bookmarks bar.** A slim row (30 px) directly under the toolbar, across the explorer (both panes),
+  shown only when there is at least one bookmark. Each bookmark is a chip (bookmark icon + label, at most
+  200 px wide, the full `s3://bucket/prefix` as tooltip), in the stored order. Click (or Enter) opens it in
+  the active pane; middle-click or `Mod`+click opens it in the other pane while two panes are shown (in the
+  active pane otherwise). Chips reorder by dragging within the bar. Right-click (or the context-menu key):
+  Open, Open in other pane (only while two panes are shown), Rename bookmark (inline; an empty name restores
+  the default label; `F2` on a chip too), Remove bookmark. The chip of the active pane's folder is marked.
+- **Overflow.** Chips that do not fit go, in order, into a "»" button at the right end of the bar; it opens
+  a menu listing them (click / middle-click / `Mod`+click and the same right-click menu as a chip; arrow
+  keys move, Escape closes). Which chips fit is measured from their rendered widths whenever the bar or the
+  labels change size, so every bookmark is always either a chip or in that menu.
+- **Several windows.** Every change re-reads the list from storage before writing it, and a window follows
+  the `storage` event for its connection's key, so two windows on one connection never drop each other's
+  bookmarks.
+- **Right-click menus.** A folder row in the file table, or a folder hit in search results: "Bookmark
+  folder", or "Remove bookmark" when it already is one. With several items selected that include folders:
+  "Bookmark N folders" adds every selected folder not yet bookmarked (disabled when all are), up to the
+  cap (the toast says how many were added when the cap stops it). A bucket in the sidebar: "Bookmark
+  bucket" / "Remove bookmark" for its root (`prefix: ""`). Every prefix is the listed one, verbatim.
+- A bookmark whose bucket is gone or inaccessible shows the usual listing error when opened and stays in
+  the list.
 
 #### IAM permissions added in this version
 

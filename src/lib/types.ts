@@ -497,3 +497,16 @@ export const OPEN_LOCAL_REFUSED_EXTENSIONS = [
   "settingcontent-ms", "diagcab", "library-ms", "search-ms", "py", "pyw", "sh", "command", "app", "terminal",
   "fileloc", "inetloc", "desktop", "reg", "lnk", "url",
 ] as const;
+
+// ---- Bookmarks (added on request after v0.7.0; frontend only, see "Bookmarks" in docs/CONTRACT.md) ----
+
+/** A bookmarked folder, stored per connection in localStorage. */
+export interface Bookmark {
+  bucket: string;
+  /** Verbatim from the server, "" for a bucket root. */
+  prefix: string;
+  /** Defaults to the folder name, or the bucket name at a root. */
+  label: string;
+}
+
+export const BOOKMARKS_MAX = 100;

@@ -13,6 +13,7 @@ import { installArchiveEffects } from "../store/archive";
 import { DragBadge } from "./RowDrag";
 import { Sidebar } from "./Sidebar";
 import { Breadcrumbs, Toolbar } from "./Toolbar";
+import { BookmarksBar } from "./BookmarksBar";
 import { ObjectTable } from "./ObjectTable";
 import { SearchResults } from "./SearchResults";
 import { toast } from "../store/toasts";
@@ -286,6 +287,7 @@ export function Explorer() {
         <main className="browser" ref={main}>
           {/* The toolbar acts on the active pane; in split view it stays (the Split button lives there). */}
           {(bucket || split) && <Toolbar />}
+          <BookmarksBar />
           <div className={`panes ${shown ? "split" : ""}`}>
             {panes.map((id, i) => (
               <Fragment key={id}>

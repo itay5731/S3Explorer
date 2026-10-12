@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { ArchiveRestore, Bookmark, BookmarkX, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane } from "../store/app";
 import { usePaneSearch } from "../store/search";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
@@ -12,6 +12,7 @@ import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlock
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 import { useKeyHint } from "../store/keyboard";
+import { addBookmarks, isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
 
 interface Item {
   label: string;
@@ -39,6 +40,7 @@ export function ContextMenu() {
   const singleInfo = useArchive((s) => (bucket && single ? s.byId[archiveId(bucket, single.key)] : undefined));
   // Split view: the other pane's folder is a destination for the selection.
   const dest = useOtherPaneDest();
+  const bookmarks = useBookmarks((s) => s.items);
   const k = {
     open: useKeyHint("nav.open"),
     copy: useKeyHint("act.copy"),
@@ -144,6 +146,19 @@ export function ContextMenu() {
     ];
   };
   const restoreItem = (label: string): Item => ({ label, icon: <ArchiveRestore size={14} />, action: () => requestRestoreArchived() });
+  // Folder prefixes are passed exactly as listed (server-provided).
+  const bookmarkItem = (fs: typeof folders): Item => {
+    if (fs.length === 1 && isBookmarked(bookmarks, bucket, fs[0].prefix)) {
+      return { label: "Remove bookmark", icon: <BookmarkX size={14} />, action: () => toggleBookmark(bucket, fs[0].prefix) };
+    }
+    const missing = fs.filter((f) => !isBookmarked(bookmarks, bucket, f.prefix));
+    return {
+      label: fs.length === 1 ? "Bookmark folder" : `Bookmark ${plural(fs.length, "folder")}`,
+      icon: <Bookmark size={14} />,
+      action: () => addBookmarks(bucket, missing.map((f) => f.prefix)),
+      ...(missing.length ? {} : { disabled: true, title: "Already bookmarked" }),
+    };
+  };
   const deleteItem = (n: number, folder: boolean): Item => ({
     label: n > 1 ? `Delete ${n} items…` : folder ? "Delete folder…" : "Delete…",
     icon: <Trash2 size={14} />,
@@ -165,6 +180,7 @@ export function ContextMenu() {
     groups.push([
       { label: inResults ? "Open folder" : "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: k.open },
       { label: "Download folder…", icon: <FolderDown size={14} />, action: () => void requestDownloadFolders([f]) },
+      bookmarkItem([f]),
     ]);
     groups.push([
       { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(f.prefix, "Key"), hint: k.copyKey },
@@ -235,6 +251,7 @@ export function ContextMenu() {
       });
     }
     if (downloads.length) groups.push(downloads);
+    if (folders.length) groups.push([bookmarkItem(folders)]);
     groups.push([
       { label: `Copy ${keys.length} keys`, icon: <Copy size={14} />, action: () => void copyText(keys.join("\n"), "Keys") },
       {
