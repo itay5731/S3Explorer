@@ -318,7 +318,17 @@ pub struct AppSettings {
     /// actions whose chords differ from the frontend defaults; unknown ids are kept.
     #[serde(default)]
     pub keybindings: BTreeMap<String, Vec<String>>,
+    /// Bandwidth limits in KiB/s, each shared by all transfers in that direction; `None` =
+    /// unlimited (see `transfers::limit`).
+    #[serde(default)]
+    pub download_limit_kibps: Option<u32>,
+    #[serde(default)]
+    pub upload_limit_kibps: Option<u32>,
 }
+
+/// Inclusive range of the bandwidth limits (mirror `BANDWIDTH_LIMITS` in `types.ts`).
+pub const BANDWIDTH_LIMIT_KIBPS_MIN: u32 = 64;
+pub const BANDWIDTH_LIMIT_KIBPS_MAX: u32 = 1_048_576;
 
 /// Limits on `keybindings` (mirror `KEYBINDING_LIMITS` in `types.ts`).
 pub const KEYBINDINGS_MAX_ACTIONS: usize = 200;
@@ -378,6 +388,8 @@ impl Default for AppSettings {
             confirm_copy_move: default_confirm_copy_move(),
             file_manager_command: None,
             keybindings: BTreeMap::new(),
+            download_limit_kibps: None,
+            upload_limit_kibps: None,
         }
     }
 }
@@ -497,6 +509,25 @@ fn keybindings_from_json(v: Option<&serde_json::Value>) -> crate::error::AppResu
     Ok(map)
 }
 
+fn bandwidth_error(field: &str) -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "{field} must be an integer from {BANDWIDTH_LIMIT_KIBPS_MIN} to {BANDWIDTH_LIMIT_KIBPS_MAX}, or null for unlimited"
+    ))
+}
+
+fn bandwidth_ok(v: Option<u32>) -> bool {
+    v.is_none_or(|v| (BANDWIDTH_LIMIT_KIBPS_MIN..=BANDWIDTH_LIMIT_KIBPS_MAX).contains(&v))
+}
+
+/// Strict parse of a bandwidth field: present, and `null` or an in-range integer.
+fn bandwidth_from_json(obj: &serde_json::Map<String, serde_json::Value>, field: &str) -> crate::error::AppResult<Option<u32>> {
+    match obj.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => json_u32(v).filter(|n| bandwidth_ok(Some(*n))).map(Some).ok_or_else(|| bandwidth_error(field)),
+        None => Err(bandwidth_error(field)),
+    }
+}
+
 fn accent_error() -> crate::error::AppError {
     crate::error::AppError::invalid(r#"accent must be "yellow", "green", "blue" or "red""#)
 }
@@ -549,6 +580,12 @@ impl AppSettings {
             return Err(file_manager_error());
         }
         validate_keybindings(&self.keybindings)?;
+        if !bandwidth_ok(self.download_limit_kibps) {
+            return Err(bandwidth_error("downloadLimitKibps"));
+        }
+        if !bandwidth_ok(self.upload_limit_kibps) {
+            return Err(bandwidth_error("uploadLimitKibps"));
+        }
         Ok(())
     }
 
@@ -571,6 +608,8 @@ impl AppSettings {
             text_weight: if text_weight_ok(self.text_weight) { self.text_weight } else { d.text_weight },
             file_manager_command: normalize_file_manager_command(self.file_manager_command.as_deref()).unwrap_or(None),
             keybindings: if validate_keybindings(&self.keybindings).is_ok() { self.keybindings } else { d.keybindings },
+            download_limit_kibps: self.download_limit_kibps.filter(|n| bandwidth_ok(Some(*n))),
+            upload_limit_kibps: self.upload_limit_kibps.filter(|n| bandwidth_ok(Some(*n))),
             ..self
         }
     }
@@ -629,12 +668,16 @@ impl AppSettings {
                 .and_then(|c| normalize_file_manager_command(Some(c)).ok().flatten()),
             // Missing or malformed (any rule broken) -> no overrides.
             keybindings: keybindings_from_json(obj.get("keybindings")).unwrap_or_default(),
+            // Missing, null or invalid -> unlimited.
+            download_limit_kibps: bandwidth_from_json(obj, "downloadLimitKibps").unwrap_or(None),
+            upload_limit_kibps: bandwidth_from_json(obj, "uploadLimitKibps").unwrap_or(None),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all twelve fields must be present
+    /// Strict parse of the `update_settings` argument: all fourteen fields must be present
     /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`; `keybindings` an
-    /// object of chord arrays within [`validate_keybindings`]'s limits). Transfer
+    /// object of chord arrays within [`validate_keybindings`]'s limits; `downloadLimitKibps` and
+    /// `uploadLimitKibps` `null` or an integer within the bandwidth range). Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
     /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
     /// `notifyOnFinish` and `confirmCopyMove` booleans. Anything else is
@@ -686,6 +729,8 @@ impl AppSettings {
                 _ => return Err(file_manager_error()),
             },
             keybindings: keybindings_from_json(obj.get("keybindings"))?,
+            download_limit_kibps: bandwidth_from_json(obj, "downloadLimitKibps")?,
+            upload_limit_kibps: bandwidth_from_json(obj, "uploadLimitKibps")?,
         };
         s.validate()?;
         Ok(s)

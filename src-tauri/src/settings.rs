@@ -150,7 +150,9 @@ mod tests {
                 "accent": "yellow",
                 "confirmCopyMove": true,
                 "fileManagerCommand": null,
-                "keybindings": {}
+                "keybindings": {},
+                "downloadLimitKibps": null,
+                "uploadLimitKibps": null
             })
         );
         assert!(d.validate().is_ok());
@@ -194,6 +196,8 @@ mod tests {
         o.entry("confirmCopyMove").or_insert(json!(true));
         o.entry("fileManagerCommand").or_insert(serde_json::Value::Null);
         o.entry("keybindings").or_insert(json!({}));
+        o.entry("downloadLimitKibps").or_insert(serde_json::Value::Null);
+        o.entry("uploadLimitKibps").or_insert(serde_json::Value::Null);
         v
     }
 
@@ -234,7 +238,7 @@ mod tests {
     #[test]
     fn strict_parse_theme_and_update_flag() {
         let base =
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}});
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}, "downloadLimitKibps": null, "uploadLimitKibps": null});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -463,6 +467,74 @@ mod tests {
     }
 
     #[test]
+    fn bandwidth_limits() {
+        let with = |field: &str, value: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match value {
+                Some(value) => o.insert(field.into(), value),
+                None => o.remove(field),
+            };
+            v
+        };
+        let d = AppSettings::default();
+        assert_eq!((d.download_limit_kibps, d.upload_limit_kibps), (None, None), "unlimited by default");
+        for field in ["downloadLimitKibps", "uploadLimitKibps"] {
+            let get = |s: &AppSettings| if field == "downloadLimitKibps" { s.download_limit_kibps } else { s.upload_limit_kibps };
+            for (value, want) in [
+                (serde_json::Value::Null, None),
+                (json!(BANDWIDTH_LIMIT_KIBPS_MIN), Some(64)),
+                (json!(BANDWIDTH_LIMIT_KIBPS_MAX), Some(1_048_576)),
+                (json!(1024), Some(1024)),
+            ] {
+                let v = with(field, Some(value.clone()));
+                assert_eq!(get(&AppSettings::from_json_strict(&v).expect("valid")), want, "{field} {value}");
+                assert_eq!(get(&AppSettings::from_json_lenient(&v)), want, "{field} {value}");
+            }
+            for bad in [json!(63), json!(1_048_577), json!(0), json!(-64), json!(100.5), json!("1024"), json!(true), json!(4294967296u64)] {
+                let v = with(field, Some(bad.clone()));
+                let e = AppSettings::from_json_strict(&v).expect_err(&bad.to_string());
+                assert_eq!(e.code, ErrorCode::InvalidInput);
+                assert!(e.message.starts_with(field) && e.message.contains("64 to 1048576"), "{bad} -> {}", e.message);
+                // The on-disk file is read leniently: only this field falls back to unlimited.
+                assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{bad}");
+            }
+            // update_settings requires it; the on-disk file without it loads null.
+            let e = AppSettings::from_json_strict(&with(field, None)).expect_err("missing");
+            assert!(e.message.starts_with(field), "{}", e.message);
+            assert_eq!(AppSettings::from_json_lenient(&with(field, None)), AppSettings::default());
+        }
+        // A bad limit next to a good one: only the bad one resets.
+        let mut v = with("downloadLimitKibps", Some(json!(512)));
+        v.as_object_mut().expect("object").insert("uploadLimitKibps".into(), json!(1));
+        let got = AppSettings::from_json_lenient(&v);
+        assert_eq!((got.download_limit_kibps, got.upload_limit_kibps), (Some(512), None));
+
+        // validate() / sanitized() on the in-memory value.
+        let bad = AppSettings { upload_limit_kibps: Some(10), ..AppSettings::default() };
+        assert!(err_msg(bad.validate()).starts_with("uploadLimitKibps"));
+        assert_eq!(bad.sanitized().upload_limit_kibps, None);
+        let bad = AppSettings { download_limit_kibps: Some(BANDWIDTH_LIMIT_KIBPS_MAX + 1), ..AppSettings::default() };
+        assert!(err_msg(bad.validate()).starts_with("downloadLimitKibps"));
+
+        // A file written before this setting existed loads both as unlimited.
+        let dir = temp_dir("bandwidth");
+        let path = dir.join(SETTINGS_FILE);
+        std::fs::write(&path, r#"{"partSizeMib": 16, "maxConcurrentParts": 4, "maxConcurrentTransfers": 2, "keybindings": {}}"#)
+            .expect("write");
+        let loaded = load(&path);
+        assert_eq!((loaded.download_limit_kibps, loaded.upload_limit_kibps), (None, None));
+        assert_eq!(loaded, s(Some(16), 4, 2));
+        // Round trip through the file.
+        let saved = AppSettings { download_limit_kibps: Some(2048), upload_limit_kibps: Some(64), ..AppSettings::default() };
+        save(&path, &saved).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"downloadLimitKibps\": 2048") && text.contains("\"uploadLimitKibps\": 64"), "{text}");
+        assert_eq!(load(&path), saved);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn confirm_copy_move_flag() {
         let with = |flag: Option<serde_json::Value>| {
             let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
@@ -530,6 +602,8 @@ mod tests {
                 confirm_copy_move: true,
                 file_manager_command: None,
                 keybindings: Default::default(),
+                download_limit_kibps: None,
+                upload_limit_kibps: None,
             }
         );
         // Saved again, the file carries the new field.
@@ -586,6 +660,8 @@ mod tests {
                 confirm_copy_move: true,
                 file_manager_command: None,
                 keybindings: Default::default(),
+                download_limit_kibps: None,
+                upload_limit_kibps: None,
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
@@ -615,6 +691,8 @@ mod tests {
                     confirm_copy_move: true,
                     file_manager_command: None,
                     keybindings: Default::default(),
+                    download_limit_kibps: None,
+                    upload_limit_kibps: None,
                 },
             ),
             // Non-boolean flag: only the flag falls back.

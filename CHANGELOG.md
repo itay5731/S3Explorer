@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Speed limits for transfers.** Settings → Transfers can cap download and upload speed (from 64 KiB/s up), shared by every running transfer, so the app no longer fills your connection. A change applies to running transfers within a second, and the Activity bar shows when a limit is on.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

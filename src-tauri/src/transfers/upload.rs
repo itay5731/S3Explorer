@@ -1,22 +1,30 @@
 //! Upload: `PutObject` for small files, concurrent multipart upload for large ones.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
+use http_body::{Body, Frame, SizeHint};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use super::limit::Limiter;
 use super::{cancellable, plan, AbortOnDrop, PartSettings, TransferEntry};
 use crate::error::{AppError, AppResult, ErrorCode};
 
 /// Slowest uplink assumed healthy: 32 KiB/s (256 kbit/s) in total, shared evenly by every
-/// body-carrying request the app may have in flight at once.
+/// body-carrying request the app may have in flight at once. The lowest bandwidth limit is above
+/// it and the limiter serves requests in turn, so a limited upload never hits the timeout below.
 pub(crate) const UPLOAD_MIN_RATE: u64 = 32 * 1024;
 /// Fixed allowance per attempt (connection setup, the server committing the data, latency).
 const UPLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(60);
@@ -43,6 +51,70 @@ fn body_upload_config(cfg: &PartSettings, body_len: u64) -> aws_sdk_s3::config::
     let t = cfg.upload_attempt_timeout.unwrap_or_else(|| upload_attempt_timeout(body_len, cfg.link_share));
     aws_sdk_s3::config::Builder::default()
         .timeout_config(TimeoutConfig::builder().disable_read_timeout().operation_attempt_timeout(t).build())
+}
+
+/// A request body that takes tokens from the upload limiter for each chunk before handing it to
+/// the HTTP client. Rebuilt with the body for every SDK retry, so a retried part is throttled too.
+struct Throttled {
+    inner: Pin<Box<SdkBody>>,
+    limiter: Arc<Limiter>,
+    /// A chunk read from disk with its limiter ticket, held until the limiter lets it go.
+    held: Option<(f64, Frame<Bytes>)>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Body for Throttled {
+    type Data = Bytes;
+    type Error = aws_smithy_types::body::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some((ticket, _)) = &this.held {
+                if let Some(sleep) = &mut this.sleep {
+                    ready!(sleep.as_mut().poll(cx));
+                    this.sleep = None;
+                }
+                match this.limiter.delay(*ticket) {
+                    Some(d) => this.sleep = Some(Box::pin(tokio::time::sleep(d))),
+                    None => return Poll::Ready(this.held.take().map(|(_, frame)| Ok(frame))),
+                }
+                continue;
+            }
+            let frame = match ready!(this.inner.as_mut().poll_frame(cx)) {
+                Some(Ok(frame)) => frame,
+                other => return Poll::Ready(other),
+            };
+            let n = frame.data_ref().map_or(0, |d| d.len() as u64);
+            match (n > 0).then(|| this.limiter.reserve(n)).flatten() {
+                Some(ticket) => this.held = Some((ticket, frame)),
+                None => return Poll::Ready(Some(Ok(frame))),
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.held.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let inner = Body::size_hint(self.inner.as_ref().get_ref());
+        let held = self.held.as_ref().and_then(|(_, f)| f.data_ref()).map_or(0, |d| d.len() as u64);
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower() + held);
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper + held);
+        }
+        hint
+    }
+}
+
+/// `body` paced by `limiter` (still replayable when `body` is).
+fn throttled(body: ByteStream, limiter: &Arc<Limiter>) -> ByteStream {
+    let limiter = limiter.clone();
+    body.map(move |inner| {
+        SdkBody::from_body_1_x(Throttled { inner: Box::pin(inner), limiter: limiter.clone(), held: None, sleep: None })
+    })
 }
 
 pub(super) async fn run(
@@ -73,7 +145,7 @@ pub(super) async fn run(
     entry.set_totals(size, p.parts_total());
     if !p.multipart {
         let _in_flight = entry.part_started();
-        let body = ByteStream::from_path(src).await?;
+        let body = throttled(ByteStream::from_path(src).await?, &entry.limit);
         cancellable(
             &token,
             client
@@ -201,6 +273,7 @@ async fn upload_parts(
                 .build()
                 .await
                 .map_err(|e| AppError::new(ErrorCode::Io, format!("Could not read {}: {e}", src.display())))?;
+            let body = throttled(body, &entry.limit);
             let resp = cancellable(
                 &token,
                 client

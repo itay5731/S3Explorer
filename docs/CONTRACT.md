@@ -1554,3 +1554,39 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## Bandwidth limit (added on request after v0.7.0)
+
+Keeps transfers from filling the connection.
+
+```ts
+// AppSettings gains:
+downloadLimitKibps: number | null;  // null = unlimited (default); else an integer 64..=1_048_576 KiB/s
+uploadLimitKibps: number | null;    // same
+export const BANDWIDTH_LIMITS = { minKibps: 64, maxKibps: 1_048_576 } as const;
+```
+
+- `update_settings` validates both fields strictly: each must be present, `null` or an integer in range;
+  anything else is `InvalidInput` with a message starting with the field name. A `settings.json` without
+  them (or with an invalid value) loads `null` for that field alone, like every other settings field.
+- **One shared limiter per direction** across all transfers and folder transfers: a token bucket refilled
+  continuously at the limit, with a burst of 256 KiB. Downloads take tokens for the bytes read from S3 (each
+  body chunk as it arrives); uploads for the bytes sent (the request body is throttled as the HTTP client
+  reads it, so an SDK retry of a part is throttled again). Waiters are served in arrival order, so parallel
+  parts and transfers share the limit evenly. Server-side copies (jobs) are not limited.
+- **Live:** changing either field applies to running transfers within a second, without restarting them.
+  Setting `null` releases every waiter at once.
+- **Never a hang:** waiting on the limiter is not a stall. The download body idle timeout (30 s) covers only
+  the wait for the next chunk from the network, never the wait for tokens. The upload attempt timeout
+  assumes at least 32 KiB/s shared by every body-carrying request; the lowest limit (64 KiB/s) is above
+  that, and the limiter serves requests in turn, so a limited healthy link never hits it.
+- Live speed and ETA in Activity reflect the limited speed naturally (they are measured, not computed
+  from the limit).
+- **UI:** Settings → Transfers gets "Download speed limit" and "Upload speed limit", each an "Unlimited"
+  switch plus a number field with a unit select (KiB/s, MiB/s), validated against the range; the impact
+  summary mentions an active limit. The Activity bar shows a small "Limited to x MiB/s" note while a limit
+  is active.
+
+#### IAM permissions added in this version
+
+None.

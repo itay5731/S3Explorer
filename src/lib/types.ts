@@ -144,7 +144,16 @@ export interface AppSettings extends TransferSettings {
    * from the defaults (see "Keyboard" in docs/CONTRACT.md). Default {}.
    */
   keybindings: Record<string, string[]>;
+  /**
+   * Bandwidth limits in KiB/s shared by all transfers (see "Bandwidth limit" in docs/CONTRACT.md);
+   * null = unlimited. Integers within `BANDWIDTH_LIMITS` otherwise.
+   */
+  downloadLimitKibps: number | null;
+  uploadLimitKibps: number | null;
 }
+
+/** Range of `downloadLimitKibps` / `uploadLimitKibps` (the backend enforces the same). */
+export const BANDWIDTH_LIMITS = { minKibps: 64, maxKibps: 1_048_576 } as const;
 
 /** Ranges and slider steps for the text settings (the backend enforces the same ranges). */
 export const TEXT_SETTINGS_LIMITS = {
@@ -163,6 +172,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   confirmCopyMove: true,
   fileManagerCommand: null,
   keybindings: {},
+  downloadLimitKibps: null,
+  uploadLimitKibps: null,
 };
 
 // Saved connections

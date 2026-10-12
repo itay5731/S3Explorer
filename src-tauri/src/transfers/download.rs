@@ -674,6 +674,8 @@ async fn attempt(
         if w.next + chunk.len() as u64 > end {
             return Err(span.overrun());
         }
+        // Outside `next_chunk`'s idle timeout: holding bytes back is not a stall.
+        cancellable(token, entry.limit.take(chunk.len() as u64)).await?;
         w.push(&chunk).await?;
         entry.add_bytes(chunk.len() as u64);
     }

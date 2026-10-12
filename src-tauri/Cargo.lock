@@ -4387,6 +4387,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "futures",
+ "http-body 1.1.0",
  "keyring",
  "mime_guess",
  "regex",

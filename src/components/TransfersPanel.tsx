@@ -24,6 +24,7 @@ import {
   ClipboardCopy,
   ExternalLink,
   LocateFixed,
+  Gauge,
 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, Batch, BatchStatus, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
@@ -37,6 +38,8 @@ import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
 import { toast } from "../store/toasts";
 import { basename, formatBytes, formatDuration, formatSpeed, refusedToOpen } from "../lib/format";
 import { isJobActive, jobFraction, plural } from "../lib/ops";
+import { formatLimit } from "../lib/settings";
+import { openSettings, useSettings } from "../store/settings";
 import { shortVersionId, useVersionDownloads } from "../store/versions";
 
 const STATUS_LABEL: Record<TransferStatus, string> = {
@@ -697,6 +700,25 @@ function Summary() {
   );
 }
 
+/** "Limited to 2 MiB/s down" while a speed limit is set; opens Settings → Transfers. */
+function LimitNote() {
+  const down = useSettings((s) => s.settings?.downloadLimitKibps ?? null);
+  const up = useSettings((s) => s.settings?.uploadLimitKibps ?? null);
+  if (down === null && up === null) return null;
+  const parts = [down !== null && `${formatLimit(down)} down`, up !== null && `${formatLimit(up)} up`].filter(Boolean);
+  return (
+    <button
+      type="button"
+      className="xlimit"
+      title="Speed limits for all transfers. Change them in Settings → Transfers."
+      onClick={() => openSettings("transfers")}
+    >
+      <Gauge size={12} />
+      Limited to {parts.join(", ")}
+    </button>
+  );
+}
+
 type ActivityRow = { kind: "job" | "transfer" | "batch"; id: string };
 
 /** Bottom panel: transfers (uploads/downloads) and jobs (delete/copy/move), newest first. */
@@ -752,6 +774,7 @@ export function ActivityPanel() {
           {active === 0 && total > 0 && <span className="muted small">{total} finished</span>}
         </button>
         <Summary />
+        <LimitNote />
         <div className="spacer" />
         {open && finishedCount > 0 && (
           <button className="link-btn" onClick={clearFinished}>
