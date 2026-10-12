@@ -9,7 +9,7 @@ import { SEARCH_LIMITS, type AppError, type SearchHit } from "../lib/types";
 import { parseS3Path } from "../lib/search";
 import { activePane, getPane, navigate, onNavigate, onPaneReset, setFilter, setPane, setSelection, useApp, usePaneId } from "./app";
 import { jobRequest, onJobUpdate } from "./jobs";
-import { emptySearch, PANE_IDS, usePanes, type PaneId, type PaneSearch, type SearchRequest } from "./panes";
+import { emptySearch, PANE_IDS, updateHiddenTabs, usePanes, type PaneId, type PaneSearch, type SearchRequest } from "./panes";
 import { toast } from "./toasts";
 
 export type { SearchRequest } from "./panes";
@@ -248,20 +248,20 @@ export function leaveSearch(pane: PaneId = activePane()) {
   setFilter("", pane);
 }
 
-/** Drop hits (and their selection) that a finished job deleted or moved away. */
-function removeHits(pane: PaneId, gone: (h: SearchHit) => boolean) {
-  const { result, selection, anchor, focus } = getSearch(pane);
-  if (!result) return;
+/** A search without the hits (and their selection) that a finished job deleted or moved away; null when none went. */
+function withoutHits(search: PaneSearch, gone: (h: SearchHit) => boolean): Partial<PaneSearch> | null {
+  const { result, selection, anchor, focus } = search;
+  if (!result) return null;
   const hits = result.hits.filter((h) => !gone(h));
-  if (hits.length === result.hits.length) return;
+  if (hits.length === result.hits.length) return null;
   const ids = new Set(hits.map(hitId));
   const keep = new Set([...selection].filter((id) => ids.has(id)));
-  setSearch(pane, {
+  return {
     result: { ...result, hits },
     selection: keep,
     anchor: anchor && ids.has(anchor) ? anchor : null,
     focus: focus && ids.has(focus) ? focus : hits[0] ? hitId(hits[0]) : null,
-  });
+  };
 }
 
 // A delete, rename or move that finished takes its sources out of the results (in every pane): they
@@ -275,16 +275,23 @@ onJobUpdate((j, prev) => {
   if (!req) return;
   const failed = new Set(j.errors.map((e) => e.key));
   const keyOf = (h: SearchHit) => (h.kind === "folder" ? h.folder!.prefix : h.entry!.key);
+  const gone = (h: SearchHit) => {
+    const k = keyOf(h);
+    // Keep a hit that failed, and a folder that still holds something that failed.
+    for (const f of failed) if (f === k || (h.kind === "folder" && f.startsWith(k))) return false;
+    return req.items.some((it) => (it.isPrefix ? k.startsWith(it.from) : !it.isPrefix && h.kind === "object" && k === it.from));
+  };
+  const affected = (s: PaneSearch) => !!s.request && req.srcBucket === s.request.bucket;
   for (const pane of PANE_IDS) {
-    const { request } = getSearch(pane);
-    if (!request || req.srcBucket !== request.bucket) continue;
-    removeHits(pane, (h) => {
-      const k = keyOf(h);
-      // Keep a hit that failed, and a folder that still holds something that failed.
-      for (const f of failed) if (f === k || (h.kind === "folder" && f.startsWith(k))) return false;
-      return req.items.some((it) => (it.isPrefix ? k.startsWith(it.from) : !it.isPrefix && h.kind === "object" && k === it.from));
-    });
+    const s = getSearch(pane);
+    const patch = affected(s) ? withoutHits(s, gone) : null;
+    if (patch) setSearch(pane, patch);
   }
+  // Hidden tabs' results too (see "Tabs" in docs/CONTRACT.md).
+  updateHiddenTabs((t) => {
+    const patch = affected(t.saved.search) ? withoutHits(t.saved.search, gone) : null;
+    return patch ? { saved: { ...t.saved, search: { ...t.saved.search, ...patch } } } : null;
+  });
 });
 
 // Every navigation of a pane closes its results, even to the current folder (a newest file, a
@@ -292,9 +299,11 @@ onJobUpdate((j, prev) => {
 // the results. A pane that is reset (split closed, disconnect) stops its search too.
 onNavigate((pane) => closeSearch(pane));
 onPaneReset((pane) => closeSearch(pane));
-// So does a change of a pane's bucket or folder, or of the connection.
+// So does a change of a pane's bucket or folder (within a tab: showing another tab brings its own
+// results), or of the connection.
 usePanes.subscribe((s, prev) => {
   for (const pane of PANE_IDS) {
+    if (s[pane].tab !== prev[pane].tab) continue;
     if (s[pane].bucket !== prev[pane].bucket || s[pane].prefix !== prev[pane].prefix) closeSearch(pane);
   }
 });

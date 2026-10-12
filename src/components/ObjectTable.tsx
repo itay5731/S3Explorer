@@ -23,6 +23,7 @@ import { pickAndUpload } from "../store/actions";
 import { useClipboard } from "../store/clipboard";
 import { isDenied, permissionText } from "../store/toasts";
 import { useRowDrag, useRowDragView } from "./RowDrag";
+import { openFolderInNewTab, takeTabScroll } from "../store/tabs";
 
 const ROW_H = 28;
 
@@ -108,6 +109,7 @@ export function ObjectTable() {
   const drag = useRowDrag(scrollRef, pane);
   const dragIds = useRowDragView((s) => s.ids);
   const scrollTo = usePane((s) => s.scrollTo);
+  const tab = usePane((s) => s.tab);
 
   const virtualizer = useVirtualizer({
     count: rows.length,
@@ -120,6 +122,12 @@ export function ObjectTable() {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [bucket, prefix, sort]);
+
+  // Another tab shown: back to where that tab was scrolled (after the reset above).
+  useEffect(() => {
+    const top = takeTabScroll(pane, tab);
+    if (scrollRef.current) scrollRef.current.scrollTop = top;
+  }, [pane, tab]);
 
   // Bring a revealed row (a newest file opened from the sidebar) into view once it is loaded.
   useEffect(() => {
@@ -193,6 +201,18 @@ export function ObjectTable() {
   const onDoubleClick = (e: ReactMouseEvent) => {
     const index = rowIndexFromEvent(e);
     if (index >= 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey) openRow(rows[index]);
+  };
+
+  // Middle-click on a folder opens it in a new tab, in the background; the press must not start
+  // the webview's autoscroll.
+  const onMouseDown = (e: ReactMouseEvent) => {
+    if (e.button === 1) e.preventDefault();
+  };
+  const onAuxClick = (e: ReactMouseEvent) => {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    const row = rows[rowIndexFromEvent(e)];
+    if (bucket && row?.kind === "folder") openFolderInNewTab(bucket, row.folder.prefix, pane, false);
   };
 
   const onContextMenu = (e: ReactMouseEvent) => {
@@ -315,6 +335,8 @@ export function ObjectTable() {
         onPointerDown={drag.onPointerDown}
         onDragStart={(e) => e.preventDefault()}
         onDoubleClick={onDoubleClick}
+        onMouseDown={onMouseDown}
+        onAuxClick={onAuxClick}
         onContextMenu={onContextMenu}
       >
         {loading && !hasRows ? (

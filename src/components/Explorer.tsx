@@ -15,6 +15,7 @@ import { Sidebar } from "./Sidebar";
 import { Breadcrumbs, Toolbar } from "./Toolbar";
 import { ObjectTable } from "./ObjectTable";
 import { SearchResults } from "./SearchResults";
+import { TabStrip } from "./TabStrip";
 import { toast } from "../store/toasts";
 import { DetailsPanel } from "./DetailsPanel";
 import { ActivityPanel } from "./TransfersPanel";
@@ -160,7 +161,7 @@ function useKeyDispatcher() {
   }, []);
 }
 
-/** One explorer pane: its path bar and its table (or search results), and the OS-drop overlay. */
+/** One explorer pane: its tab strip, its path bar and its table (or search results), and the OS-drop overlay. */
 function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
   const bucket = usePanes((s) => s[id].bucket);
   const prefix = usePanes((s) => s[id].prefix);
@@ -178,6 +179,7 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
         onPointerDownCapture={() => setActivePane(id)}
         onFocusCapture={() => setActivePane(id)}
       >
+        <TabStrip pane={id} />
         {bucket && <Breadcrumbs />}
         <div className="table-wrap">
           {searchOpen ? <SearchResults /> : <ObjectTable />}

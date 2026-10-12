@@ -13,7 +13,7 @@ import { clearRecent } from "./recent";
 import { clearArchive } from "./archive";
 import { clearVersioning } from "./versions";
 import { selectActiveCount, useTransfers } from "./transfers";
-import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, usePanes, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
+import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, tabEntry, usePanes, usePaneTabs, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
 import { readPref, writePref } from "./prefs";
 
 export type { Listing, PaneId, PaneState, SortKey, SortState } from "./panes";
@@ -182,12 +182,19 @@ export function onPaneReset(cb: (pane: PaneId) => void): () => void {
  */
 const freshPanes = new Set<PaneId>();
 
-/** Forget everything a pane shows (stops its in-flight listing and search). */
+/** Forget everything a pane shows (stops its in-flight listing and search), and all its tabs but one. */
 function resetPane(id: PaneId) {
   resetListeners.forEach((cb) => cb(id));
   freshPanes.add(id);
   listSeq[id]++;
-  setPane(id, { ...freshPane(getPane(id).sort), search: emptySearch });
+  const fresh = { ...freshPane(getPane(id).sort), search: emptySearch };
+  usePaneTabs.setState({ [id]: [tabEntry(fresh.tab)] } as Partial<Record<PaneId, never>>);
+  setPane(id, fresh);
+}
+
+/** Stop a pane's listing in flight: its result is dropped (a tab of the pane is being hidden). */
+export function stopListing(pane: PaneId) {
+  listSeq[pane]++;
 }
 
 /**
@@ -231,11 +238,23 @@ async function fetchPage(pane: PaneId, bucket: string, prefix: string, token: st
 /** The saved connection the app is connected through (null: connected without saving, or not connected). */
 let savedConnectionId: string | null = null;
 
+const connectionListeners = new Set<(key: string | null) => void>();
+/**
+ * Called with a key that identifies the connection once it is set up (panes reset, connection set),
+ * and with null before panes are reset for a new connection or a disconnect (remembered tabs).
+ */
+export function onConnectionChange(cb: (key: string | null) => void): () => void {
+  connectionListeners.add(cb);
+  return () => connectionListeners.delete(cb);
+}
+const notifyConnection = (key: string | null) => connectionListeners.forEach((cb) => cb(key));
+
 function resetPanes() {
   for (const id of PANE_IDS) resetPane(id);
 }
 
 export function setConnected(info: ConnectionInfo, savedId: string | null = null) {
+  notifyConnection(null);
   savedConnectionId = savedId;
   clearClipboard();
   clearRecent();
@@ -252,10 +271,12 @@ export function setConnected(info: ConnectionInfo, savedId: string | null = null
   });
   if (info.canListBuckets) void loadBuckets();
   void loadAddedBuckets();
+  notifyConnection(savedId ? `saved:${savedId}` : `conn:${info.label}|${info.endpoint ?? ""}|${info.region}`);
 }
 
 /** `cancelActive`: cancel every queued or running transfer, folder transfer and job before disconnecting. */
 export async function disconnect(cancelActive = false) {
+  notifyConnection(null);
   try {
     await api.disconnect(cancelActive);
   } catch {
@@ -338,6 +359,11 @@ export async function removeSharedBucket(name: string): Promise<void> {
   set((s) => ({ addedBuckets: s.addedBuckets.filter((b) => b.name !== name) }));
   // Close it in every pane that shows it, unless it is also in the regular list.
   if (buckets.some((b) => b.name === name)) return;
+  usePaneTabs.setState((s) => {
+    const next = { ...s };
+    for (const id of PANE_IDS) next[id] = s[id].filter((t) => t.saved?.bucket !== name);
+    return next;
+  });
   for (const id of PANE_IDS) {
     if (getPane(id).bucket !== name) continue;
     listSeq[id]++;
@@ -400,7 +426,12 @@ export function goHistory(delta: -1 | 1, pane: PaneId = activePane()): boolean {
  * Open `bucket`/`prefix` in a pane (default: the active pane). Every navigation is recorded in the
  * pane's history except Back / Forward themselves (`fromHistory`).
  */
-export function navigate(bucket: string, prefix: string, pane: PaneId = activePane(), opts: { fromHistory?: boolean; replaceHistory?: boolean } = {}) {
+export function navigate(
+  bucket: string,
+  prefix: string,
+  pane: PaneId = activePane(),
+  opts: { fromHistory?: boolean; replaceHistory?: boolean; alone?: boolean } = {},
+) {
   navigateListeners.forEach((cb) => cb(pane));
   freshPanes.delete(pane);
   // Server-provided prefixes are used verbatim (see asFolderPrefix / normalizePrefix).
@@ -420,7 +451,8 @@ export function navigate(bucket: string, prefix: string, pane: PaneId = activePa
   // Split view with the other pane still empty since connecting (the split was saved and this is
   // the first bucket opened): it opens at the same place, as when the split is opened.
   const other = otherPane(pane);
-  if (isSplitShown() && freshPanes.has(other) && !getPane(other).bucket) navigate(bucket, p, other);
+  // `alone`: the other pane is about to be opened somewhere itself (restoring remembered tabs).
+  if (!opts.alone && isSplitShown() && freshPanes.has(other) && !getPane(other).bucket) navigate(bucket, p, other);
 }
 
 let scrollSeq = 0;
@@ -459,8 +491,8 @@ async function continueReveal(pane: PaneId) {
   if (getPane(pane).reveal) setPane(pane, { reveal: null, selection: new Set(), anchor: null, focus: null });
 }
 
-export function refresh(pane: PaneId = activePane()) {
-  void loadFirstPage(pane, true);
+export function refresh(pane: PaneId = activePane()): Promise<void> {
+  return loadFirstPage(pane, true);
 }
 
 async function loadFirstPage(pane: PaneId, keepSelection = false) {
@@ -488,6 +520,7 @@ async function loadFirstPage(pane: PaneId, keepSelection = false) {
           error: null,
         },
         selection,
+        listedAt: Date.now(),
       };
     });
     if (getPane(pane).reveal) void continueReveal(pane);
@@ -551,6 +584,7 @@ async function reloadKeepingPosition(pane: PaneId) {
     const selection = new Set([...s.selection].filter((id) => ids.has(id)));
     return {
       listing: { folders, objects, token, truncated, loading: false, loadingMore: false, error: null },
+      listedAt: Date.now(),
       selection: selection.size === s.selection.size ? s.selection : selection,
       anchor: s.anchor && ids.has(s.anchor) ? s.anchor : null,
       focus: s.focus && ids.has(s.focus) ? s.focus : null,

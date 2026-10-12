@@ -1554,3 +1554,66 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## Tabs (added on request after v0.7.0)
+
+Several locations open at once in each pane. Frontend only; no new command, type or event.
+
+- Each pane (see "Split view" and "State shape" in the v0.7.0 section) holds a list of **tabs** and an
+  active tab. A tab owns what a pane owned in v0.7.0: bucket, prefix, listing, sort, selection, filter (the
+  search box text), search results, history. Switching tabs restores all of it at once, with the table's
+  scroll position, without a refetch, unless the cached listing is older than 60 s or something changed
+  that folder while the tab was hidden; it is then refreshed in place in the background. A search or a
+  listing still running when its tab is hidden stops (the search says it was cancelled; the listing loads
+  again when the tab is shown).
+- The **tab strip** sits above each pane's path bar and appears only when the pane has 2 or more tabs. Each
+  tab: a folder icon, the folder name (the bucket name at a bucket root), a close button shown on hover and
+  on the active tab; the full `s3://` path as tooltip. Middle-click closes. Tabs reorder by dragging within
+  their pane (pointer events, like the saved-connection tiles). At most **20 tabs per pane**; asking for a
+  21st shows a toast and opens nothing.
+- **Dropping rows onto a tab** (either pane): rows dragged from a table highlight a tab they are over and,
+  released there, go into that tab's folder exactly as a drop on a folder row or path-bar crumb does
+  ("Drag and drop to move or copy"): `Ctrl` / `Option` copies, the same refusals, preview, confirmation
+  setting and job, with the items captured when the drag started. The tab the rows were dragged from is no
+  target (no highlight, nothing happens). Hovering a tab for **600 ms** during the drag shows it, so its
+  file list (empty area or object rows) becomes a target too, including in the pane the drag started in;
+  the drag keeps its captured items (and their storage classes, for the archived-object check).
+- **Moving a tab to the other pane:** only while two panes are on screen. A tab dragged and released over
+  the other pane's tab strip (at the position under the pointer) or, when that pane has one tab, its path
+  bar (after its shown tab) moves there with its whole state (listing, selection, filter, search results,
+  history, scroll) and is shown; the target is highlighted during the drag. Released on its own strip it
+  only reorders. The last tab of a pane can't be dragged (its strip is hidden); a pane already at 20 tabs
+  refuses with a toast. A search or listing running in the tab stops as when it is hidden.
+- Key actions (in `src/lib/keys.ts`, group Navigate, context `global`; none of these defaults was taken):
+
+  | Action id | Label | Defaults |
+  |---|---|---|
+  | `tab.new` | New tab (duplicates the current location) | `Mod+Alt+T` |
+  | `tab.close` | Close tab | `Mod+W` |
+  | `tab.next` | Next tab | `Mod+Tab`, `Mod+PageDown` |
+  | `tab.prev` | Previous tab | `Mod+Shift+Tab`, `Mod+PageUp` |
+  | `tab.reopen` | Reopen closed tab | `Mod+Alt+Shift+T` |
+
+  On macOS `Cmd+Tab` / `Cmd+Shift+Tab` belong to the system; `Cmd+PageDown` / `Cmd+PageUp` work there.
+  Closing the last tab of a pane does nothing: the pane stays on its location (never an empty pane).
+  A new tab opens right after the current one. "New tab" copies the location and its loaded listing, with
+  no selection, filter, results or history behind it. "Reopen closed tab" brings back the last closed tabs
+  (up to 20, this connection only) at their location, in the pane they were closed in when it is shown
+  (else the active pane).
+- Folder rows: the context menu of a single folder has **Open in new tab** (the new tab becomes the shown
+  one); **middle-click** on a folder row opens it in a new tab in the background. Both use the folder's
+  prefix verbatim. The same for buckets in the sidebar: middle-click opens the bucket's root in a new
+  background tab of the active pane, and the bucket's menu has **Open in new tab** (shown at once). The
+  20-tab cap applies (same toast). A pane with nothing open just opens the place instead of adding a tab.
+- Open tabs are remembered **per connection** in `localStorage` (`s3x.tabs`: per connection, per pane, the
+  tabs' bucket and prefix and which one is active; nothing else), and restored on reconnect (the second pane
+  only when the split is on). The connection is identified by its saved-connection id, else by its label,
+  endpoint and region. Reads and writes never throw; malformed data is ignored.
+- Everything that acts on "the active pane" acts on the active pane's shown tab. Transfers, jobs and their
+  events keep working whichever tab is shown. A job, upload or new folder that changes a folder refreshes
+  the shown tabs showing it at once and marks hidden tabs showing it for a refresh when they are shown (a
+  hidden tab whose folder a move or delete took away goes to the nearest existing ancestor then, as a shown
+  pane does). Search hits removed by a finished delete or move leave hidden tabs' results too. "Remove from
+  list" of an added bucket closes the hidden tabs showing it.
+- Closing the split drops the other pane's tabs; disconnecting resets every pane to one empty tab and forgets
+  the closed-tab list (the remembered tabs stay in `localStorage`).

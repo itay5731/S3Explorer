@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, SquarePlus, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane } from "../store/app";
 import { usePaneSearch } from "../store/search";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
@@ -12,6 +12,7 @@ import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlock
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 import { useKeyHint } from "../store/keyboard";
+import { openFolderInNewTab } from "../store/tabs";
 
 interface Item {
   label: string;
@@ -164,6 +165,7 @@ export function ContextMenu() {
     const f = folders[0];
     groups.push([
       { label: inResults ? "Open folder" : "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: k.open },
+      { label: "Open in new tab", icon: <SquarePlus size={14} />, action: () => openFolderInNewTab(bucket, f.prefix) },
       { label: "Download folder…", icon: <FolderDown size={14} />, action: () => void requestDownloadFolders([f]) },
     ]);
     groups.push([
