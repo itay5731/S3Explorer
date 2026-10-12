@@ -249,6 +249,12 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     if (!folders.length && !objects.some((o) => isArchiveClass(o.storageClass))) return no("None of the selected objects is archived");
     requestRestoreArchived();
   },
+  "act.preview": () => {
+    const { folders, objects } = selection();
+    if (!getPane().bucket) return no(OPEN_BUCKET);
+    if (folders.length || objects.length !== 1) return no("Select one file to preview it");
+    openModal({ kind: "quickLook" });
+  },
   "act.disconnect": () => requestDisconnect(),
 };
 

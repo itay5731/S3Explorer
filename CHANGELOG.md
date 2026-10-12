@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **See inside a file without downloading it.** Selecting a text file or an image shows a preview at the top of the details panel: JSON is pretty-printed, CSV and TSV show as a table, images fit the panel (large ones load when you ask). Press `F3` or choose **Quick look** from the right-click menu for a big view, and use the arrow keys to flip through files while it is open.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

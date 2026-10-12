@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, Eye, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane } from "../store/app";
 import { usePaneSearch } from "../store/search";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
@@ -51,6 +51,7 @@ export function ContextMenu() {
     copyKey: useKeyHint("act.copyKey"),
     copyUri: useKeyHint("act.copyUri"),
     tags: useKeyHint("act.tags"),
+    preview: useKeyHint("act.preview"),
     newFolder: useKeyHint("act.newFolder"),
     refresh: useKeyHint("nav.refresh"),
     upload: useKeyHint("act.upload"),
@@ -191,6 +192,7 @@ export function ContextMenu() {
       groups.push([{ label: "Go to object", icon: <LocateFixed size={14} />, action: () => revealObject(bucket, o.key, o.name), hint: k.open }]);
     }
     groups.push([
+      { label: "Quick look", icon: <Eye size={14} />, action: () => openModal({ kind: "quickLook" }), hint: k.preview },
       {
         label: "Download…",
         icon: <Download size={14} />,

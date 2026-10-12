@@ -1469,6 +1469,7 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `act.tags` | Tags | files | `Mod+T` |
 | `act.versions` | Show versions (details panel, Versions section) | files | `Mod+Shift+V` |
 | `act.restore` | Restore archived | files | (none) |
+| `act.preview` | Quick look (added with "Object preview") | files | `F3` |
 | `act.disconnect` | Disconnect | global | `Mod+Shift+Q` |
 
 `Shift` held with `sel.up/down/pageUp/pageDown/first/last` extends the selection (a fixed rule, not a
@@ -1554,3 +1555,69 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## Object preview (added on request after v0.7.0)
+
+See what is inside a file without downloading it.
+
+```ts
+type PreviewKind = "text" | "image" | "unsupported";
+interface ObjectPreview {
+  kind: PreviewKind;
+  contentType: string | null;  // as stored in S3
+  size: number;                // the object's full size
+  truncated: boolean;          // text only: just the first PREVIEW_LIMITS.textMaxBytes were read
+  text: string | null;         // kind "text": UTF-8, invalid sequences replaced
+  dataBase64: string | null;   // kind "image": the whole object
+  reason: string | null;       // kind "unsupported": a short user-facing reason
+}
+export const PREVIEW_LIMITS = { textMaxBytes: 262_144, imageMaxBytes: 10_485_760, imageAutoBytes: 2_097_152 } as const;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `preview_object` | `{ bucket, key }` | `ObjectPreview`. HeadObject, then at most two ranged GetObject calls pinned to the ETag with `If-Match`. The key is sent verbatim. |
+
+#### Backend
+
+- **Kind**, from the key's extension (case-insensitive; the whole name for `Dockerfile`) and the content
+  type (parameters ignored):
+  - Images: extensions `png jpg jpeg gif webp bmp ico avif svg`, or the matching `image/*` content
+    types. SVG is shown only through `<img>`, where scripts never run.
+  - Text: content types `text/*`, `application/json`, `application/xml`, `application/x-yaml`, or
+    extensions `txt md markdown json jsonl csv tsv log xml yaml yml toml ini conf cfg env sql sh bat ps1 py
+    js mjs ts tsx jsx css scss html htm rs go java kt c h cpp cs rb php swift tf hcl properties gitignore
+    dockerfile`. An image extension wins over a text content type and vice versa.
+  - Anything else: the first 8 KiB are read; valid UTF-8 (a multi-byte character cut at the end of the
+    sample is allowed) without NUL bytes is text, otherwise `unsupported` with reason "Binary file".
+- **Text** reads a single ranged GET of the first `min(size, textMaxBytes)` bytes; `truncated` when the
+  object is bigger. A character cut by the limit is dropped, not replaced. An empty object is text `""`
+  without a GET.
+- **Images** larger than `imageMaxBytes` are `unsupported` ("Too large to preview"); otherwise the
+  whole object is read and returned base64-encoded.
+- **Archived** objects (GLACIER / DEEP_ARCHIVE / Intelligent-Tiering archive tiers not restored, or a
+  GET answered `InvalidObjectState`) are `unsupported` ("Archived: restore it to preview").
+- A ranged response whose length or `Content-Range` does not match the request is an error, never a
+  silently short preview. A body that stalls for 30 s is a `Network` error, and the whole read is bounded
+  by the same size-scaled limit as a transfer request (60 s + 1 s per 32 KiB). An object that changed
+  between HeadObject and GetObject (`PreconditionFailed`) is a `Conflict` error ("changed while it was
+  read").
+
+#### Frontend
+
+- **Details panel**, one object selected: a "Preview" section at the top. Text and images up to
+  `imageAutoBytes` load automatically; bigger images (up to `imageMaxBytes`) show "Load preview (n MiB)".
+  A response for an object that is no longer selected is ignored. Errors show inline with Retry.
+- **Rendering:** images fit the panel width, shown with `<img>` from a `blob:` URL created from the
+  bytes and revoked when it changes (the CSP already allows `img-src blob:`; it is not loosened). JSON is
+  pretty-printed when it parses. CSV/TSV render as a small table of the first 200 rows. Everything else
+  is monospace text with soft wrap. "Showing the first 256 KiB" when `truncated`.
+- **Quick look:** key action `act.preview`, label "Quick look", group Act, context `files`, default `F3`
+  (F3 is in the always-prevented list, so the webview's find never opens). Opens a large modal with the
+  same preview; `Escape` closes; `ArrowUp`/`ArrowDown` while it is open move the selection and the
+  preview follows. Also in the object context menu. Not available for folders or several selected
+  items. No PDF, video or audio in this version.
+
+#### IAM permissions added in this version
+
+None (`s3:GetObject` is already required).

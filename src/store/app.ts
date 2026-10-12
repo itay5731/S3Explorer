@@ -60,6 +60,8 @@ export type Modal =
   | { kind: "bulkRestore"; bucket: string; prefix: string; items: JobItem[]; deepArchive: boolean; allDeep: boolean }
   /** Confirm an action on one version of an object (shown from the details panel). */
   | { kind: "versionAction"; action: "restore" | "delete" | "undelete"; bucket: string; key: string; version: ObjectVersion; onlyVersion: boolean; previousIsMarker: boolean }
+  /** Quick look: a large preview of the selected object; it follows the selection while open. */
+  | { kind: "quickLook" }
   | null;
 
 /** Modals that make sense without an open bucket. */

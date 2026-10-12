@@ -16,6 +16,7 @@ import { plural } from "../lib/ops";
 import { getSelected, useSelectionInfo } from "../store/view";
 import { displayName, formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
 import { FileIcon } from "./FileIcon";
+import { PreviewSection } from "./Preview";
 
 function Field({ label, children, mono, copy }: { label: string; children: ReactNode; mono?: boolean; copy?: string }) {
   return (
@@ -211,6 +212,7 @@ export function DetailsPanel() {
             <div className="muted small">{formatBytes(obj.size)}</div>
           </div>
         </div>
+        <PreviewSection bucket={bucket} object={obj} />
         <div className="dactions">
           <button className="btn" onClick={() => void downloadObjects([obj])} disabled={blocked} title={blocked ? ARCHIVED_REASON : undefined}>
             <Download size={14} /> Download

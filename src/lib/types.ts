@@ -497,3 +497,25 @@ export const OPEN_LOCAL_REFUSED_EXTENSIONS = [
   "settingcontent-ms", "diagcab", "library-ms", "search-ms", "py", "pyw", "sh", "command", "app", "terminal",
   "fileloc", "inetloc", "desktop", "reg", "lnk", "url",
 ] as const;
+
+// ---- Object preview (see "Object preview" in docs/CONTRACT.md) ----
+
+export type PreviewKind = "text" | "image" | "unsupported";
+
+export interface ObjectPreview {
+  kind: PreviewKind;
+  /** As stored in S3. */
+  contentType: string | null;
+  /** The object's full size. */
+  size: number;
+  /** Text only: just the first `PREVIEW_LIMITS.textMaxBytes` were read. */
+  truncated: boolean;
+  /** Kind "text": UTF-8, invalid sequences replaced. */
+  text: string | null;
+  /** Kind "image": the whole object. */
+  dataBase64: string | null;
+  /** Kind "unsupported": a short user-facing reason. */
+  reason: string | null;
+}
+
+export const PREVIEW_LIMITS = { textMaxBytes: 262_144, imageMaxBytes: 10_485_760, imageAutoBytes: 2_097_152 } as const;

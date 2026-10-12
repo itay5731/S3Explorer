@@ -5970,3 +5970,162 @@ kbd {
   justify-content: flex-end;
   gap: 6px;
 }
+
+/* ==========================================================================
+   Object preview: details panel section and Quick look
+   ========================================================================== */
+.pv-none {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 72px;
+  padding: 12px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+.pv-none svg {
+  flex: none;
+  color: var(--dim);
+}
+.pv-image {
+  display: grid;
+  place-items: center;
+  padding: 6px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  /* A checkerboard, so transparent images read as transparent in both themes. */
+  background: repeating-conic-gradient(var(--bg-hover) 0% 25%, transparent 0% 50%) 50% / 16px 16px, var(--bg-input);
+}
+.pv-image img {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+}
+.pv-text {
+  margin: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pv-table-wrap {
+  max-height: 280px;
+  overflow: auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+}
+.pv-table {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.pv-table th,
+.pv-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pv-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-elev);
+  color: var(--text);
+  font-weight: 600;
+}
+.pv-table td {
+  color: var(--text-2);
+}
+.pv-note {
+  margin-top: -4px;
+}
+.pv-retry {
+  margin-top: 4px;
+}
+
+.modal.quicklook {
+  width: min(1040px, 100%);
+  height: min(860px, calc(100vh - 32px));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px 16px;
+}
+.ql-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ql-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--bg-hover);
+  flex: none;
+  margin-right: 4px;
+}
+.ql-title {
+  flex: 1;
+  min-width: 0;
+}
+.ql-title h2 {
+  font-size: 15px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ql-head .icon-btn {
+  width: 28px;
+  height: 28px;
+}
+.ql-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.ql-body .pv-image,
+.ql-body .pv-text,
+.ql-body .pv-table-wrap,
+.ql-body .pv-none {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+}
+.ql-body .pv-image {
+  position: relative;
+}
+.ql-body .pv-image img {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px);
+}
+.ql-body .pv-text {
+  font-size: 12.5px;
+}

@@ -115,7 +115,7 @@ fn is_checksum_mismatch(e: &(dyn std::error::Error + 'static)) -> bool {
 /// Next body chunk, bounded by [`BODY_IDLE_TIMEOUT`] so a stalled connection cannot hang forever.
 /// Transport errors are `Network` (retryable); a checksum mismatch is not (`Unknown`): retrying
 /// or keeping what was received would accept corrupt data.
-async fn next_chunk(body: &mut aws_sdk_s3::primitives::ByteStream) -> AppResult<Option<bytes::Bytes>> {
+pub(crate) async fn next_chunk(body: &mut aws_sdk_s3::primitives::ByteStream) -> AppResult<Option<bytes::Bytes>> {
     match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.try_next()).await {
         Ok(Ok(c)) => Ok(c),
         Ok(Err(e)) if is_checksum_mismatch(&e) => Err(AppError::new(

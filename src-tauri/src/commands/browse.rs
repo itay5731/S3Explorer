@@ -1,8 +1,8 @@
 use tauri::State;
 
 use crate::error::AppResult;
-use crate::models::{Bucket, ListPage, ObjectMeta, RecentListing};
-use crate::ops;
+use crate::models::{Bucket, ListPage, ObjectMeta, ObjectPreview, RecentListing};
+use crate::{ops, preview};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -37,4 +37,10 @@ pub async fn list_recent(
 pub async fn head_object(state: State<'_, AppState>, bucket: String, key: String) -> AppResult<ObjectMeta> {
     let client = state.client_for_bucket(&bucket).await?;
     ops::head_object(&client, &bucket, &key).await
+}
+
+#[tauri::command]
+pub async fn preview_object(state: State<'_, AppState>, bucket: String, key: String) -> AppResult<ObjectPreview> {
+    let client = state.client_for_bucket(&bucket).await?;
+    preview::preview_object(&client, &bucket, &key).await
 }
