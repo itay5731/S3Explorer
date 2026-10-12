@@ -121,6 +121,29 @@ impl RunGate {
         Waiter { gate: self.clone(), id, notify, pending: true }
     }
 
+    /// A ticket number taken now without joining the line: [`Self::enqueue_at`] later puts its
+    /// holder behind everyone who enqueued before this call and ahead of everyone after it
+    /// (a paused transfer keeps its place this way).
+    pub fn reserve(&self) -> u64 {
+        let mut s = self.lock();
+        let id = s.next_ticket;
+        s.next_ticket += 1;
+        id
+    }
+
+    /// Joins the line at `ticket` (from [`Waiter::ticket`] or [`Self::reserve`]; never one that
+    /// is waiting right now).
+    pub fn enqueue_at(self: &Arc<Self>, ticket: u64) -> Waiter {
+        let notify = Arc::new(Notify::new());
+        {
+            let mut s = self.lock();
+            s.waiting.insert(ticket, notify.clone());
+            // It may sort before the current head, which then has to make way.
+            s.wake_head();
+        }
+        Waiter { gate: self.clone(), id: ticket, notify, pending: true }
+    }
+
     /// `enqueue` then `wait`: the place in line is taken when this future is first polled (tests;
     /// the app enqueues synchronously at start).
     #[cfg(test)]
@@ -130,6 +153,11 @@ impl RunGate {
 }
 
 impl Waiter {
+    /// Its place in line (see [`RunGate::enqueue_at`]).
+    pub fn ticket(&self) -> u64 {
+        self.id
+    }
+
     /// Waits for a run slot (FIFO). Cancel-safe: dropping the future gives up the place in line.
     pub async fn wait(mut self) -> RunPermit {
         let gate = self.gate.clone();
@@ -349,6 +377,33 @@ mod tests {
         // FIFO start order; with 3 slots, a start can be at most 2 places ahead of its turn.
         assert!(order.iter().enumerate().all(|(pos, i)| i.abs_diff(pos) <= 2));
         assert_eq!((gate.running(), gate.waiting()), (0, 0));
+    }
+
+    /// A waiter that left the line and comes back with its ticket (or a reserved one) goes
+    /// behind the tickets taken before it and ahead of those taken after.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_returning_ticket_keeps_its_place() {
+        let gate = RunGate::new(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let first = spawn_holder(&gate, 0, &tx);
+        settle().await;
+        let early = gate.enqueue();
+        let reserved = gate.reserve();
+        let late = gate.enqueue();
+        let early_ticket = early.ticket();
+        drop(early); // paused while queued
+        for (n, w) in [(2usize, late), (1, gate.enqueue_at(reserved)), (0, gate.enqueue_at(early_ticket))] {
+            let started = tx.clone();
+            tokio::spawn(async move {
+                let _p = w.wait().await;
+                let _ = started.send(10 + n);
+            });
+        }
+        settle().await;
+        assert_eq!(gate.waiting(), 3);
+        let _ = first.send(());
+        settle().await;
+        assert_eq!(drain(&mut rx), vec![0, 10, 11, 12]);
     }
 
     /// An enqueued waiter that is dropped without waiting gives up its place.

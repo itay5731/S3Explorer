@@ -113,6 +113,8 @@ export interface Backend {
   previewBatch(request: BatchPlanRequest, previewId?: string): Promise<BatchPreview>;
   startBatch(request: BatchPlanRequest): Promise<string>;
   cancelBatch(id: string): Promise<void>;
+  pauseBatch(id: string): Promise<void>;
+  resumeBatch(id: string): Promise<void>;
   removeBatch(id: string): Promise<void>;
   listBatches(): Promise<Batch[]>;
   onBatchProgress(cb: (b: Batch) => void): Promise<Unlisten>;
@@ -126,6 +128,8 @@ export interface Backend {
   startDownload(bucket: string, key: string, destPath: string): Promise<string>;
   startUpload(bucket: string, key: string, srcPath: string): Promise<string>;
   cancelTransfer(id: string): Promise<void>;
+  pauseTransfer(id: string): Promise<void>;
+  resumeTransfer(id: string): Promise<void>;
   removeTransfer(id: string): Promise<void>;
   listTransfers(): Promise<Transfer[]>;
   onTransferProgress(cb: (t: Transfer) => void): Promise<Unlisten>;
@@ -243,6 +247,8 @@ const tauriBackend: Backend = {
   previewBatch: (request, previewId) => invoke<BatchPreview>("preview_batch", { request, previewId: previewId ?? null }),
   startBatch: (request) => invoke<string>("start_batch", { request }),
   cancelBatch: (id) => invoke<void>("cancel_batch", { id }),
+  pauseBatch: (id) => invoke<void>("pause_batch", { id }),
+  resumeBatch: (id) => invoke<void>("resume_batch", { id }),
   removeBatch: (id) => invoke<void>("remove_batch", { id }),
   listBatches: () => invoke<Batch[]>("list_batches"),
   onBatchProgress: (cb) => listen<Batch>(BATCH_PROGRESS_EVENT, (e) => cb(e.payload)),
@@ -255,6 +261,8 @@ const tauriBackend: Backend = {
   startDownload: (bucket, key, destPath) => invoke<string>("start_download", { bucket, key, destPath }),
   startUpload: (bucket, key, srcPath) => invoke<string>("start_upload", { bucket, key, srcPath }),
   cancelTransfer: (id) => invoke<void>("cancel_transfer", { id }),
+  pauseTransfer: (id) => invoke<void>("pause_transfer", { id }),
+  resumeTransfer: (id) => invoke<void>("resume_transfer", { id }),
   removeTransfer: (id) => invoke<void>("remove_transfer", { id }),
   listTransfers: () => invoke<Transfer[]>("list_transfers"),
   onTransferProgress: (cb) => listen<Transfer>(TRANSFER_PROGRESS_EVENT, (e) => cb(e.payload)),
@@ -437,6 +445,9 @@ export const previewBatch = (request: BatchPlanRequest, previewId?: string) => c
 /** Plan again and start the folder transfer; returns the batch id. */
 export const startBatch = (request: BatchPlanRequest) => call("startBatch", request);
 export const cancelBatch = (id: string) => call("cancelBatch", id);
+/** Pause every queued or running file of the folder transfer; files it starts later start paused. */
+export const pauseBatch = (id: string) => call("pauseBatch", id);
+export const resumeBatch = (id: string) => call("resumeBatch", id);
 export const removeBatch = (id: string) => call("removeBatch", id);
 export const listBatches = () => call("listBatches");
 export const onBatchProgress = (cb: (b: Batch) => void) => call("onBatchProgress", cb);
@@ -475,6 +486,10 @@ export const startDownload = (bucket: string, key: string, destPath: string) =>
   call("startDownload", bucket, key, destPath);
 export const startUpload = (bucket: string, key: string, srcPath: string) => call("startUpload", bucket, key, srcPath);
 export const cancelTransfer = (id: string) => call("cancelTransfer", id);
+/** Stop moving data but keep the finished parts; `paused` gives the run slot back. */
+export const pauseTransfer = (id: string) => call("pauseTransfer", id);
+/** Back to the queue at its place; continues with the missing parts. */
+export const resumeTransfer = (id: string) => call("resumeTransfer", id);
 export const removeTransfer = (id: string) => call("removeTransfer", id);
 export const listTransfers = () => call("listTransfers");
 export const onTransferProgress = (cb: (t: Transfer) => void) => call("onTransferProgress", cb);

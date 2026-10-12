@@ -1554,3 +1554,46 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## Pause and resume transfers (added on request after v0.7.0)
+
+- `TransferStatus` gains `"paused"`. `BatchStatus` gains `"paused"` too (a folder transfer paused as a whole).
+- `paused` counts as active everywhere "active" is used: `remove_transfer` / `remove_batch` refuse it, the
+  updater refuses to install while one exists, and `disconnect` with `cancelActive` cancels it.
+
+| Command | Args | Returns |
+|---|---|---|
+| `pause_transfer` | `{ id }` | `void`. A running or queued download or upload stops moving data and becomes `paused`. `InvalidInput` for an unknown id or a finished transfer; no-op if already paused. |
+| `resume_transfer` | `{ id }` | `void`. A paused transfer goes back to the queue (`queued`), keeping its place behind transfers that were queued before it was paused. No-op unless paused (`InvalidInput` for an unknown id). |
+| `pause_batch` | `{ id }` | `void`. Pauses every queued or running file of the folder transfer and stops starting new ones (files it starts from now on start `paused`); the batch becomes `paused` (one still `planning` keeps planning and becomes `paused` when it would become `queued`). `InvalidInput` for an unknown id or a finished batch; no-op if already paused. |
+| `resume_batch` | `{ id }` | `void`. Resumes the batch's paused files and goes back to `queued` (then `running` as soon as one of its files runs again). No-op unless paused. |
+
+Behaviour:
+- Pausing cancels the in-flight part requests. Parts already written stay: downloads keep the temp file and the
+  record of finished parts (in memory); uploads keep the multipart upload id and the finished parts. Progress
+  shown (`transferredBytes`, `partsDone`) stays at the bytes of finished parts; `bytesPerSec` is 0 while paused.
+  A transfer in a step that cannot be interrupted (CreateMultipartUpload, CompleteMultipartUpload, the final
+  flush and rename) finishes that step first; if it was the last step the transfer simply completes.
+- Resuming a download continues with the missing parts only, with `If-Match` on the ETag captured at start: if
+  the object changed meanwhile, the transfer fails with the usual message and the temp file is removed. (A server
+  that returned no ETag gets a HeadObject on resume instead; a different size or Last-Modified fails it the same
+  way.) A folder download re-checks its destination for links on resume. A small file fetched with one GET starts
+  over.
+- Resuming an upload continues the same multipart upload with the missing parts; the local file's size and
+  modified time are re-checked first and a change fails the transfer (and aborts the multipart upload). A small
+  file sent with one PutObject is sent again.
+- A paused transfer does not count toward the simultaneous-transfers limit (it gives its run slot back).
+- Cancel works on a paused transfer or batch (download: temp file removed; upload: multipart upload aborted).
+  The destination of a paused download stays reserved (no second download to the same file).
+- Paused state lives in memory only. On app exit, paused transfers are cancelled like a cancel (uploads aborted,
+  downloads' temp files removed), waiting at most 10 s. Resume across restarts is out of scope.
+- Events: `transfer:progress` / `batch:progress` carry the new status; payloads are otherwise unchanged.
+
+Frontend: a Pause / Resume button next to Cancel on each transfer row and folder-transfer row in Activity, also
+in its right-click menu; "Paused" status with the progress bar dimmed; a "Pause all" / "Resume all" button in the
+Activity bar when relevant (it applies to single transfers and folder transfers, not to a batch's own files
+individually). Keyboard: none new.
+
+#### IAM permissions added in this version
+
+None (pausing and resuming use the same calls as a transfer).

@@ -46,6 +46,8 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     drag and drop, keyboard and the context menu (see "v0.7.0 additions" in `docs/CONTRACT.md`).
 27. (v0.7.0) Every action has a keyboard binding, all rebindable in Settings → Keyboard with export/import to a
     file; search runs as you type; type-to-search from the file list; per-pane back/forward history.
+28. Pause and resume downloads, uploads and folder transfers, in memory only (added on request after v0.7.0;
+    see "Pause and resume transfers" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

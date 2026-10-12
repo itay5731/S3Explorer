@@ -7,7 +7,7 @@ import { create } from "zustand";
 import * as api from "../lib/api";
 import type { AppError, Batch, BatchPlanRequest, Transfer } from "../lib/types";
 
-export const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running";
+export const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running" || b.status === "paused";
 
 /** Fraction 0..1 of the batch that is finished, by bytes (by files when there are no bytes). */
 export function batchFraction(b: Batch): number {
@@ -90,7 +90,7 @@ export function upsertBatchFiles(ts: Transfer[]) {
   for (const t of ts) {
     const bid = t.batchId!;
     const cur = (files ?? prev)[bid];
-    const active = t.status === "running" || t.status === "queued";
+    const active = t.status === "running" || t.status === "queued" || t.status === "paused";
     if (!active && !cur?.[t.id]) continue;
     if (!files) files = { ...prev };
     if (!copied.has(bid)) {
@@ -164,6 +164,14 @@ export async function startBatch(request: BatchPlanRequest): Promise<string> {
 export async function cancelBatch(id: string) {
   try {
     await api.cancelBatch(id);
+  } catch {
+    /* unknown or already finished */
+  }
+}
+
+export async function setBatchPaused(id: string, paused: boolean) {
+  try {
+    await (paused ? api.pauseBatch(id) : api.resumeBatch(id));
   } catch {
     /* unknown or already finished */
   }

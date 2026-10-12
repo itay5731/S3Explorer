@@ -2,6 +2,8 @@
 
 mod download;
 pub(crate) mod gate;
+#[cfg(test)]
+mod pause_tests;
 pub mod plan;
 mod upload;
 
@@ -12,6 +14,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use tokio::sync::watch;
+
 use std::panic::AssertUnwindSafe;
 
 use aws_sdk_s3::Client;
@@ -21,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{now_iso, Transfer, TransferKind, TransferSettings, TransferStatus};
-use gate::RunGate;
+use gate::{RunGate, RunPermit};
 
 pub const MIB: u64 = 1024 * 1024;
 const TICK: Duration = Duration::from_millis(100);
@@ -42,12 +46,14 @@ pub trait TransferObserver: Send + Sync + 'static {
 
 /// Ties a transfer to its batch: the id it carries (`batchId`), the batch's cancel token (the
 /// transfer's own token is a child of it, so cancelling the batch cancels every file, even one
-/// started after the cancel) and the observer that aggregates it.
+/// started after the cancel), the observer that aggregates it, and whether it starts paused (the
+/// batch is paused).
 #[derive(Clone)]
 pub struct BatchLink {
     pub batch_id: String,
     pub cancel: CancellationToken,
     pub observer: Arc<dyn TransferObserver>,
+    pub paused: bool,
 }
 
 /// A sink that drops every event.
@@ -80,6 +86,13 @@ pub struct TransferEntry {
     /// Times a download's temp file was flushed to disk (`sync_all`) before the rename.
     file_syncs: AtomicU32,
     observer: Option<Arc<dyn TransferObserver>>,
+    /// Whether a pause is requested; the transfer's task watches it.
+    paused: watch::Sender<bool>,
+    /// The current run's token: a child of `cancel`, cancelled by a pause (which so stops the
+    /// requests in flight without cancelling the transfer) and renewed when it runs again.
+    run: Mutex<CancellationToken>,
+    /// Its place in line whenever it (re)joins the queue (see [`RunGate::enqueue_at`]).
+    ticket: AtomicU64,
 }
 
 /// Internal counters of one transfer, for tests and benchmarks (not part of the bridge contract).
@@ -113,7 +126,33 @@ impl Drop for InFlight<'_> {
     }
 }
 
+fn lock_run(m: &Mutex<CancellationToken>) -> MutexGuard<'_, CancellationToken> {
+    m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 impl TransferEntry {
+    fn new(seq: u64, record: Transfer, cancel: CancellationToken, observer: Option<Arc<dyn TransferObserver>>) -> Self {
+        let paused = record.status == TransferStatus::Paused;
+        let run = cancel.child_token();
+        Self {
+            seq,
+            record: Mutex::new(record),
+            cancel,
+            finished: CancellationToken::new(),
+            transferred: AtomicU64::new(0),
+            parts_done: AtomicU32::new(0),
+            parts_in_flight: AtomicUsize::new(0),
+            peak_parts_in_flight: AtomicUsize::new(0),
+            part_retries: AtomicU32::new(0),
+            discarded_bytes: AtomicU64::new(0),
+            file_syncs: AtomicU32::new(0),
+            observer,
+            paused: watch::Sender::new(paused),
+            run: Mutex::new(run),
+            ticket: AtomicU64::new(0),
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, Transfer> {
         // A poisoned lock only means another thread panicked mid-update; the data is still usable.
         self.record.lock().unwrap_or_else(|p| p.into_inner())
@@ -154,6 +193,84 @@ impl TransferEntry {
 
     fn status(&self) -> TransferStatus {
         self.lock().status
+    }
+
+    fn is_paused(&self) -> bool {
+        *self.paused.borrow()
+    }
+
+    /// Requests a pause: stops the current run (its requests end as `Cancelled`).
+    fn pause(&self) {
+        // Under the run lock, so a run starting right now (see `renew_run`) sees the request.
+        let run = lock_run(&self.run);
+        self.paused.send_if_modified(|p| !std::mem::replace(p, true));
+        run.cancel();
+    }
+
+    fn resume(&self) {
+        self.paused.send_if_modified(|p| std::mem::replace(p, false));
+    }
+
+    /// The token of the run in progress.
+    pub(crate) fn run_token(&self) -> CancellationToken {
+        lock_run(&self.run).clone()
+    }
+
+    /// A fresh run token for a run that starts now (already cancelled if a pause is requested).
+    fn renew_run(&self) {
+        let mut run = lock_run(&self.run);
+        *run = self.cancel.child_token();
+        if self.is_paused() {
+            run.cancel();
+        }
+    }
+
+    /// `e` means the run was stopped by a pause, not by a cancel of the transfer (or its batch).
+    pub(crate) fn interrupted(&self, e: &AppError) -> bool {
+        e.is_cancelled() && !self.cancel.is_cancelled()
+    }
+
+    /// Takes back bytes counted for a part that will be fetched again from its start.
+    fn sub_bytes(&self, n: u64) {
+        self.transferred.fetch_sub(n, Ordering::Relaxed);
+    }
+}
+
+/// A running transfer's hold on its run slot, and how its body stops for a pause. The body keeps
+/// its own state across the pause (temp file and finished parts, or multipart upload id and
+/// finished parts); only the slot is given back.
+pub(crate) struct Runner<'a> {
+    tm: &'a TransferManager,
+    entry: &'a Arc<TransferEntry>,
+    permit: &'a Mutex<Option<RunPermit>>,
+}
+
+impl Runner<'_> {
+    /// The current run's token (cancelled by a cancel or a pause).
+    pub(crate) fn token(&self) -> CancellationToken {
+        self.entry.run_token()
+    }
+
+    /// For a body whose run a pause stopped (see [`TransferEntry::interrupted`]): reports
+    /// `paused`, gives the run slot back, waits for resume and then for a slot (keeping its place
+    /// in line), and reports `running` again. `Cancelled` if the transfer is cancelled meanwhile.
+    pub(crate) async fn pause_point(&self) -> AppResult<()> {
+        let entry = self.entry;
+        if !entry.is_paused() {
+            // Resumed before the run had stopped: carry on with the slot it holds.
+            entry.renew_run();
+            return Ok(());
+        }
+        // Behind everyone queued before the pause, ahead of everyone queued after it.
+        entry.ticket.store(self.tm.running.reserve(), Ordering::Relaxed);
+        // The event first, then the slot (observers never see the next transfer running while
+        // this one still looks running).
+        self.tm.set_status(entry, TransferStatus::Paused);
+        drop(self.permit.lock().unwrap_or_else(|p| p.into_inner()).take());
+        let permit = self.tm.acquire(entry, None).await.ok_or_else(AppError::cancelled)?;
+        *self.permit.lock().unwrap_or_else(|p| p.into_inner()) = Some(permit);
+        self.tm.now_running(entry);
+        Ok(())
     }
 }
 
@@ -374,6 +491,7 @@ impl TransferManager {
         link: Option<BatchLink>,
     ) -> String {
         let id = uuid::Uuid::new_v4().to_string();
+        let paused = link.as_ref().is_some_and(|l| l.paused);
         let record = Transfer {
             id: id.clone(),
             kind,
@@ -386,53 +504,100 @@ impl TransferManager {
             parts_total: 0,
             parts_done: 0,
             bytes_per_sec: 0,
-            status: TransferStatus::Queued,
+            status: if paused { TransferStatus::Paused } else { TransferStatus::Queued },
             error: None,
             started_at: now_iso(),
             finished_at: None,
         };
-        let entry = Arc::new(TransferEntry {
-            seq: self.seq.fetch_add(1, Ordering::Relaxed),
-            record: Mutex::new(record),
-            cancel: link.as_ref().map_or_else(CancellationToken::new, |l| l.cancel.child_token()),
-            finished: CancellationToken::new(),
-            transferred: AtomicU64::new(0),
-            parts_done: AtomicU32::new(0),
-            parts_in_flight: AtomicUsize::new(0),
-            peak_parts_in_flight: AtomicUsize::new(0),
-            part_retries: AtomicU32::new(0),
-            discarded_bytes: AtomicU64::new(0),
-            file_syncs: AtomicU32::new(0),
-            observer: link.map(|l| l.observer),
-        });
+        let cancel = link.as_ref().map_or_else(CancellationToken::new, |l| l.cancel.child_token());
+        let entry = Arc::new(TransferEntry::new(self.seq.fetch_add(1, Ordering::Relaxed), record, cancel, link.map(|l| l.observer)));
         self.entries.insert(id.clone(), entry.clone());
         self.sink.emit(&entry.snapshot());
-        // Take the place in line now, in start order (see `RunGate::enqueue`).
-        let waiter = self.running.enqueue();
+        // Take the place in line now, in start order (see `RunGate::enqueue`). A file of a paused
+        // batch only reserves its place.
+        let waiter = if paused {
+            entry.ticket.store(self.running.reserve(), Ordering::Relaxed);
+            None
+        } else {
+            let w = self.running.enqueue();
+            entry.ticket.store(w.ticket(), Ordering::Relaxed);
+            Some(w)
+        };
         let me = self.clone();
         tokio::spawn(async move { me.run_job(entry, waiter, client, job).await });
         id
     }
 
-    async fn run_job(self: Arc<Self>, entry: Arc<TransferEntry>, waiter: gate::Waiter, client: Client, job: Job) {
-        let permit = tokio::select! {
-            biased;
-            _ = entry.cancel.cancelled() => None,
-            p = waiter.wait() => Some(p),
-        };
+    /// Sets the status (the rate is 0 unless running) and sends an event if it changed.
+    fn set_status(&self, entry: &TransferEntry, status: TransferStatus) {
+        {
+            let mut r = entry.lock();
+            if r.status == status {
+                return;
+            }
+            r.status = status;
+            if status != TransferStatus::Running {
+                r.bytes_per_sec = 0;
+            }
+        }
+        self.sink.emit(&entry.snapshot());
+    }
 
-        let result = match &permit {
-            None => Err(AppError::cancelled()),
-            Some(_) => {
+    /// The transfer got a run slot: a fresh run token, `running`, and the batch is told.
+    fn now_running(&self, entry: &TransferEntry) {
+        entry.renew_run();
+        self.set_status(entry, TransferStatus::Running);
+        if let Some(o) = &entry.observer {
+            let id = entry.lock().id.clone();
+            o.running(&id);
+        }
+    }
+
+    /// Waits for a run slot (FIFO, from `waiter` or else from the entry's ticket), going
+    /// `paused` (and out of the line) while a pause is requested and back to `queued` on resume.
+    /// `None` once the transfer is cancelled.
+    async fn acquire(&self, entry: &TransferEntry, mut waiter: Option<gate::Waiter>) -> Option<RunPermit> {
+        let mut paused = entry.paused.subscribe();
+        loop {
+            if *paused.borrow_and_update() {
+                drop(waiter.take());
+                self.set_status(entry, TransferStatus::Paused);
+                tokio::select! {
+                    biased;
+                    _ = entry.cancel.cancelled() => return None,
+                    _ = paused.wait_for(|p| !*p) => {}
+                }
+            }
+            let w = match waiter.take() {
+                Some(w) => w,
+                None => {
+                    self.set_status(entry, TransferStatus::Queued);
+                    self.running.enqueue_at(entry.ticket.load(Ordering::Relaxed))
+                }
+            };
+            // A pause drops the waiting future, which gives the place up (the ticket is kept).
+            tokio::select! {
+                biased;
+                _ = entry.cancel.cancelled() => return None,
+                _ = paused.changed() => {}
+                p = w.wait() => return Some(p),
+            }
+        }
+    }
+
+    async fn run_job(self: Arc<Self>, entry: Arc<TransferEntry>, waiter: Option<gate::Waiter>, client: Client, job: Job) {
+        // Released only after the final event (see the end); a pause gives it back meanwhile.
+        let permit = Mutex::new(self.acquire(&entry, waiter).await);
+        let started = permit.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+
+        let result = match started {
+            false => Err(AppError::cancelled()),
+            true => {
                 // Snapshot now (not at queue time): settings changed while queued still apply.
                 let mut cfg = PartSettings::from(&self.settings());
                 cfg.upload_attempt_timeout = self.tuning.upload_attempt_timeout;
-                entry.lock().status = TransferStatus::Running;
-                self.sink.emit(&entry.snapshot());
-                if let Some(o) = &entry.observer {
-                    let id = entry.lock().id.clone();
-                    o.running(&id);
-                }
+                self.now_running(&entry);
+                let runner = Runner { tm: &self, entry: &entry, permit: &permit };
 
                 let stop = CancellationToken::new();
                 let ticker = tokio::spawn(ticker(self.sink.clone(), entry.clone(), stop.clone()));
@@ -448,13 +613,13 @@ impl TransferManager {
                                 f("download");
                             }
                             let src = download::Source { bucket: &bucket, key: &key, version_id: version_id.as_deref() };
-                            download::run(&client, &entry, cfg, &id, src, &dest, no_replace, within.as_deref()).await
+                            download::run(&client, &runner, cfg, &id, src, &dest, no_replace, within.as_deref()).await
                         }
                         Job::Upload { src } => {
                             if let Some(f) = &fault {
                                 f("upload");
                             }
-                            upload::run(&client, &entry, cfg, &bucket, &key, &src).await
+                            upload::run(&client, &runner, cfg, &bucket, &key, &src).await
                         }
                     }
                 };
@@ -505,11 +670,49 @@ impl TransferManager {
         entry.finished.cancel();
     }
 
+    fn entry(&self, id: &str) -> AppResult<Arc<TransferEntry>> {
+        self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown transfer id"))
+    }
+
     /// Cooperative cancel. No-op for transfers that already finished.
     pub fn cancel(&self, id: &str) -> AppResult<()> {
-        let entry = self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown transfer id"))?;
-        entry.cancel.cancel();
+        self.entry(id)?.cancel.cancel();
         Ok(())
+    }
+
+    /// Stops a queued or running transfer's requests and gives its run slot back; it keeps what
+    /// it has finished and becomes `paused` (once its in-flight requests have stopped).
+    /// `InvalidInput` for a finished transfer; no-op if already paused.
+    pub fn pause(&self, id: &str) -> AppResult<()> {
+        let entry = self.entry(id)?;
+        if !entry.status().is_active() {
+            return Err(AppError::invalid("The transfer has already finished"));
+        }
+        entry.pause();
+        Ok(())
+    }
+
+    /// Puts a paused transfer back in the queue at its place. No-op unless paused.
+    pub fn resume(&self, id: &str) -> AppResult<()> {
+        self.entry(id)?.resume();
+        Ok(())
+    }
+
+    /// Cancels every paused transfer (app exit: uploads are aborted, temp files removed) and
+    /// waits up to `limit` for them to reach their final state. Returns how many had not.
+    pub async fn cancel_paused_and_wait(&self, limit: Duration) -> usize {
+        let pending: Vec<CancellationToken> = self
+            .entries
+            .iter()
+            .filter(|e| e.is_paused() && e.status().is_active())
+            .map(|e| {
+                e.cancel.cancel();
+                e.finished.clone()
+            })
+            .collect();
+        let all = futures::future::join_all(pending.iter().map(|t| t.cancelled()));
+        let _ = tokio::time::timeout(limit, all).await;
+        pending.iter().filter(|t| !t.is_cancelled()).count()
     }
 
     /// Forgets a finished transfer. Active transfers must be cancelled first.
@@ -524,7 +727,7 @@ impl TransferManager {
         Ok(())
     }
 
-    /// Cancels every queued or running transfer (cooperatively) and returns tokens that fire
+    /// Cancels every queued, running or paused transfer (cooperatively) and returns tokens that fire
     /// once each of them reached its final state (after its final event).
     pub fn cancel_active(&self) -> Vec<CancellationToken> {
         self.entries
@@ -537,7 +740,7 @@ impl TransferManager {
             .collect()
     }
 
-    /// True while any transfer is queued or running (the updater refuses to install then).
+    /// True while any transfer is queued, running or paused (the updater refuses to install then).
     pub fn has_active(&self) -> bool {
         self.entries.iter().any(|e| e.snapshot().status.is_active())
     }
@@ -572,6 +775,11 @@ async fn ticker(sink: Arc<dyn ProgressSink>, entry: Arc<TransferEntry>, stop: Ca
             biased;
             _ = stop.cancelled() => break,
             _ = interval.tick() => {}
+        }
+        // Paused or waiting for its slot again: no rate; status events are sent by the task.
+        if entry.status() != TransferStatus::Running {
+            samples.clear();
+            continue;
         }
         let now = Instant::now();
         let bytes = entry.transferred.load(Ordering::Relaxed);
@@ -1038,7 +1246,7 @@ mod tests {
         let dest = dir.0.join("exists.bin");
         std::fs::write(&dest, b"keep me").expect("write");
         let obs = Arc::new(CountingObserver(Mutex::new(Vec::new())));
-        let link = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs.clone() };
+        let link = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs.clone(), paused: false };
         let id = tm.start_batch_download(s3.client(), "b", "k", dest.clone(), &dir.0, true, link.clone()).expect("start");
         let t = finished(&tm, &id, Duration::from_secs(30)).await;
         assert_eq!(t.status, TransferStatus::Failed);
@@ -1123,42 +1331,30 @@ mod tests {
     async fn a_queued_transfer_task_is_small() {
         let s3 = FakeS3::start(|_| Reply::status(500)).await;
         let tm = TransferManager::new(Arc::new(NoopSink));
-        let entry = Arc::new(TransferEntry {
-            seq: 0,
-            record: Mutex::new(Transfer {
-                id: "t".into(),
-                kind: TransferKind::Download,
-                batch_id: None,
-                bucket: "b".into(),
-                key: "k".into(),
-                local_path: "x".into(),
-                total_bytes: 0,
-                transferred_bytes: 0,
-                parts_total: 0,
-                parts_done: 0,
-                bytes_per_sec: 0,
-                status: TransferStatus::Queued,
-                error: None,
-                started_at: now_iso(),
-                finished_at: None,
-            }),
-            cancel: CancellationToken::new(),
-            finished: CancellationToken::new(),
-            transferred: AtomicU64::new(0),
-            parts_done: AtomicU32::new(0),
-            parts_in_flight: AtomicUsize::new(0),
-            peak_parts_in_flight: AtomicUsize::new(0),
-            part_retries: AtomicU32::new(0),
-            discarded_bytes: AtomicU64::new(0),
-            file_syncs: AtomicU32::new(0),
-            observer: None,
-        });
+        let record = Transfer {
+            id: "t".into(),
+            kind: TransferKind::Download,
+            batch_id: None,
+            bucket: "b".into(),
+            key: "k".into(),
+            local_path: "x".into(),
+            total_bytes: 0,
+            transferred_bytes: 0,
+            parts_total: 0,
+            parts_done: 0,
+            bytes_per_sec: 0,
+            status: TransferStatus::Queued,
+            error: None,
+            started_at: now_iso(),
+            finished_at: None,
+        };
+        let entry = Arc::new(TransferEntry::new(0, record, CancellationToken::new(), None));
         let jobs = [
             Job::Download { dest: PathBuf::from("x"), no_replace: false, version_id: None, within: None },
             Job::Upload { src: PathBuf::from("x") },
         ];
         for job in jobs {
-            let fut = tm.clone().run_job(entry.clone(), tm.running.enqueue(), s3.client(), job);
+            let fut = tm.clone().run_job(entry.clone(), Some(tm.running.enqueue()), s3.client(), job);
             let size = std::mem::size_of_val(&fut);
             eprintln!("run_job future: {size} bytes");
             assert!(size < 2048, "a queued transfer task holds {size} bytes");
@@ -1184,7 +1380,7 @@ mod tests {
         let s3 = FakeS3::start(|_| Reply::with_headers(200, vec![h("ETag", "\"e\"")])).await;
         let tm = TransferManager::new(Arc::new(NoopSink));
         let obs = Arc::new(CountingObserver(Mutex::new(Vec::new())));
-        let blink = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs };
+        let blink = BatchLink { batch_id: "B1".into(), cancel: CancellationToken::new(), observer: obs, paused: false };
         let id = tm.start_batch_upload(s3.client(), "b", "k", link.clone(), blink);
         let t = finished(&tm, &id, Duration::from_secs(30)).await;
         assert_eq!(t.status, TransferStatus::Failed, "{t:?}");

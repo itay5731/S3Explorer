@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Pause and resume transfers.** Pause a download, an upload or a whole folder transfer from its row in Activity (or its right-click menu), and resume it later: it continues with the parts it has not finished, and a paused transfer leaves its slot to the next one in line. "Pause all" and "Resume all" are in the Activity bar. If the object (download) or the local file (upload) changed while paused, the transfer fails safely instead of mixing old and new data. Paused transfers are cancelled when you quit the app.
+
 ## [0.7.0] - 2026-10-11
 
 ### New
