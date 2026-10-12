@@ -17,6 +17,7 @@ import {
 import { registerListKeys, type ListKeys } from "../store/keyboard";
 import { getViewRows, useViewRows, type Row } from "../store/view";
 import { formatBytes, formatExact, formatRelative, formatStorageClass, displayName } from "../lib/format";
+import { FolderSizeCell } from "./FolderSize";
 import { FileIcon } from "./FileIcon";
 import { Welcome } from "./Welcome";
 import { pickAndUpload } from "../store/actions";
@@ -71,7 +72,7 @@ const RowView = memo(function RowView({
         <span className="name-text">{displayName(row.name)}</span>
         {cut && <span className="cut-tag" title="Cut: will be moved when you paste">cut</span>}
       </div>
-      <div className="cell col-size">{obj ? formatBytes(obj.size) : <span className="dim">—</span>}</div>
+      <div className="cell col-size">{obj ? formatBytes(obj.size) : <FolderSizeCell bucket={bucket} prefix={row.kind === "folder" ? row.folder.prefix : ""} />}</div>
       <div className="cell col-modified" title={obj ? formatExact(obj.lastModified) : undefined}>
         {obj ? formatRelative(obj.lastModified) : <span className="dim">—</span>}
       </div>

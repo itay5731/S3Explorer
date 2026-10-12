@@ -9,6 +9,7 @@ import { installTransferEffects } from "../store/actions";
 import { handleOsDrop, installBatchEffects } from "../store/folders";
 import { installJobEffects } from "../store/ops";
 import { installTagEffects } from "../store/tags";
+import { installFolderSizeEffects } from "../store/folderSizes";
 import { installArchiveEffects } from "../store/archive";
 import { DragBadge } from "./RowDrag";
 import { Sidebar } from "./Sidebar";
@@ -259,6 +260,7 @@ export function Explorer() {
   useEffect(() => installBatchEffects(), []);
   useEffect(() => installTagEffects(), []);
   useEffect(() => installArchiveEffects(), []);
+  useEffect(() => installFolderSizeEffects(), []);
 
   return (
     <div className="app">

@@ -1554,3 +1554,49 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## Folder size (added on request after v0.7.0)
+
+How much is in a folder, on demand. S3 keeps no folder totals, so the size is a bounded, cancellable
+scan of every key under the prefix.
+
+```ts
+interface FolderSize {
+  objects: number;     // objects counted (folder markers, keys ending in "/", are not counted)
+  bytes: number;       // sum of the counted objects' sizes
+  scanned: number;     // keys listed, folder markers included
+  truncated: boolean;  // stopped at FOLDER_SIZE_SCAN_LIMIT: the numbers are a lower bound
+}
+export const FOLDER_SIZE_SCAN_LIMIT = 200_000;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `folder_size` | `{ id, bucket, prefix }` | `FolderSize`. A flat `ListObjectsV2` (no delimiter) under `prefix`, verbatim, page by page, stopping at the limit. `id` is chosen by the frontend; a newer call with the same `id` cancels the older one (`Cancelled`). |
+| `cancel_folder_size` | `{ id }` | `void`. The running scan stops at its next page and the call above rejects with `Cancelled`. Unknown id: no-op. |
+
+Backend rules:
+
+- A listing is complete only when there is no continuation token; paging follows the same rules as
+  every other listing (a repeated token, or "truncated" without a token, is an error, never a silent
+  stop). The scan lists at most `FOLDER_SIZE_SCAN_LIMIT` keys (pages are requested no larger than what
+  is left) and at most 2,000 pages; stopping at either bound with more pages left is `truncated: true`.
+- At most 4 scans run at once; more wait for a slot (cancellable while waiting). Disconnecting or
+  connecting elsewhere cancels every scan.
+- `prefix` is sent exactly as given (no normalization); `""` is the whole bucket.
+
+Frontend:
+
+- Right-click a folder: **Calculate size**. Details panel with one folder selected: a **Size** row with a
+  **Calculate** button. While scanning: a spinner and **Cancel**. Result: "1,234 objects · 5.6 GiB",
+  prefixed "At least" when truncated, with the time it was calculated (and a Recalculate button).
+- Results are cached per bucket + prefix for the session (cleared on disconnect) and dropped when
+  anything under that prefix is uploaded, deleted, moved, copied, renamed or restored as a version (the
+  `transfer:progress`, `batch:progress` and `job:progress` events, and the app's own version actions,
+  tell the frontend), so a stale size is never shown.
+- The file table's Size column shows the cached size for folders that have one (muted, "≥" when
+  truncated), "—" otherwise.
+- Details with several folders selected (and nothing else): one button calculates all of them (each its
+  own scan, at most 4 at once), shown summed, "At least" when any is truncated.
+
+IAM: none new (`s3:ListBucket` is already required).

@@ -497,3 +497,19 @@ export const OPEN_LOCAL_REFUSED_EXTENSIONS = [
   "settingcontent-ms", "diagcab", "library-ms", "search-ms", "py", "pyw", "sh", "command", "app", "terminal",
   "fileloc", "inetloc", "desktop", "reg", "lnk", "url",
 ] as const;
+
+// ---- Folder size (see "Folder size" in docs/CONTRACT.md) ----
+
+/** Result of `folder_size`. */
+export interface FolderSize {
+  /** Objects counted (folder markers, keys ending in "/", are not counted). */
+  objects: number;
+  bytes: number;
+  /** Keys listed, folder markers included. */
+  scanned: number;
+  /** Stopped at FOLDER_SIZE_SCAN_LIMIT: the numbers are a lower bound. */
+  truncated: boolean;
+}
+
+/** `folder_size` lists at most this many keys. */
+export const FOLDER_SIZE_SCAN_LIMIT = 200_000;

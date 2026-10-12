@@ -10,6 +10,7 @@ pub mod buckets;
 pub mod commands;
 pub mod error;
 pub mod file_manager;
+pub mod folder_size;
 pub mod jobs;
 pub mod keychain;
 pub mod lifecycle;
@@ -160,6 +161,8 @@ pub fn run() {
             commands::versions::restore_object,
             commands::search::search_objects,
             commands::search::cancel_search,
+            commands::folder_size::folder_size,
+            commands::folder_size::cancel_folder_size,
             commands::transfers::open_local,
             commands::transfers::reveal_local,
             commands::transfers::try_file_manager,

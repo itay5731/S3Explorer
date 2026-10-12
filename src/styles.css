@@ -5970,3 +5970,15 @@ kbd {
   justify-content: flex-end;
   gap: 6px;
 }
+
+/* Folder size (details panel) */
+.dvalue.fsize {
+  flex-direction: column;
+  gap: 2px;
+}
+.fsize-line {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
