@@ -86,6 +86,10 @@ pub struct BatchEntry {
     /// Paused by the user: its files are paused and new ones start paused. Changed and read
     /// under the record lock, together with the status.
     paused: AtomicBool,
+    /// Serializes pause, resume and the start of each file: held across the flag change and the
+    /// walk over the batch's files, so a Pause all racing a Resume all cannot interleave and leave
+    /// the batch `queued` with every file paused (or the other way round).
+    control: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -308,6 +312,7 @@ impl BatchManager {
             transfer_ids: Mutex::new(Vec::new()),
             no_replace: req.kind == BatchKind::Download && req.on_conflict == ConflictPolicy::Skip,
             paused: AtomicBool::new(false),
+            control: tokio::sync::Mutex::new(()),
         });
         self.entries.insert(id.clone(), entry.clone());
         entry.publish(self.sink.as_ref());
@@ -364,6 +369,9 @@ impl BatchManager {
             if entry.cancel.is_cancelled() {
                 break;
             }
+            // Under the control lock: a pause or resume either sees this file in `transfer_ids`
+            // or happened before it read the flag, never in between.
+            let control = entry.control.lock().await;
             let paused = entry.paused.load(Ordering::SeqCst);
             let link = BatchLink { batch_id: batch_id.clone(), cancel: entry.cancel.clone(), observer: observer.clone(), paused };
             entry.outstanding.fetch_add(1, Ordering::AcqRel);
@@ -377,24 +385,13 @@ impl BatchManager {
                 }
             };
             match started {
-                Ok(id) => {
-                    lock(&entry.transfer_ids).push(id.clone());
-                    // Paused or resumed while this file started: `pause`/`resume` may have missed it.
-                    match (paused, entry.paused.load(Ordering::SeqCst)) {
-                        (false, true) => {
-                            let _ = self.transfers.pause(&id);
-                        }
-                        (true, false) => {
-                            let _ = self.transfers.resume(&id);
-                        }
-                        _ => {}
-                    }
-                }
+                Ok(id) => lock(&entry.transfer_ids).push(id),
                 Err(e) => {
                     entry.outstanding.fetch_sub(1, Ordering::AcqRel);
                     push_failure(&mut entry.lock(), f.key.clone(), e.message);
                 }
             }
+            drop(control);
             // Thousands of starts in a row: let other tasks (and the transfers) run.
             if i % 256 == 255 {
                 tokio::task::yield_now().await;
@@ -423,8 +420,9 @@ impl BatchManager {
 
     /// Pauses the batch's queued and running files and makes the ones it starts from now on start
     /// paused. `InvalidInput` for an unknown id or a finished batch; no-op if already paused.
-    pub fn pause(&self, id: &str) -> AppResult<()> {
+    pub async fn pause(&self, id: &str) -> AppResult<()> {
         let entry = self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown batch id"))?;
+        let _control = entry.control.lock().await;
         {
             let mut b = entry.lock();
             if !b.status.is_active() {
@@ -449,8 +447,9 @@ impl BatchManager {
 
     /// Resumes a paused batch: its files go back to the queue at their places, and it is `queued`
     /// until one of them runs. `InvalidInput` for an unknown id; no-op unless paused.
-    pub fn resume(&self, id: &str) -> AppResult<()> {
+    pub async fn resume(&self, id: &str) -> AppResult<()> {
         let entry = self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown batch id"))?;
+        let _control = entry.control.lock().await;
         {
             let mut b = entry.lock();
             if !entry.paused.swap(false, Ordering::SeqCst) {

@@ -246,74 +246,104 @@ fn static_config(endpoint: &str, ak: &str, sk: &str) -> ConnectionConfig {
 
 /// Pause and resume against the real server: a download resumes to the same bytes, an upload
 /// continues its multipart upload, and pause + cancel leaves no multipart upload behind.
+///
+/// Every pause is a hard assertion on a transfer that is provably still in progress: the manager
+/// runs with a 2 MiB/s limit in both directions, so a 5 MiB part takes ~2.5 s and the pause lands
+/// after the first part with most of the object still to go. The limit is lifted (live) before
+/// each resume so the rest goes at full speed.
 async fn pause_checks(client: &aws_sdk_s3::Client, bucket: &str, dir: &std::path::Path, big: &[u8], big_src: &std::path::Path) -> Res<()> {
     println!("pause and resume");
+    const PART: u64 = 5 * 1024 * 1024;
+    let size = big.len() as u64;
+    if size < 3 * PART {
+        return Err(format!("FAILED: pause checks need SMOKE_BIG_MIB >= 15 (got {} MiB): the transfer must still be running when paused", size >> 20).into());
+    }
     let out = dir.join("pause-out");
     let _ = tokio::fs::remove_dir_all(&out).await;
-    let tm = TransferManager::with_settings(Arc::new(|_: &Transfer| {}), settings(Some(5), 1, 2));
-    let wait_for = |id: String, pred: fn(&Transfer) -> bool| {
+    let slow = TransferSettings { download_limit_kibps: Some(2048), upload_limit_kibps: Some(2048), ..settings(Some(5), 1, 2) };
+    let fast = settings(Some(5), 1, 2);
+    let tm = TransferManager::with_settings(Arc::new(|_: &Transfer| {}), slow.clone());
+    let wait_for = |id: String, what: &'static str, pred: fn(&Transfer) -> bool| {
         let tm = tm.clone();
         async move {
-            for _ in 0..3000 {
-                if let Some(t) = tm.get(&id) {
-                    if pred(&t) {
-                        return t;
-                    }
+            let deadline = Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let t = tm.get(&id).ok_or("unknown transfer")?;
+                if pred(&t) {
+                    return Ok::<Transfer, Box<dyn std::error::Error>>(t);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                if Instant::now() > deadline {
+                    return Err(format!("FAILED: timed out waiting for {what}: {t:?}").into());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
-            tm.get(&id).expect("known")
         }
     };
-    let settled = |t: &Transfer| t.status == TransferStatus::Paused || !t.status.is_active();
+    let one_part_running = |t: &Transfer| t.status == TransferStatus::Running && t.parts_done >= 1;
+    let settled = |t: &Transfer| t.status != TransferStatus::Running && t.status != TransferStatus::Queued;
+    let parts_total = size.div_ceil(PART) as u32;
 
-    // Download: pause after the first part, resume, compare.
+    // Download: pause after the first part while the rest is still coming, resume, compare.
     let id = tm.start_download(client.clone(), bucket, "smoke/data/big.bin", out.join("paused.bin"))?;
-    wait_for(id.clone(), |t| t.parts_done >= 1 || !t.status.is_active()).await;
+    wait_for(id.clone(), "download: first part done, still running", one_part_running).await?;
     tm.pause(&id)?;
-    let t = wait_for(id.clone(), settled).await;
-    println!("  download pause -> {:?} at {} bytes, {} parts", t.status, t.transferred_bytes, t.parts_done);
-    if t.status == TransferStatus::Paused {
-        check(t.transferred_bytes == u64::from(t.parts_done) * 5 * 1024 * 1024, "paused download shows finished parts only")?;
-        check(tm.running_count() == 0, "paused download gave its slot back")?;
-        check(part_files_exist(&out)?, "paused download keeps its temp file")?;
-        tm.resume(&id)?;
-    }
+    let t = wait_for(id.clone(), "download pause to settle", settled).await?;
+    println!("  download pause -> {:?} at {} bytes, {} of {parts_total} parts", t.status, t.transferred_bytes, t.parts_done);
+    check(t.status == TransferStatus::Paused, "download paused mid-transfer")?;
+    check(t.parts_done >= 1 && t.parts_done < parts_total, "paused with parts still missing")?;
+    check(t.transferred_bytes == u64::from(t.parts_done) * PART, "paused download shows finished parts only")?;
+    check(t.bytes_per_sec == 0, "paused download reports no speed")?;
+    check(tm.running_count() == 0, "paused download gave its slot back")?;
+    check(part_files_exist(&out)?, "paused download keeps its temp file")?;
+    check(!out.join("paused.bin").exists(), "paused download has not written the destination")?;
+    tm.apply_settings(&fast);
+    tm.resume(&id)?;
     let t = tm.wait(&id).await.ok_or("missing transfer")?;
     check(t.status == TransferStatus::Completed, "resumed download completed")?;
     check(sha(&tokio::fs::read(out.join("paused.bin")).await?) == sha(big), "resumed download sha256 matches")?;
     check(!part_files_exist(&out)?, "no .part left after resume")?;
 
-    // Upload: pause after the first part, resume, read back.
+    // Upload: pause after the first part, check the multipart upload is kept, resume, read back.
+    tm.apply_settings(&slow);
     let key = "smoke/pause/up.bin";
     let id = tm.start_upload(client.clone(), bucket, key, big_src.to_path_buf());
-    wait_for(id.clone(), |t| t.parts_done >= 1 || !t.status.is_active()).await;
+    wait_for(id.clone(), "upload: first part done, still running", one_part_running).await?;
     tm.pause(&id)?;
-    let t = wait_for(id.clone(), settled).await;
-    println!("  upload pause -> {:?} at {} bytes", t.status, t.transferred_bytes);
-    if t.status == TransferStatus::Paused {
-        tm.resume(&id)?;
-    }
+    let t = wait_for(id.clone(), "upload pause to settle", settled).await?;
+    println!("  upload pause -> {:?} at {} bytes, {} of {parts_total} parts", t.status, t.transferred_bytes, t.parts_done);
+    check(t.status == TransferStatus::Paused, "upload paused mid-transfer")?;
+    check(t.parts_done >= 1 && t.parts_done < parts_total, "paused with parts still to send")?;
+    check(tm.running_count() == 0, "paused upload gave its slot back")?;
+    let uploads = client.list_multipart_uploads().bucket(bucket).prefix(key).send().await?;
+    check(uploads.uploads().len() == 1, "paused upload keeps its multipart upload open")?;
+    check(client.head_object().bucket(bucket).key(key).send().await.is_err(), "paused upload has not created the object")?;
+    tm.apply_settings(&fast);
+    tm.resume(&id)?;
     let t = tm.wait(&id).await.ok_or("missing transfer")?;
     check(t.status == TransferStatus::Completed, "resumed upload completed")?;
     let got = client.get_object().bucket(bucket).key(key).send().await?.body.collect().await?.into_bytes();
     check(sha(&got) == sha(big), "resumed upload sha256 matches")?;
+    let uploads = client.list_multipart_uploads().bucket(bucket).prefix(key).send().await?;
+    check(uploads.uploads().is_empty(), "resumed upload completed its multipart upload (none left open)")?;
 
-    // Upload paused, then cancelled: the multipart upload is aborted.
+    // Upload paused, then cancelled: the multipart upload is aborted and no object is left.
+    tm.apply_settings(&slow);
     let key = "smoke/pause/cancelled.bin";
     let id = tm.start_upload(client.clone(), bucket, key, big_src.to_path_buf());
-    wait_for(id.clone(), |t| t.parts_done >= 1 || !t.status.is_active()).await;
+    wait_for(id.clone(), "upload to cancel: first part done, still running", one_part_running).await?;
     tm.pause(&id)?;
-    let t = wait_for(id.clone(), settled).await;
-    println!("  upload pause then cancel -> {:?}", t.status);
+    let t = wait_for(id.clone(), "upload pause to settle", settled).await?;
+    println!("  upload pause then cancel -> paused as {:?} at {} bytes", t.status, t.transferred_bytes);
+    check(t.status == TransferStatus::Paused, "upload paused before the cancel")?;
+    let uploads = client.list_multipart_uploads().bucket(bucket).prefix(key).send().await?;
+    check(uploads.uploads().len() == 1, "the paused upload's multipart upload exists before the cancel")?;
     tm.cancel(&id)?;
     let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    check(t.status == TransferStatus::Cancelled, "paused upload cancelled")?;
     let uploads = client.list_multipart_uploads().bucket(bucket).prefix(key).send().await?;
     check(uploads.uploads().is_empty(), "no multipart upload left after pause + cancel")?;
-    if t.status == TransferStatus::Cancelled {
-        let head = client.head_object().bucket(bucket).key(key).send().await;
-        check(head.is_err(), "cancelled upload left no object")?;
-    }
+    check(client.head_object().bucket(bucket).key(key).send().await.is_err(), "cancelled upload left no object")?;
+    tm.apply_settings(&fast);
     // The later delete check counts exactly what the other steps left.
     delete_prefix(client, bucket, "smoke/pause/").await?;
     let _ = tokio::fs::remove_dir_all(&out).await;

@@ -197,7 +197,7 @@ async fn cancelling_or_exiting_with_a_paused_download_removes_its_temp_file() {
         tm.pause(&id).expect("pause");
         status_is(&tm, &id, TransferStatus::Paused).await;
         if exit {
-            assert_eq!(tm.cancel_paused_and_wait(LIMIT).await, 0);
+            assert_eq!(tm.cancel_active_and_wait(LIMIT).await, 0);
         } else {
             tm.cancel(&id).expect("cancel");
         }
@@ -305,7 +305,7 @@ async fn pausing_then_cancelling_or_exiting_or_changing_the_file_aborts_the_mult
                 finished(&tm, &id).await
             }
             "exit" => {
-                assert_eq!(tm.cancel_paused_and_wait(LIMIT).await, 0);
+                assert_eq!(tm.cancel_active_and_wait(LIMIT).await, 0);
                 finished(&tm, &id).await
             }
             _ => {
@@ -438,7 +438,7 @@ async fn a_paused_folder_upload_pauses_its_files_and_resumes_them() {
     };
     let id = bm.start(req, s3.client()).expect("start");
     until("first file in flight", || s3.count(|r| r.method == "PUT") == 1).await;
-    bm.pause(&id).expect("pause");
+    bm.pause(&id).await.expect("pause");
     assert_eq!(bm.get(&id).expect("batch").status, BatchStatus::Paused);
     let files = bm.transfer_ids(&id);
     assert_eq!(files.len(), 3);
@@ -448,7 +448,7 @@ async fn a_paused_folder_upload_pauses_its_files_and_resumes_them() {
     assert_eq!(tm.running_count(), 0);
     assert!(bm.remove(&id).is_err(), "a paused batch cannot be removed");
     state.lock().unwrap().hold = false;
-    bm.resume(&id).expect("resume");
+    bm.resume(&id).await.expect("resume");
     let b = tokio::time::timeout(LIMIT, bm.wait(&id)).await.expect("in time").expect("known");
     assert_eq!(b.status, BatchStatus::Completed, "{b:?}");
     assert_eq!(b.done_files, 3);
@@ -456,5 +456,86 @@ async fn a_paused_folder_upload_pauses_its_files_and_resumes_them() {
         s3.requests().into_iter().filter(|r| r.method == "PUT").map(|r| String::from_utf8_lossy(&r.body).into_owned()).collect();
     bodies.sort();
     assert_eq!(bodies, ["a.txt", "a.txt", "b.txt", "c.txt"], "the interrupted file is sent again, the others once");
-    assert!(bm.pause(&id).is_err(), "a finished batch cannot be paused");
+    assert!(bm.pause(&id).await.is_err(), "a finished batch cannot be paused");
+}
+
+/// Pause all racing Resume all on the same folder transfer: whichever lands last wins, but the
+/// batch and its files always agree (never `queued` with every file paused, or the reverse).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pause_and_resume_of_a_batch_never_strand_it() {
+    let dir = ScratchDir::new("pause-race");
+    let root = dir.0.join("many");
+    std::fs::create_dir_all(&root).expect("root");
+    const FILES: usize = 300;
+    for i in 0..FILES {
+        std::fs::write(root.join(format!("f{i:04}.txt")), b"x").expect("write");
+    }
+    // Every PUT hangs: one file holds the only run slot, the rest stay queued.
+    let state = Arc::new(Mutex::new(UploadServer { hold: true, hold_from: 1 }));
+    let s3 = upload_server(state.clone()).await;
+    let tm = manager(TransferSettings { max_concurrent_transfers: 1, ..TransferSettings::default() }, Arc::new(NoopSink));
+    let bm = BatchManager::new(tm.clone(), Arc::new(NoopBatchSink));
+    let req = BatchPlanRequest {
+        kind: BatchKind::Upload,
+        bucket: "b".into(),
+        prefix: "p/".into(),
+        local_path: root.display().to_string(),
+        on_conflict: ConflictPolicy::Overwrite,
+    };
+    let id = bm.start(req, s3.client()).expect("start");
+    until("every file started", || bm.transfer_ids(&id).len() == FILES).await;
+    let files = bm.transfer_ids(&id);
+
+    for round in 0..40 {
+        let (p, r) = (bm.clone(), bm.clone());
+        let (pid, rid) = (id.clone(), id.clone());
+        // Alternate which call is spawned first so both orders race.
+        let (a, b) = if round % 2 == 0 {
+            (tokio::spawn(async move { p.pause(&pid).await }), tokio::spawn(async move { r.resume(&rid).await }))
+        } else {
+            let b = tokio::spawn(async move { r.resume(&rid).await });
+            (tokio::spawn(async move { p.pause(&pid).await }), b)
+        };
+        a.await.expect("join").expect("pause");
+        b.await.expect("join").expect("resume");
+        let paused = bm.get(&id).expect("batch").status == BatchStatus::Paused;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let files_paused = files.iter().filter(|f| tm.get(f).is_some_and(|t| t.status == TransferStatus::Paused)).count();
+            let want = if paused { FILES } else { 0 };
+            if files_paused == want {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "round {round}: batch paused = {paused} but {files_paused} of {FILES} files are paused"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    bm.cancel(&id).expect("cancel");
+    let b = tokio::time::timeout(LIMIT, bm.wait(&id)).await.expect("in time").expect("known");
+    assert_eq!(b.status, BatchStatus::Cancelled);
+}
+
+/// App exit cancels running transfers too, not only paused ones: a multipart upload in flight is
+/// aborted rather than left behind, and a running download's temp file is removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn exiting_with_a_running_transfer_aborts_and_cleans_up() {
+    let dir = ScratchDir::new("exit-running-up");
+    let (tm, s3, _state, _src, id) = upload_held_after_one_part(&dir).await;
+    assert_eq!(tm.get(&id).expect("known").status, TransferStatus::Running);
+    assert_eq!(tm.cancel_active_and_wait(LIMIT).await, 0);
+    assert_eq!(finished(&tm, &id).await.status, TransferStatus::Cancelled);
+    assert_eq!(aborts(&s3), 1, "the running multipart upload is aborted");
+    assert!(!tm.has_active());
+
+    let dir = ScratchDir::new("exit-running-dl");
+    let object = Arc::new(Mutex::new(Object { size: 8 * MIB, etag: Some("\"v1\"".into()), last_modified: "Mon, 05 Oct 2026 10:00:00 GMT".into(), hold_from: 2 * MIB }));
+    let s3 = object_server(object).await;
+    let tm = manager(ranged_settings(2), Arc::new(NoopSink));
+    let id = download_held_after_two_parts(&tm, &s3, dir.0.join("obj.bin")).await;
+    assert_eq!(tm.cancel_active_and_wait(LIMIT).await, 0);
+    assert_eq!(finished(&tm, &id).await.status, TransferStatus::Cancelled);
+    assert!(dir.files().is_empty(), "{:?}", dir.files());
 }

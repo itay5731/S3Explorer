@@ -724,18 +724,10 @@ impl TransferManager {
         Ok(())
     }
 
-    /// Cancels every paused transfer (app exit: uploads are aborted, temp files removed) and
-    /// waits up to `limit` for them to reach their final state. Returns how many had not.
-    pub async fn cancel_paused_and_wait(&self, limit: Duration) -> usize {
-        let pending: Vec<CancellationToken> = self
-            .entries
-            .iter()
-            .filter(|e| e.is_paused() && e.status().is_active())
-            .map(|e| {
-                e.cancel.cancel();
-                e.finished.clone()
-            })
-            .collect();
+    /// Cancels every queued, running or paused transfer (app exit: uploads are aborted, temp files
+    /// removed) and waits up to `limit` for them to reach their final state. Returns how many had not.
+    pub async fn cancel_active_and_wait(&self, limit: Duration) -> usize {
+        let pending = self.cancel_active();
         let all = futures::future::join_all(pending.iter().map(|t| t.cancelled()));
         let _ = tokio::time::timeout(limit, all).await;
         pending.iter().filter(|t| !t.is_cancelled()).count()

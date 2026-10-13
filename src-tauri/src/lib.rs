@@ -180,15 +180,16 @@ pub fn run() {
         .build(context)
         .expect("error while building tauri application")
         .run(|app, event| {
-            // Paused state is not kept across restarts: end paused transfers like a cancel, so no
-            // multipart upload or temp file is left behind (abort what you start).
+            // Nothing survives a restart: cancel every running, queued or paused transfer, folder
+            // transfer and job, so no multipart upload or temp file is left behind (abort what you
+            // start). Bounded by EXIT_WAIT.
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<AppState>() {
-                    tauri::async_runtime::block_on(state.transfers.cancel_paused_and_wait(EXIT_WAIT));
+                    tauri::async_runtime::block_on(state.cancel_active_and_wait(EXIT_WAIT));
                 }
             }
         });
 }
 
-/// How long app exit waits for paused transfers to clean up.
+/// How long app exit waits for active transfers and jobs to clean up.
 const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);

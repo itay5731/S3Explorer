@@ -26,12 +26,12 @@ pub async fn cancel_batch(state: State<'_, AppState>, id: String) -> AppResult<(
 
 #[tauri::command]
 pub async fn pause_batch(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.batches.pause(&id)
+    state.batches.pause(&id).await
 }
 
 #[tauri::command]
 pub async fn resume_batch(state: State<'_, AppState>, id: String) -> AppResult<()> {
-    state.batches.resume(&id)
+    state.batches.resume(&id).await
 }
 
 #[tauri::command]

@@ -318,7 +318,8 @@ pub struct AppSettings {
     pub max_concurrent_transfers: u32,
     #[serde(default)]
     pub theme: ThemeMode,
-    #[serde(default)]
+    /// v0.8.0: on by default (a file without it loads `true`, like `Default`).
+    #[serde(default = "default_true")]
     pub check_updates_on_startup: bool,
     #[serde(default = "default_notify_on_finish")]
     pub notify_on_finish: bool,
@@ -347,6 +348,9 @@ pub struct AppSettings {
     pub download_limit_kibps: Option<u32>,
     #[serde(default)]
     pub upload_limit_kibps: Option<u32>,
+    /// v0.8.0: the details panel previews the selected file on its own; off = a "Preview" button.
+    #[serde(default = "default_true")]
+    pub preview_automatically: bool,
 }
 
 /// Inclusive range of the bandwidth limits (mirror `BANDWIDTH_LIMITS` in `types.ts`).
@@ -380,6 +384,10 @@ fn default_max_concurrent_transfers() -> u32 {
     DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_notify_on_finish() -> bool {
     true
 }
@@ -403,7 +411,7 @@ impl Default for AppSettings {
             max_concurrent_parts: DEFAULT_MAX_CONCURRENT_PARTS,
             max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
             theme: ThemeMode::System,
-            check_updates_on_startup: true,
+            check_updates_on_startup: default_true(),
             notify_on_finish: default_notify_on_finish(),
             text_size: DEFAULT_TEXT_SIZE,
             text_weight: DEFAULT_TEXT_WEIGHT,
@@ -413,6 +421,7 @@ impl Default for AppSettings {
             keybindings: BTreeMap::new(),
             download_limit_kibps: None,
             upload_limit_kibps: None,
+            preview_automatically: default_true(),
         }
     }
 }
@@ -441,6 +450,10 @@ fn theme_error() -> crate::error::AppError {
 
 fn check_updates_error() -> crate::error::AppError {
     crate::error::AppError::invalid("checkUpdatesOnStartup must be true or false")
+}
+
+fn preview_automatically_error() -> crate::error::AppError {
+    crate::error::AppError::invalid("previewAutomatically must be true or false")
 }
 
 fn notify_error() -> crate::error::AppError {
@@ -582,7 +595,8 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 
 impl AppSettings {
     /// Rejects (`InvalidInput`, naming the field and its range) the first out-of-range field.
-    /// `theme`, `checkUpdatesOnStartup` and `notifyOnFinish` are valid by construction.
+    /// `theme`, `checkUpdatesOnStartup`, `notifyOnFinish` and `previewAutomatically` are valid by
+    /// construction.
     pub fn validate(&self) -> crate::error::AppResult<()> {
         if !part_size_ok(self.part_size_mib) {
             return Err(part_size_error());
@@ -694,16 +708,20 @@ impl AppSettings {
             // Missing, null or invalid -> unlimited.
             download_limit_kibps: bandwidth_from_json(obj, "downloadLimitKibps").unwrap_or(None),
             upload_limit_kibps: bandwidth_from_json(obj, "uploadLimitKibps").unwrap_or(None),
+            preview_automatically: obj
+                .get("previewAutomatically")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(d.preview_automatically),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all fourteen fields must be present
+    /// Strict parse of the `update_settings` argument: all fifteen fields must be present
     /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`; `keybindings` an
     /// object of chord arrays within [`validate_keybindings`]'s limits; `downloadLimitKibps` and
     /// `uploadLimitKibps` `null` or an integer within the bandwidth range). Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
-    /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
-    /// `notifyOnFinish` and `confirmCopyMove` booleans. Anything else is
+    /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup`,
+    /// `notifyOnFinish`, `confirmCopyMove` and `previewAutomatically` booleans. Anything else is
     /// `InvalidInput` naming the field.
     /// Unknown fields are ignored.
     pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
@@ -754,6 +772,10 @@ impl AppSettings {
             keybindings: keybindings_from_json(obj.get("keybindings"))?,
             download_limit_kibps: bandwidth_from_json(obj, "downloadLimitKibps")?,
             upload_limit_kibps: bandwidth_from_json(obj, "uploadLimitKibps")?,
+            preview_automatically: obj
+                .get("previewAutomatically")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(preview_automatically_error)?,
         };
         s.validate()?;
         Ok(s)

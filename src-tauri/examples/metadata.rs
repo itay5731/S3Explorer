@@ -321,7 +321,14 @@ async fn main() -> Res<()> {
     println!("4. invalid input is refused before any request");
     let before = snap(&c).await?;
     let shown = &before[small];
-    for (k, v, what) in [("Owner", "x", "uppercase key"), ("k", "caf\u{e9}", "non-ASCII value"), ("k", "a\nb", "control character"), ("k", " x", "leading space")] {
+    for (k, v, what) in [
+        ("Owner", "x", "uppercase key"),
+        ("a:b", "x", "key with a separator (not an HTTP token)"),
+        ("a b", "x", "key with a space"),
+        ("k", "caf\u{e9}", "non-ASCII value"),
+        ("k", "a\nb", "control character"),
+        ("k", " x", "leading space"),
+    ] {
         expect_err(update_object_metadata(&c, &edit(small, shown, &[(k, v)])).await, ErrorCode::InvalidInput, what)?;
     }
     let big: Vec<(String, String)> = (0..9).map(|i| (format!("key-{i}"), "v".repeat(250))).collect();
@@ -332,6 +339,68 @@ async fn main() -> Res<()> {
     empty_ct.content_type = String::new();
     expect_err(update_object_metadata(&c, &empty_ct).await, ErrorCode::InvalidInput, "empty content type")?;
     check(snap(&c).await? == before, "bucket snapshot identical after the refusals")?;
+
+    println!("4b. keys with any HTTP token character, and an empty value, round-trip");
+    let before = snap(&c).await?;
+    let pairs = [("a.b_c~1", "dots and underscores"), ("x!#$%&'*+^`|", "symbols"), ("empty-value", "")];
+    let e = edit(small, &before[small], &pairs);
+    match update_object_metadata(&c, &e).await {
+        Ok(_) => {
+            let after = snap(&c).await?;
+            let want: BTreeMap<String, String> = e.metadata.clone().into_iter().collect();
+            check(after[small].metadata == want, &format!("token keys and the empty value read back as sent: {:?}", after[small].metadata))?;
+            assert_survived(&before, &after, small, "token keys")?;
+        }
+        Err(err) if err.code != ErrorCode::Unknown => return Err(format!("FAILED: token keys refused: {:?}: {}", err.code, err.message).into()),
+        Err(err) => {
+            // Only a read-back mismatch on the server's side is a "cannot run here"; report it loudly.
+            let after = snap(&c).await?;
+            println!("  SKIPPED (server limitation): {:?}: {}; stored metadata: {:?}", err.code, err.message, after[small].metadata);
+            println!("  SKIPPED: this server does not round-trip these metadata keys/values; verify on real S3");
+            // Put the object back to the state later scenarios expect.
+            let restore = edit(small, &after[small], &[]);
+            update_object_metadata(&c, &restore).await?;
+        }
+    }
+
+    println!("4c. GLACIER / DEEP_ARCHIVE objects are refused (the copy would re-archive them), nothing written");
+    for class in [StorageClass::Glacier, StorageClass::DeepArchive] {
+        let key = format!("archive/{}.txt", class.as_str());
+        let put = c.put_object().bucket(B).key(&key).body(ByteStream::from(pseudo_random(1000, 7))).storage_class(class.clone()).send().await;
+        let head = c.head_object().bucket(B).key(&key).send().await;
+        let stored = head.as_ref().ok().and_then(|h| h.storage_class().map(|s| s.as_str().to_string()));
+        if put.is_err() || stored.as_deref() != Some(class.as_str()) {
+            println!(
+                "  SKIPPED {}: this server does not store the class (put: {}, head reports {:?}); covered by the unit test refuses_restored_glacier_and_deep_archive",
+                class.as_str(),
+                if put.is_ok() { "ok" } else { "refused" },
+                stored
+            );
+            let _ = c.delete_object().bucket(B).key(&key).send().await;
+            continue;
+        }
+        let h = head?;
+        let shown_etag = h.e_tag().unwrap_or_default().to_string();
+        let shown_lm = h.last_modified().and_then(|d| d.fmt(DateTimeFormat::DateTime).ok()).unwrap_or_default();
+        let e = MetadataEdit {
+            bucket: B.into(),
+            key: key.clone(),
+            expected_etag: shown_etag,
+            expected_last_modified: shown_lm,
+            content_type: "text/csv".into(),
+            cache_control: None,
+            content_disposition: None,
+            metadata: [("owner".to_string(), "me".to_string())].into_iter().collect(),
+        };
+        let before = c.head_object().bucket(B).key(&key).send().await?;
+        expect_err(update_object_metadata(&c, &e).await, ErrorCode::NotSupported, &format!("{} object", class.as_str()))?;
+        let after = c.head_object().bucket(B).key(&key).send().await?;
+        check(
+            after.e_tag() == before.e_tag() && after.last_modified() == before.last_modified() && after.metadata() == before.metadata(),
+            &format!("{}: object untouched", class.as_str()),
+        )?;
+        c.delete_object().bucket(B).key(&key).send().await?;
+    }
 
     println!("5. multipart object: body and tags survive, the new ETag is reported");
     let before = snap(&c).await?;

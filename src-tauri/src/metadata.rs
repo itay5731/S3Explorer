@@ -29,12 +29,27 @@ fn printable(s: &str) -> bool {
     s.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
+/// A metadata key is the tail of an `x-amz-meta-*` header name, so it must be an HTTP token
+/// (RFC 7230 `tchar`), lowercase (S3 lowercases names on the way in, so an uppercase key could not be
+/// read back as sent). Equivalent regex, mirrored in `src/lib/metadata.ts`:
+/// `^[a-z0-9!#$%&'*+.^_`|~-]+$`
+pub fn is_metadata_key(k: &str) -> bool {
+    !k.is_empty() && k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// Header values must survive the round trip byte for byte: printable ASCII (S3 stores anything
 /// else RFC 2047-encoded) and no leading or trailing spaces (HTTP trims them).
 fn header_error(s: &str) -> Option<&'static str> {
     if s.is_empty() {
         Some("must not be empty")
-    } else if s.chars().any(char::is_control) {
+    } else {
+        value_error(s)
+    }
+}
+
+/// Like [`header_error`] but empty is fine: a user metadata value may be empty.
+fn value_error(s: &str) -> Option<&'static str> {
+    if s.chars().any(char::is_control) {
         Some("must not contain control characters")
     } else if !printable(s) {
         Some("must be plain ASCII (S3 would store other characters encoded)")
@@ -78,13 +93,13 @@ pub fn validate(edit: &MetadataEdit) -> AppResult<()> {
         if k.chars().count() > MAX_KEY_CHARS {
             return Err(AppError::invalid(format!("Metadata key {k:?} is longer than {MAX_KEY_CHARS} characters.")));
         }
-        if !k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') {
+        if !is_metadata_key(k) {
             return Err(AppError::invalid(format!(
-                "Metadata key {k:?} may only contain lowercase letters a-z, digits and hyphens."
+                "Metadata key {k:?} may only contain lowercase letters a-z, digits and the symbols ! # $ % & ' * + - . ^ _ ` | ~"
             )));
         }
         let v = &edit.metadata[k];
-        if let Some(why) = header_error(v) {
+        if let Some(why) = value_error(v) {
             return Err(AppError::invalid(format!("The value of metadata key {k:?} {why}.")));
         }
         total += k.len() + v.len();
@@ -119,7 +134,19 @@ fn check_object(edit: &MetadataEdit, h: &HeadObjectOutput) -> AppResult<()> {
             "The object is larger than 5 GiB, the most S3 can copy in one request, so its metadata cannot be edited here.",
         ));
     }
-    if crate::archive::ArchiveInfo::from_head(h).archived(chrono::Utc::now()) {
+    let archive = crate::archive::ArchiveInfo::from_head(h);
+    // GLACIER / DEEP_ARCHIVE, restored or not: the copy keeps the storage class, so it would write the
+    // data straight back into the archive and the restored copy would be gone. Restoring cannot help.
+    if crate::archive::is_archive_class(archive.storage_class.as_deref()) {
+        return Err(AppError::new(
+            ErrorCode::NotSupported,
+            format!(
+                "The object is in {}. Editing metadata copies the object, which would put it back in the archive (a restored copy would be lost), so it cannot be edited here.",
+                archive.storage_class.as_deref().unwrap_or("an archive storage class")
+            ),
+        ));
+    }
+    if archive.archived(chrono::Utc::now()) {
         return Err(AppError::invalid("The object is archived; restore it first to edit its metadata."));
     }
     if h.sse_customer_algorithm().is_some() {
@@ -265,9 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn metadata_keys_are_lowercase_ascii() {
-        for k in ["Owner", "my_key", "a.b", "a b", "é", ""] {
+    fn metadata_keys_are_lowercase_http_tokens() {
+        for k in ["Owner", "a b", "é", "", "a:b", "a/b", "a\"b", "(x)", "a,b", "a;b", "a=b", "a@b", "[x]", "{x}", "a?b", "a\\b", "t\tb", "a\u{7f}"] {
             invalid(&edit(&[(k, "v")]));
+        }
+        for k in ["my_key", "a.b", "x-1", "!#$%&'*+-.^_`|~", "0"] {
+            validate(&edit(&[(k, "v")])).unwrap_or_else(|e| panic!("{k:?} should be valid: {}", e.message));
         }
         let long = "a".repeat(MAX_KEY_CHARS);
         validate(&edit(&[(&long, "v")])).expect("128 chars");
@@ -276,9 +306,14 @@ mod tests {
 
     #[test]
     fn values_are_printable_ascii_without_edge_spaces() {
-        for v in ["a\nb", "tab\there", "\u{7f}", "caf\u{e9}", " lead", "trail ", ""] {
+        for v in ["a\nb", "tab\there", "\u{7f}", "caf\u{e9}", " lead", "trail ", " "] {
             invalid(&edit(&[("k", v)]));
         }
+    }
+
+    #[test]
+    fn empty_metadata_values_are_allowed() {
+        validate(&edit(&[("flag", "")])).expect("an empty value is a valid header value");
     }
 
     #[test]
@@ -383,7 +418,7 @@ mod tests {
     async fn refuses_large_archived_and_sse_c_objects_without_copying() {
         let cases: Vec<(Vec<(String, String)>, &str)> = vec![
             (vec![h("Content-Length", &(MAX_COPY_BYTES + 1).to_string())], "5 GiB"),
-            (vec![h("x-amz-storage-class", "GLACIER")], "archived"),
+            (vec![h("x-amz-storage-class", "INTELLIGENT_TIERING"), h("x-amz-archive-status", "ARCHIVE_ACCESS")], "archived"),
             (vec![h("x-amz-server-side-encryption-customer-algorithm", "AES256")], "SSE-C"),
             (vec![h("Expires", "not a date")], "Expires"),
         ];
@@ -404,6 +439,30 @@ mod tests {
             assert_eq!(err.code, ErrorCode::InvalidInput, "{what}: {}", err.message);
             assert!(err.message.contains(what), "{what}: {}", err.message);
             assert_eq!(s3.count(|r| r.method == "PUT"), 0, "{what}: no copy");
+        }
+    }
+
+    /// GLACIER / DEEP_ARCHIVE are refused even when restored: the copy would re-archive the data.
+    #[tokio::test]
+    async fn refuses_restored_glacier_and_deep_archive() {
+        for class in ["GLACIER", "DEEP_ARCHIVE"] {
+            for restore in [None, Some("ongoing-request=\"false\", expiry-date=\"Fri, 01 Jan 2100 00:00:00 GMT\"")] {
+                let s3 = FakeS3::start(move |r| match r.method.as_str() {
+                    "HEAD" => {
+                        let mut extra = vec![h("x-amz-storage-class", class)];
+                        if let Some(v) = restore {
+                            extra.push(h("x-amz-restore", v));
+                        }
+                        head_reply("abc", extra)
+                    }
+                    _ => Reply::status(500),
+                })
+                .await;
+                let err = update_object_metadata(&s3.client(), &edit(&[])).await.expect_err(class);
+                assert_eq!(err.code, ErrorCode::NotSupported, "{class} {restore:?}: {}", err.message);
+                assert!(err.message.contains(class), "{}", err.message);
+                assert_eq!(s3.count(|r| r.method == "PUT"), 0, "{class}: no copy");
+            }
         }
     }
 

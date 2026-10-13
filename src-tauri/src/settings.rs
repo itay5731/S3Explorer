@@ -152,10 +152,45 @@ mod tests {
                 "fileManagerCommand": null,
                 "keybindings": {},
                 "downloadLimitKibps": null,
-                "uploadLimitKibps": null
+                "uploadLimitKibps": null,
+                "previewAutomatically": true
             })
         );
         assert!(d.validate().is_ok());
+    }
+
+    /// The serde field defaults and `Default` cannot diverge: a `{}` deserializes to `Default`.
+    #[test]
+    fn serde_defaults_agree_with_default() {
+        let got: AppSettings = serde_json::from_value(json!({})).expect("deserialize");
+        assert_eq!(got, AppSettings::default());
+        assert!(got.check_updates_on_startup && got.preview_automatically);
+    }
+
+    #[test]
+    fn preview_automatically_flag() {
+        let with = |flag: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match flag {
+                Some(flag) => o.insert("previewAutomatically".into(), flag),
+                None => o.remove("previewAutomatically"),
+            };
+            v
+        };
+        for flag in [true, false] {
+            let got = AppSettings::from_json_strict(&with(Some(json!(flag)))).expect("valid");
+            assert_eq!(got.preview_automatically, flag);
+            assert_eq!(AppSettings::from_json_lenient(&with(Some(json!(flag)))).preview_automatically, flag);
+        }
+        for bad in [Some(json!("true")), Some(json!(1)), Some(serde_json::Value::Null), None] {
+            let v = with(bad);
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with("previewAutomatically"), "{v} -> {}", e.message);
+            // The on-disk file: missing or malformed loads `true` and nothing else changes.
+            assert_eq!(AppSettings::from_json_lenient(&v), AppSettings::default(), "{v}");
+        }
     }
 
     #[test]
@@ -198,6 +233,7 @@ mod tests {
         o.entry("keybindings").or_insert(json!({}));
         o.entry("downloadLimitKibps").or_insert(serde_json::Value::Null);
         o.entry("uploadLimitKibps").or_insert(serde_json::Value::Null);
+        o.entry("previewAutomatically").or_insert(json!(true));
         v
     }
 
@@ -238,7 +274,7 @@ mod tests {
     #[test]
     fn strict_parse_theme_and_update_flag() {
         let base =
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}, "downloadLimitKibps": null, "uploadLimitKibps": null});
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}, "downloadLimitKibps": null, "uploadLimitKibps": null, "previewAutomatically": true});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -604,6 +640,7 @@ mod tests {
                 keybindings: Default::default(),
                 download_limit_kibps: None,
                 upload_limit_kibps: None,
+                preview_automatically: true,
             }
         );
         // Saved again, the file carries the new field.
@@ -662,6 +699,7 @@ mod tests {
                 keybindings: Default::default(),
                 download_limit_kibps: None,
                 upload_limit_kibps: None,
+                preview_automatically: true,
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
@@ -693,6 +731,7 @@ mod tests {
                     keybindings: Default::default(),
                     download_limit_kibps: None,
                     upload_limit_kibps: None,
+                    preview_automatically: true,
                 },
             ),
             // Non-boolean flag: only the flag falls back.
@@ -713,6 +752,12 @@ mod tests {
             // Notifications switched off; a non-boolean value falls back to on.
             (r#"{"notifyOnFinish": false}"#, AppSettings { notify_on_finish: false, ..AppSettings::default() }),
             (r#"{"notifyOnFinish": "no"}"#, AppSettings::default()),
+            // v0.8.0: preview off is kept; a v0.7.0 file without the field previews automatically.
+            (r#"{"previewAutomatically": false}"#, AppSettings { preview_automatically: false, ..AppSettings::default() }),
+            (r#"{"previewAutomatically": "no"}"#, AppSettings::default()),
+            // A file without checkUpdatesOnStartup checks (v0.8.0 default); `false` is respected.
+            (r#"{"theme": "dark"}"#, AppSettings { theme: ThemeMode::Dark, check_updates_on_startup: true, ..AppSettings::default() }),
+            (r#"{"checkUpdatesOnStartup": false}"#, AppSettings { check_updates_on_startup: false, ..AppSettings::default() }),
         ];
         for (text, want) in cases {
             std::fs::write(&path, text).expect("write");

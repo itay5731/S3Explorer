@@ -23,9 +23,14 @@ use super::{cancellable, plan, AbortOnDrop, PartSettings, Runner, TransferEntry}
 use crate::error::{AppError, AppResult, ErrorCode};
 
 /// Slowest uplink assumed healthy: 32 KiB/s (256 kbit/s) in total, shared evenly by every
-/// body-carrying request the app may have in flight at once. The lowest bandwidth limit is above
-/// it and the limiter serves requests in turn, so a limited upload never hits the timeout below.
+/// body-carrying request the app may have in flight at once. While an upload limit is set the
+/// share is the most requests the settings could ever allow at once ([`LIMITED_LINK_SHARE`]): the
+/// lowest limit (64 KiB/s) is above this rate, so a limited healthy link never hits the timeout
+/// whatever the parallelism, even after the settings change mid-transfer.
 pub(crate) const UPLOAD_MIN_RATE: u64 = 32 * 1024;
+/// Parts per transfer x transfers at once, both at their setting maximum.
+pub(crate) const LIMITED_LINK_SHARE: u64 =
+    crate::models::MAX_CONCURRENT_PARTS_MAX as u64 * crate::models::MAX_CONCURRENT_TRANSFERS_MAX as u64;
 /// Fixed allowance per attempt (connection setup, the server committing the data, latency).
 const UPLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(60);
 const UPLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(6 * 60 * 60);
@@ -47,10 +52,23 @@ pub(crate) fn upload_attempt_timeout(body_len: u64, share: u64) -> Duration {
 /// time out and start the part over. These requests replace it with an `operation_attempt_timeout`
 /// scaled to the body size ([`upload_attempt_timeout`]). The SDK still retries a timed-out
 /// attempt (the body is re-read from disk); the connect timeout is inherited from the client.
-fn body_upload_config(cfg: &PartSettings, body_len: u64) -> aws_sdk_s3::config::Builder {
-    let t = cfg.upload_attempt_timeout.unwrap_or_else(|| upload_attempt_timeout(body_len, cfg.link_share));
+///
+/// While the upload limit is on (checked per request, so a limit switched on mid-transfer counts for
+/// the parts sent from then on) the share is [`LIMITED_LINK_SHARE`]: the limiter splits the limit
+/// over every request in flight, and a low limit with high parallelism must not time parts out.
+fn body_upload_config(cfg: &PartSettings, body_len: u64, limited: bool) -> aws_sdk_s3::config::Builder {
+    let t = cfg.upload_attempt_timeout.unwrap_or_else(|| upload_attempt_timeout(body_len, attempt_share(cfg, limited)));
     aws_sdk_s3::config::Builder::default()
         .timeout_config(TimeoutConfig::builder().disable_read_timeout().operation_attempt_timeout(t).build())
+}
+
+/// The share [`upload_attempt_timeout`] assumes for a request of this transfer.
+fn attempt_share(cfg: &PartSettings, limited: bool) -> u64 {
+    if limited {
+        LIMITED_LINK_SHARE.max(cfg.link_share)
+    } else {
+        cfg.link_share
+    }
 }
 
 /// A request body that takes tokens from the upload limiter for each chunk before handing it to
@@ -61,6 +79,16 @@ struct Throttled {
     /// A chunk read from disk with its limiter ticket, held until the limiter lets it go.
     held: Option<(f64, Frame<Bytes>)>,
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Drop for Throttled {
+    /// The HTTP client dropped the body while a chunk waited for the limiter (cancel, pause, an
+    /// attempt timeout): its bytes were never sent, so give them back.
+    fn drop(&mut self) {
+        if let Some((ticket, frame)) = &self.held {
+            self.limiter.refund(*ticket, frame.data_ref().map_or(0, |d| d.len() as u64));
+        }
+    }
 }
 
 impl Body for Throttled {
@@ -185,7 +213,7 @@ pub(super) async fn run(
                 .content_length(size as i64)
                 .body(body)
                 .customize()
-                .config_override(body_upload_config(&cfg, size))
+                .config_override(body_upload_config(&cfg, size, entry.limit.is_limited()))
                 .send();
             match cancellable(&runner.token(), put).await {
                 Ok(r) => {
@@ -348,7 +376,7 @@ async fn upload_parts(
                     .content_length(len as i64)
                     .body(body)
                     .customize()
-                    .config_override(body_upload_config(&cfg, len))
+                    .config_override(body_upload_config(&cfg, len, entry.limit.is_limited()))
                     .send(),
             )
             .await??;
@@ -378,6 +406,41 @@ async fn upload_parts(
 mod tests {
     use super::*;
     use crate::transfers::MIB;
+
+    #[test]
+    fn a_limited_upload_sizes_its_timeout_from_the_widest_share() {
+        let cfg = PartSettings { part_size_mib: Some(8), max_parts: 1, link_share: 1, upload_attempt_timeout: None };
+        assert_eq!(attempt_share(&cfg, false), 1);
+        assert_eq!(attempt_share(&cfg, true), LIMITED_LINK_SHARE);
+        assert_eq!(LIMITED_LINK_SHARE, 320);
+        // At the lowest limit split over every request the settings allow, a part still makes it.
+        let min_limit = u64::from(crate::models::BANDWIDTH_LIMIT_KIBPS_MIN) * 1024;
+        for len in [5 * MIB, 8 * MIB, 64 * MIB] {
+            let send = Duration::from_secs(len * LIMITED_LINK_SHARE / min_limit);
+            let bound = upload_attempt_timeout(len, attempt_share(&cfg, true));
+            assert!(bound > send || bound == UPLOAD_TIMEOUT_MAX, "{len}: {bound:?} vs {send:?}");
+        }
+    }
+
+    /// A throttled body dropped while its chunk waits refunds the chunk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_throttled_body_refunds_its_held_chunk() {
+        let limiter = Arc::new(Limiter::new(Some(64)));
+        limiter.take(super::super::limit::BURST).await;
+        let body = throttled(ByteStream::from(vec![0u8; 4 * 1024 * 1024]), &limiter);
+        let mut inner = body.into_inner();
+        // Poll once: the 4 MiB chunk reserves ~64 s of tickets and is held.
+        let polled = tokio::time::timeout(
+            Duration::from_millis(100),
+            std::future::poll_fn(|cx| Pin::new(&mut inner).poll_frame(cx)),
+        )
+        .await;
+        assert!(polled.is_err(), "the chunk waits for the limiter");
+        drop(inner);
+        let t = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), limiter.take(16 * 1024)).await.expect("no phantom delay");
+        assert!(t.elapsed() < Duration::from_millis(600), "{:?}", t.elapsed());
+    }
 
     #[test]
     fn attempt_timeout_scales_with_body_and_sharing() {

@@ -8,6 +8,11 @@
 //! share the limit evenly and none of them can starve behind the others. (f64 counts bytes
 //! exactly up to 2^53, about 9 PB per session.)
 //!
+//! A waiter that goes away before its ticket came up (cancel, pause, an SDK attempt timeout dropping
+//! the request body) gives its bytes back: [`Bucket::refund`] adds them to `credit`, which is the same
+//! as taking them out of every later ticket, so the ones behind it are not delayed by bytes that
+//! were never sent. [`Limiter::take`] and the upload's throttled body both refund on drop.
+//!
 //! A waiter never sleeps longer than [`RECHECK`] before looking again, so a new rate (or switching
 //! the limit off) reaches running transfers within a second. The debt ahead of a ticket is in
 //! bytes, so it simply drains at whatever the rate is now.
@@ -64,6 +69,19 @@ impl Bucket {
         self.refill(now);
         self.demand += n as f64;
         Some(self.demand)
+    }
+
+    /// Gives back the `n` bytes of `ticket` when its waiter leaves before the ticket came up: every
+    /// later ticket moves `n` bytes closer. Credit stays capped at one burst above what was asked
+    /// for. A ticket that already came up (its bytes were allowed) is not refunded.
+    pub(crate) fn refund(&mut self, ticket: f64, n: u64, now: Duration) {
+        if self.rate.is_none() {
+            return;
+        }
+        self.refill(now);
+        if self.credit < ticket {
+            self.credit = (self.credit + n as f64).min(self.demand + BURST as f64);
+        }
     }
 
     /// How long `ticket` still has to wait at the current rate; `None` once it may go (always
@@ -132,11 +150,38 @@ impl Limiter {
         }
     }
 
-    /// Waits until `n` more bytes may pass.
+    /// Whether a limit is set right now.
+    pub fn is_limited(&self) -> bool {
+        self.limited.load(Ordering::Relaxed)
+    }
+
+    /// Gives back a ticket whose waiter left before it came up (see [`Bucket::refund`]).
+    pub fn refund(&self, ticket: f64, n: u64) {
+        let now = self.now();
+        self.lock().refund(ticket, n, now);
+    }
+
+    /// Waits until `n` more bytes may pass. Dropped while waiting (cancel, pause), it refunds the
+    /// bytes so the waiters behind it are not held back by them.
     pub async fn take(&self, n: u64) {
         if let Some(ticket) = self.reserve(n) {
+            let guard = Unredeemed { limiter: self, ticket, n };
             self.wait(ticket).await;
+            std::mem::forget(guard);
         }
+    }
+}
+
+/// Refunds a ticket on drop unless forgotten once the ticket came up.
+struct Unredeemed<'a> {
+    limiter: &'a Limiter,
+    ticket: f64,
+    n: u64,
+}
+
+impl Drop for Unredeemed<'_> {
+    fn drop(&mut self) {
+        self.limiter.refund(self.ticket, self.n);
     }
 }
 
@@ -268,6 +313,54 @@ mod tests {
         b.set_rate(Some(64 * KIB), Duration::from_secs(1));
         let ticket = b.reserve(BURST, Duration::from_secs(1)).expect("limited");
         assert!(b.wait_for(ticket, Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn a_dropped_waiter_gives_its_bytes_back() {
+        let t0 = Duration::ZERO;
+        // Burst used up, then A asks for 1 MiB (16 s at 64 KiB/s) and B for 16 KiB behind it.
+        let mut b = Bucket::new(Some(64 * KIB), t0);
+        let burst = b.reserve(BURST, t0).expect("limited");
+        assert!(b.wait_for(burst, t0).is_none());
+        let a = b.reserve(1024 * KIB, t0).expect("limited");
+        let b_ticket = b.reserve(16 * KIB, t0).expect("limited");
+        assert!(b.wait_for(b_ticket, t0).expect("B waits behind A") > Duration::from_secs(16));
+        // A is cancelled one second in: B now waits only for its own 16 KiB, already earned.
+        let t1 = Duration::from_secs(1);
+        b.refund(a, 1024 * KIB, t1);
+        assert!(b.wait_for(b_ticket, t1).is_none(), "no phantom delay for A's unsent bytes");
+        // Credit is capped: a request of more than one burst waits for the rate again.
+        let c = b.reserve(BURST + 64 * KIB, t1).expect("limited");
+        assert!(b.wait_for(c, t1).is_some(), "a refund never grants more than one burst");
+    }
+
+    #[test]
+    fn a_ticket_that_came_up_is_not_refunded() {
+        let t0 = Duration::ZERO;
+        let mut b = Bucket::new(Some(64 * KIB), t0);
+        let a = b.reserve(BURST, t0).expect("limited");
+        assert!(b.wait_for(a, t0).is_none(), "allowed at once");
+        b.refund(a, BURST, t0);
+        let next = b.reserve(64 * KIB, t0).expect("limited");
+        let wait = b.wait_for(next, t0).expect("must wait");
+        assert!((wait.as_secs_f64() - 1.0).abs() < 0.01, "{wait:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_take_does_not_delay_the_next_one() {
+        let l = std::sync::Arc::new(Limiter::new(Some(64)));
+        l.take(BURST).await; // the burst
+        let waiter = {
+            let l = l.clone();
+            tokio::spawn(async move { l.take(64 * 1024 * KIB).await }) // ~17 min at 64 KiB/s
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waiter.abort();
+        let _ = waiter.await;
+        // 16 KiB at 64 KiB/s: 250 ms, not 17 minutes behind the aborted request.
+        let t = Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), l.take(16 * KIB)).await.expect("served without the phantom delay");
+        assert!(t.elapsed() < Duration::from_millis(600), "{:?}", t.elapsed());
     }
 
     #[tokio::test(flavor = "multi_thread")]
