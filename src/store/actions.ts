@@ -8,7 +8,7 @@ import { markHiddenTabsStale, PANE_IDS, type PaneId } from "./panes";
 import { isDenied, toast, toastDenied, toastFailure } from "./toasts";
 import { notifyInBackground } from "./notify";
 import { ARCHIVED_MESSAGE, splitReadable, toastArchivedSkipped } from "./archive";
-import { scheduleTransferResync, onTransferFinished, selectActiveCount, useTransfers } from "./transfers";
+import { scheduleTransferResync, onTransferFinished, selectMovingCount, useTransfers } from "./transfers";
 
 /** Upload files into a pane's folder (default: the active pane). */
 export async function uploadPaths(paths: string[], pane: PaneId = activePane()) {
@@ -130,7 +130,8 @@ function notifyDrained() {
   drainScheduled = false;
   const done = drained;
   drained = [];
-  if (!done.length || selectActiveCount(useTransfers.getState()) > 0) return;
+  // A paused transfer waits for the user: the queue has drained without it.
+  if (!done.length || selectMovingCount(useTransfers.getState()) > 0) return;
   const failed = done.filter((t) => t.status === "failed").length;
   const title = failed ? (failed === 1 ? "Transfer failed" : `${failed} transfers failed`) : "Transfers finished";
   const body = done.length === 1 ? basename(done[0].key) : `${done.length} transfers${failed ? `, ${failed} failed` : ""}`;
@@ -143,7 +144,7 @@ export function installTransferEffects(): () => void {
     // One notification when the queue drains, not one per file.
     if (t.status !== "cancelled") {
       drained.push(t);
-      if (selectActiveCount(useTransfers.getState()) === 0 && !drainScheduled) {
+      if (selectMovingCount(useTransfers.getState()) === 0 && !drainScheduled) {
         drainScheduled = true;
         queueMicrotask(notifyDrained);
       }

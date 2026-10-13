@@ -40,6 +40,9 @@ SHA-256, exercises cancel and a missing-key failure, then deletes the folder wit
 and confirms it is empty. Record the reported MiB/s for upload and download. Reference on this
 machine: 40 MiB upload ~300 MiB/s, download ~450 MiB/s; 512 MiB upload ~480 MiB/s, download ~650 MiB/s.
 
+The smoke example also pauses and resumes a download and an upload (byte-identical after resume) and
+pauses then cancels an upload (no multipart upload or object left behind).
+
 ## Other harnesses in src-tauri/examples
 - `cargo run --example jobs`: delete, copy, move and rename. 110+ checks, each comparing a full snapshot of the
   bucket (every key, size, hash) before and after. Run it after any change under `src-tauri/src/jobs/`.

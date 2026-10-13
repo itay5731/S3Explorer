@@ -56,7 +56,7 @@ export interface ObjectMeta extends ObjectEntry {
 }
 
 export type TransferKind = "download" | "upload";
-export type TransferStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type TransferStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
 
 export interface Transfer {
   id: string;
@@ -367,7 +367,7 @@ export type BucketVersioning = "Enabled" | "Suspended" | "Off";
 
 // Folder transfers (batches)
 export type BatchKind = "upload" | "download";
-export type BatchStatus = "planning" | "queued" | "running" | "completed" | "failed" | "cancelled";
+export type BatchStatus = "planning" | "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
 
 export interface BatchPlanRequest {
   kind: BatchKind;

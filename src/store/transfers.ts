@@ -15,7 +15,10 @@ interface TransferState {
   remove(ids: string[]): void;
 }
 
-export const isActive = (t: Transfer) => t.status === "running" || t.status === "queued";
+/** Not finished yet: queued, running or paused. */
+export const isActive = (t: Transfer) => t.status === "running" || t.status === "queued" || t.status === "paused";
+/** Moving data or waiting for a slot to (a paused transfer waits for the user). */
+export const isMoving = (t: Transfer) => t.status === "running" || t.status === "queued";
 
 export const useTransfers = create<TransferState>((set, get) => ({
   byId: {},
@@ -48,7 +51,7 @@ export const useTransfers = create<TransferState>((set, get) => ({
   },
 }));
 
-/** Selector: number of queued + running transfers. */
+/** Selector: number of queued + running + paused transfers. */
 export const selectActiveCount = (s: TransferState) => {
   let n = 0;
   for (const id of s.ids) {
@@ -57,6 +60,25 @@ export const selectActiveCount = (s: TransferState) => {
   }
   return n;
 };
+
+/** Selector: number of queued + running transfers. */
+export const selectMovingCount = (s: TransferState) => {
+  let n = 0;
+  for (const id of s.ids) {
+    const t = s.byId[id];
+    if (t && isMoving(t)) n++;
+  }
+  return n;
+};
+
+/** Pause or resume, ignoring "already finished" (the row catches up with the next event). */
+export async function setTransferPaused(id: string, paused: boolean) {
+  try {
+    await (paused ? api.pauseTransfer(id) : api.resumeTransfer(id));
+  } catch {
+    /* unknown or already finished */
+  }
+}
 
 type CompletionHandler = (t: Transfer) => void;
 const completionHandlers = new Set<CompletionHandler>();

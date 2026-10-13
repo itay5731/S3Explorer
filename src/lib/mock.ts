@@ -947,6 +947,9 @@ const progressListeners = new Set<(t: Transfer) => void>();
 let ticker: ReturnType<typeof setInterval> | null = null;
 let idSeq = 0;
 
+/** Queued, running or paused (paused still holds its temp file / multipart upload). */
+const simActive = (t: Transfer) => t.status === "running" || t.status === "queued" || t.status === "paused";
+
 function emit(t: Transfer) {
   const copy = { ...t };
   for (const l of progressListeners) l(copy);
@@ -969,7 +972,8 @@ function startQueued() {
     s.partSize = plan.partBytes;
     s.t.partsTotal = plan.parts;
     s.t.status = "running";
-    s.startedMs = now;
+    // A resumed transfer continues from its finished parts.
+    s.startedMs = now - (s.t.totalBytes ? (s.t.transferredBytes / s.t.totalBytes) * s.durationMs : 0);
     running++;
     emit(s.t);
   }
@@ -1304,6 +1308,8 @@ interface BatchSim {
   baseBytes: number; // bytes of finished files
   everRan: boolean;
   transferIds: string[];
+  /** Paused by the user (also while still planning). */
+  paused: boolean;
 }
 
 const batchSims = new Map<string, BatchSim>();
@@ -1314,7 +1320,7 @@ const batchCallLog: { cmd: "preview_batch" | "start_batch" | "cancel_batch"; req
 const batchPreviewDelay: { next: number | null } = { next: null };
 
 const cloneBatch = (b: Batch): Batch => ({ ...b, errors: b.errors.map((e) => ({ ...e })) });
-const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running";
+const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running" || b.status === "paused";
 
 function emitBatch(b: Batch) {
   const copy = cloneBatch(b);
@@ -1383,10 +1389,12 @@ function batchTick() {
         sim.req.kind === "upload"
           ? `Upload ${name}/ (${b.totalFiles.toLocaleString()} file${b.totalFiles === 1 ? "" : "s"})`
           : `Download ${name}/ to ${sim.req.localPath}`;
-      b.status = "queued";
+      b.status = sim.paused ? "paused" : "queued";
       emitBatch(b);
       continue;
     }
+    // Paused: its files are paused and no new ones start.
+    if (b.status === "paused") continue;
     let liveBytes = 0;
     let speed = 0;
     let running = false;
@@ -1460,7 +1468,7 @@ function startBatchSim(req: BatchPlanRequest): string {
     startedAt: new Date().toISOString(),
     finishedAt: null,
   };
-  batchSims.set(id, { b, req, planningUntil: Date.now() + 900, files: null, pos: 0, active: new Map(), baseBytes: 0, everRan: false, transferIds: [] });
+  batchSims.set(id, { b, req, planningUntil: Date.now() + 900, files: null, pos: 0, active: new Map(), baseBytes: 0, everRan: false, transferIds: [], paused: false });
   emitBatch(b);
   if (!batchTicker) batchTicker = setInterval(batchTick, 100);
   return id;
@@ -1469,7 +1477,7 @@ function startBatchSim(req: BatchPlanRequest): string {
 function cancelBatchSim(sim: BatchSim) {
   for (const tid of sim.active.keys()) {
     const s = sims.get(tid);
-    if (s && (s.t.status === "running" || s.t.status === "queued")) {
+    if (s && simActive(s.t)) {
       s.t.status = "cancelled";
       s.t.bytesPerSec = 0;
       s.t.finishedAt = new Date().toISOString();
@@ -1479,6 +1487,28 @@ function cancelBatchSim(sim: BatchSim) {
   sim.active.clear();
   sim.pos = sim.files?.length ?? 0;
   finishBatch(sim, "cancelled");
+}
+
+function pauseSim(s: Sim) {
+  if (s.t.status !== "running" && s.t.status !== "queued") return;
+  // In-flight parts are dropped: progress falls back to the finished parts.
+  if (s.t.partsTotal > 1) {
+    s.t.partsDone = Math.min(s.t.partsTotal, Math.floor(s.t.transferredBytes / s.partSize));
+    s.t.transferredBytes = s.t.partsDone * s.partSize;
+  } else {
+    s.t.partsDone = 0;
+    s.t.transferredBytes = 0;
+  }
+  s.t.status = "paused";
+  s.t.bytesPerSec = 0;
+  emit(s.t);
+}
+
+function resumeSim(s: Sim) {
+  if (s.t.status !== "paused") return;
+  s.t.status = "queued";
+  emit(s.t);
+  ensureTicker();
 }
 
 function logBatchCall(cmd: "preview_batch" | "start_batch" | "cancel_batch", request: unknown) {
@@ -1619,7 +1649,7 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
     windowFocus.fail = f;
   },
   activeCounts: () => ({
-    transfers: [...sims.values()].filter((x) => x.t.status === "running" || x.t.status === "queued").length,
+    transfers: [...sims.values()].filter((x) => simActive(x.t)).length,
     batches: [...batchSims.values()].filter((x) => isBatchActive(x.b)).length,
     jobs: [...jobSims.values()].filter((x) => x.job.status === "running" || x.job.status === "queued").length,
   }),
@@ -2471,7 +2501,7 @@ export const mockBackend: Backend = {
       // Cooperative cancel of everything queued or running; the final events are emitted.
       for (const sim of batchSims.values()) if (isBatchActive(sim.b)) cancelBatchSim(sim);
       for (const s of sims.values()) {
-        if (s.t.status === "running" || s.t.status === "queued") {
+        if (simActive(s.t)) {
           s.t.status = "cancelled";
           s.t.bytesPerSec = 0;
           s.t.finishedAt = new Date().toISOString();
@@ -2830,6 +2860,38 @@ export const mockBackend: Backend = {
     return startBatchSim(request);
   },
 
+  async pauseBatch(id) {
+    await delay(30);
+    const sim = batchSims.get(id);
+    if (!sim) throw invalid("Unknown batch id");
+    if (!isBatchActive(sim.b)) throw invalid("The folder transfer has already finished");
+    if (sim.paused) return;
+    sim.paused = true;
+    if (sim.b.status === "queued" || sim.b.status === "running") {
+      sim.b.status = "paused";
+      sim.b.bytesPerSec = 0;
+    }
+    for (const tid of sim.active.keys()) {
+      const s = sims.get(tid);
+      if (s) pauseSim(s);
+    }
+    emitBatch(sim.b);
+  },
+
+  async resumeBatch(id) {
+    await delay(30);
+    const sim = batchSims.get(id);
+    if (!sim) throw invalid("Unknown batch id");
+    if (!sim.paused) return;
+    sim.paused = false;
+    if (sim.b.status === "paused") sim.b.status = "queued";
+    for (const tid of sim.active.keys()) {
+      const s = sims.get(tid);
+      if (s) resumeSim(s);
+    }
+    emitBatch(sim.b);
+  },
+
   async cancelBatch(id) {
     await delay(30);
     logBatchCall("cancel_batch", { id });
@@ -2971,7 +3033,7 @@ export const mockBackend: Backend = {
     await delay(30);
     const s = sims.get(id);
     if (!s) throw fail("InvalidInput", "Unknown transfer.");
-    if (s.t.status === "running" || s.t.status === "queued") {
+    if (simActive(s.t)) {
       s.t.status = "cancelled";
       s.t.bytesPerSec = 0;
       s.t.finishedAt = new Date().toISOString();
@@ -2979,10 +3041,25 @@ export const mockBackend: Backend = {
     }
   },
 
+  async pauseTransfer(id) {
+    await delay(30);
+    const s = sims.get(id);
+    if (!s) throw fail("InvalidInput", "Unknown transfer id");
+    if (!simActive(s.t)) throw fail("InvalidInput", "The transfer has already finished");
+    pauseSim(s);
+  },
+
+  async resumeTransfer(id) {
+    await delay(30);
+    const s = sims.get(id);
+    if (!s) throw fail("InvalidInput", "Unknown transfer id");
+    resumeSim(s);
+  },
+
   async removeTransfer(id) {
     await delay(20);
     const s = sims.get(id);
-    if (s && (s.t.status === "running" || s.t.status === "queued")) {
+    if (s && simActive(s.t)) {
       throw fail("InvalidInput", "Cannot remove a transfer that is still running. Cancel it first.");
     }
     sims.delete(id);
@@ -3209,7 +3286,7 @@ export const mockBackend: Backend = {
       throw fail("InvalidInput", "No installable update is known. Check for updates first.");
     }
     for (const s of sims.values()) {
-      if (s.t.status === "running" || s.t.status === "queued") {
+      if (simActive(s.t)) {
         throw fail("InvalidInput", "Transfers are still running. Wait for them to finish or cancel them, then install the update.");
       }
     }

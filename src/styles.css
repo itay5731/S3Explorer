@@ -2964,7 +2964,7 @@ input[type="checkbox"] {
 }
 .xrow {
   display: grid;
-  grid-template-columns: 26px minmax(160px, 1fr) minmax(140px, 220px) 74px 56px 54px 90px 52px;
+  grid-template-columns: 26px minmax(160px, 1fr) minmax(140px, 220px) 74px 56px 54px 90px 72px;
   align-items: center;
   gap: 10px;
   height: 44px;
@@ -3054,6 +3054,10 @@ input[type="checkbox"] {
 .status-cancelled .pbar-fill {
   background: var(--dim);
 }
+/* Paused: the finished parts stay visible, dimmed. */
+.pbar.paused {
+  opacity: 0.45;
+}
 .xbytes {
   font-size: 11px;
   color: var(--muted);
@@ -3089,6 +3093,9 @@ input[type="checkbox"] {
 .s-cancelled {
   color: var(--muted);
 }
+.s-paused {
+  color: var(--text-2);
+}
 .pulse-dot {
   width: 7px;
   height: 7px;
@@ -3108,7 +3115,7 @@ input[type="checkbox"] {
 }
 @media (max-width: 1100px) {
   .xrow {
-    grid-template-columns: 26px minmax(140px, 1fr) minmax(120px, 180px) 70px 54px 84px 52px;
+    grid-template-columns: 26px minmax(140px, 1fr) minmax(120px, 180px) 70px 54px 84px 72px;
   }
   .xparts {
     display: none;

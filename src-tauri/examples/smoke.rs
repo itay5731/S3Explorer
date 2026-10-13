@@ -244,6 +244,82 @@ fn static_config(endpoint: &str, ak: &str, sk: &str) -> ConnectionConfig {
     }
 }
 
+/// Pause and resume against the real server: a download resumes to the same bytes, an upload
+/// continues its multipart upload, and pause + cancel leaves no multipart upload behind.
+async fn pause_checks(client: &aws_sdk_s3::Client, bucket: &str, dir: &std::path::Path, big: &[u8], big_src: &std::path::Path) -> Res<()> {
+    println!("pause and resume");
+    let out = dir.join("pause-out");
+    let _ = tokio::fs::remove_dir_all(&out).await;
+    let tm = TransferManager::with_settings(Arc::new(|_: &Transfer| {}), settings(Some(5), 1, 2));
+    let wait_for = |id: String, pred: fn(&Transfer) -> bool| {
+        let tm = tm.clone();
+        async move {
+            for _ in 0..3000 {
+                if let Some(t) = tm.get(&id) {
+                    if pred(&t) {
+                        return t;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            tm.get(&id).expect("known")
+        }
+    };
+    let settled = |t: &Transfer| t.status == TransferStatus::Paused || !t.status.is_active();
+
+    // Download: pause after the first part, resume, compare.
+    let id = tm.start_download(client.clone(), bucket, "smoke/data/big.bin", out.join("paused.bin"))?;
+    wait_for(id.clone(), |t| t.parts_done >= 1 || !t.status.is_active()).await;
+    tm.pause(&id)?;
+    let t = wait_for(id.clone(), settled).await;
+    println!("  download pause -> {:?} at {} bytes, {} parts", t.status, t.transferred_bytes, t.parts_done);
+    if t.status == TransferStatus::Paused {
+        check(t.transferred_bytes == u64::from(t.parts_done) * 5 * 1024 * 1024, "paused download shows finished parts only")?;
+        check(tm.running_count() == 0, "paused download gave its slot back")?;
+        check(part_files_exist(&out)?, "paused download keeps its temp file")?;
+        tm.resume(&id)?;
+    }
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    check(t.status == TransferStatus::Completed, "resumed download completed")?;
+    check(sha(&tokio::fs::read(out.join("paused.bin")).await?) == sha(big), "resumed download sha256 matches")?;
+    check(!part_files_exist(&out)?, "no .part left after resume")?;
+
+    // Upload: pause after the first part, resume, read back.
+    let key = "smoke/pause/up.bin";
+    let id = tm.start_upload(client.clone(), bucket, key, big_src.to_path_buf());
+    wait_for(id.clone(), |t| t.parts_done >= 1 || !t.status.is_active()).await;
+    tm.pause(&id)?;
+    let t = wait_for(id.clone(), settled).await;
+    println!("  upload pause -> {:?} at {} bytes", t.status, t.transferred_bytes);
+    if t.status == TransferStatus::Paused {
+        tm.resume(&id)?;
+    }
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    check(t.status == TransferStatus::Completed, "resumed upload completed")?;
+    let got = client.get_object().bucket(bucket).key(key).send().await?.body.collect().await?.into_bytes();
+    check(sha(&got) == sha(big), "resumed upload sha256 matches")?;
+
+    // Upload paused, then cancelled: the multipart upload is aborted.
+    let key = "smoke/pause/cancelled.bin";
+    let id = tm.start_upload(client.clone(), bucket, key, big_src.to_path_buf());
+    wait_for(id.clone(), |t| t.parts_done >= 1 || !t.status.is_active()).await;
+    tm.pause(&id)?;
+    let t = wait_for(id.clone(), settled).await;
+    println!("  upload pause then cancel -> {:?}", t.status);
+    tm.cancel(&id)?;
+    let t = tm.wait(&id).await.ok_or("missing transfer")?;
+    let uploads = client.list_multipart_uploads().bucket(bucket).prefix(key).send().await?;
+    check(uploads.uploads().is_empty(), "no multipart upload left after pause + cancel")?;
+    if t.status == TransferStatus::Cancelled {
+        let head = client.head_object().bucket(bucket).key(key).send().await;
+        check(head.is_err(), "cancelled upload left no object")?;
+    }
+    // The later delete check counts exactly what the other steps left.
+    delete_prefix(client, bucket, "smoke/pause/").await?;
+    let _ = tokio::fs::remove_dir_all(&out).await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Res<()> {
     let endpoint = env("SMOKE_ENDPOINT", "http://127.0.0.1:8333");
@@ -391,6 +467,7 @@ async fn main() -> Res<()> {
     check(tm.list().len() == 5, "remove_transfer")?;
 
     settings_checks(&client, bucket, &dir, &big, &big_src, big_mib).await?;
+    pause_checks(&client, bucket, &dir, &big, &big_src).await?;
 
     println!("delete");
     {

@@ -211,6 +211,8 @@ pub enum TransferKind {
 pub enum TransferStatus {
     Queued,
     Running,
+    /// Stopped by the user; keeps its finished parts and no run slot (see `pause_transfer`).
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -218,7 +220,7 @@ pub enum TransferStatus {
 
 impl TransferStatus {
     pub fn is_active(self) -> bool {
-        matches!(self, TransferStatus::Queued | TransferStatus::Running)
+        matches!(self, TransferStatus::Queued | TransferStatus::Running | TransferStatus::Paused)
     }
 }
 
@@ -1114,6 +1116,7 @@ pub enum BatchStatus {
     Planning,
     Queued,
     Running,
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -1121,7 +1124,7 @@ pub enum BatchStatus {
 
 impl BatchStatus {
     pub fn is_active(self) -> bool {
-        matches!(self, BatchStatus::Planning | BatchStatus::Queued | BatchStatus::Running)
+        matches!(self, BatchStatus::Planning | BatchStatus::Queued | BatchStatus::Running | BatchStatus::Paused)
     }
 }
 

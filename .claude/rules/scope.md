@@ -62,6 +62,8 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     only) actions (added on request after v0.7.0; see "History" in `docs/CONTRACT.md`).
 34. Download and upload speed limits shared by all transfers, applied live (added on request after
     v0.7.0; see "Bandwidth limit" in `docs/CONTRACT.md`).
+35. Pause and resume downloads, uploads and folder transfers, in memory only (added on request after v0.7.0;
+    see "Pause and resume transfers" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

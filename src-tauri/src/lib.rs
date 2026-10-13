@@ -126,11 +126,15 @@ pub fn run() {
             commands::transfers::start_download,
             commands::transfers::start_upload,
             commands::transfers::cancel_transfer,
+            commands::transfers::pause_transfer,
+            commands::transfers::resume_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::list_transfers,
             commands::batches::preview_batch,
             commands::batches::start_batch,
             commands::batches::cancel_batch,
+            commands::batches::pause_batch,
+            commands::batches::resume_batch,
             commands::batches::remove_batch,
             commands::batches::list_batches,
             commands::jobs::preview_job,
@@ -173,6 +177,18 @@ pub fn run() {
             commands::files::write_text_file,
             commands::files::read_text_file,
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Paused state is not kept across restarts: end paused transfers like a cancel, so no
+            // multipart upload or temp file is left behind (abort what you start).
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    tauri::async_runtime::block_on(state.transfers.cancel_paused_and_wait(EXIT_WAIT));
+                }
+            }
+        });
 }
+
+/// How long app exit waits for paused transfers to clean up.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
