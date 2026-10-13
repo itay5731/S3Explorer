@@ -16,6 +16,7 @@ import type {
   ConnectionInfo,
   ErrorCode,
   FolderEntry,
+  FolderSize,
   Job,
   JobItem,
   JobPreview,
@@ -39,7 +40,7 @@ import type {
   UpdateProgress,
   VersionListing,
 } from "./types";
-import { BATCH_LIMITS, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { BATCH_LIMITS, FOLDER_SIZE_SCAN_LIMIT, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
 import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
@@ -2229,6 +2230,61 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   },
 });
 
+// ---- folder size ---------------------------------------------------------------------------
+
+/** The newest scan per id; an older one sees it changed and stops with Cancelled. */
+const folderSizeGen = new Map<string, number>();
+let folderSizeSeq = 0;
+/** Scans holding one of the four slots, and the ones waiting for a slot. */
+let folderSizeRunning = 0;
+const folderSizeWaiting: (() => void)[] = [];
+/** Lowered from a test driver (`__s3xMock.setFolderSizeLimit`) to see truncation. */
+let folderSizeLimit = FOLDER_SIZE_SCAN_LIMIT;
+
+async function mockFolderSize(id: string, bucket: string, prefix: string): Promise<FolderSize> {
+  const gen = ++folderSizeSeq;
+  folderSizeGen.set(id, gen);
+  const epoch = searchEpoch;
+  const cancelled = () => folderSizeGen.get(id) !== gen || searchEpoch !== epoch;
+  const stop = () => fail("Cancelled", "The scan was cancelled.");
+  if (folderSizeRunning >= 4) await new Promise<void>((r) => folderSizeWaiting.push(r));
+  folderSizeRunning++;
+  try {
+    if (cancelled()) throw stop();
+    const b = requireBucket(bucket);
+    const keys = sortedKeys(b);
+    const out: FolderSize = { objects: 0, bytes: 0, scanned: 0, truncated: false };
+    // One "page" of 1000 keys per 40 ms, so Cancel and the spinner can be seen on big folders.
+    for (let i = lowerBound(keys, prefix); i < keys.length && keys[i].startsWith(prefix); i++) {
+      if (out.scanned >= folderSizeLimit) {
+        out.truncated = true;
+        break;
+      }
+      if (out.scanned % 1000 === 0) {
+        await delay(40);
+        if (cancelled()) throw stop();
+      }
+      out.scanned++;
+      if (keys[i].endsWith("/")) continue;
+      out.objects++;
+      out.bytes += b.objects.get(keys[i])?.size ?? 0;
+    }
+    await delay(150);
+    if (cancelled()) throw stop();
+    return out;
+  } finally {
+    if (folderSizeGen.get(id) === gen) folderSizeGen.delete(id);
+    folderSizeRunning--;
+    folderSizeWaiting.shift()?.();
+  }
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  setFolderSizeLimit: (n: number | null) => {
+    folderSizeLimit = n ?? FOLDER_SIZE_SCAN_LIMIT;
+  },
+});
+
 // ---- text files (keyboard bindings export / import, v0.7.0) -----------------------------------
 // The real backend writes and reads `.json` files on disk; the mock keeps them in a map keyed by
 // path (case-insensitive, like Windows). A parent folder containing "missing" does not exist.
@@ -2485,6 +2541,14 @@ export const mockBackend: Backend = {
     cancelSearchCallLog.push({ searchId, at: new Date().toISOString() });
     // The running search with this id sees a newer generation and stops with Cancelled; no-op otherwise.
     if (searchGen.has(searchId)) searchGen.set(searchId, ++searchSeq);
+  },
+
+  async folderSize(id, bucket, prefix) {
+    return mockFolderSize(id, bucket, prefix);
+  },
+
+  async cancelFolderSize(id) {
+    if (folderSizeGen.has(id)) folderSizeGen.set(id, ++folderSizeSeq);
   },
 
   async openLocal(path) {

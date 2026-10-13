@@ -16,6 +16,7 @@ import { plural } from "../lib/ops";
 import { getSelected, useSelectionInfo } from "../store/view";
 import { displayName, formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
 import { FileIcon } from "./FileIcon";
+import { FolderSizeField } from "./FolderSize";
 
 function Field({ label, children, mono, copy }: { label: string; children: ReactNode; mono?: boolean; copy?: string }) {
   return (
@@ -182,6 +183,11 @@ export function DetailsPanel() {
   }, [bucket, objKey, rev]);
   const blocked = useArchiveBlocked(bucket, obj);
   // Archived objects in a multiple selection (for "Restore archived…").
+  // Folders in a multiple selection (their sizes are calculated and summed together).
+  const selectedFolders = useMemo(
+    () => (sel.folders > 0 && sel.folders + sel.objects > 1 ? getSelected().folders.map((f) => f.prefix) : []),
+    [sel],
+  );
   const archivedSelected = useMemo(
     () => (sel.folders + sel.objects > 1 ? getSelected().objects.filter((o) => isArchiveClass(o.storageClass)).length : 0),
     [sel],
@@ -314,6 +320,7 @@ export function DetailsPanel() {
           </button>
         </div>
         <div className="dsection">
+          <FolderSizeField bucket={bucket} prefixes={[f.prefix]} />
           <Field label="Prefix" mono copy={f.prefix}>
             {f.prefix}
           </Field>
@@ -357,6 +364,11 @@ export function DetailsPanel() {
             <Tags size={14} /> Edit tags for {(sel.folders + sel.objects).toLocaleString()} items…
           </button>
         </div>
+        {selectedFolders.length > 0 && (
+          <div className="dsection">
+            <FolderSizeField bucket={bucket} prefixes={selectedFolders} />
+          </div>
+        )}
         {archivedSelected > 0 && (
           <div className="dactions">
             <button className="btn" onClick={() => requestRestoreArchived()}>

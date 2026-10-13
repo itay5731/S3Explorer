@@ -27,6 +27,7 @@ import {
   type ConnectionConfig,
   type ConnectionInfo,
   type ErrorCode,
+  type FolderSize,
   type Job,
   type JobPreview,
   type JobRequest,
@@ -99,6 +100,11 @@ export interface Backend {
   searchObjects(query: SearchQuery, searchId: string): Promise<SearchResult>;
   /** Stop the running search with this id (it rejects `Cancelled`); no-op when none runs. */
   cancelSearch(searchId: string): Promise<void>;
+  // Folder size
+  /** Objects and bytes under `prefix`; a newer call with the same `id` cancels the older one. */
+  folderSize(id: string, bucket: string, prefix: string): Promise<FolderSize>;
+  /** Stop the scan with this id (it rejects `Cancelled`); no-op for an unknown id. */
+  cancelFolderSize(id: string): Promise<void>;
   /** Open a finished download (file or folder) with the OS. */
   openLocal(path: string): Promise<void>;
   // Object operations (jobs)
@@ -233,6 +239,8 @@ const tauriBackend: Backend = {
   getBucketVersioning: (bucket) => invoke<BucketVersioning>("get_bucket_versioning", { bucket }),
   searchObjects: (query, searchId) => invoke<SearchResult>("search_objects", { query, searchId }),
   cancelSearch: (searchId) => invoke<void>("cancel_search", { searchId }),
+  folderSize: (id, bucket, prefix) => invoke<FolderSize>("folder_size", { id, bucket, prefix }),
+  cancelFolderSize: (id) => invoke<void>("cancel_folder_size", { id }),
   openLocal: (path) => invoke<void>("open_local", { path }),
   previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
   startJob: (request) => invoke<string>("start_job", { request }),
@@ -420,6 +428,12 @@ export const getBucketVersioning = (bucket: string) => call("getBucketVersioning
 export const searchObjects = (query: SearchQuery, searchId: string) => call("searchObjects", query, searchId);
 /** Stop the running search with this id; it then rejects with `Cancelled`. No-op when none runs. */
 export const cancelSearch = (searchId: string) => call("cancelSearch", searchId);
+/**
+ * Count the objects and bytes under `prefix` (verbatim) by a bounded scan (see "Folder size" in
+ * docs/CONTRACT.md). At most four run at once; `cancelFolderSize(id)` makes this reject `Cancelled`.
+ */
+export const folderSize = (id: string, bucket: string, prefix: string) => call("folderSize", id, bucket, prefix);
+export const cancelFolderSize = (id: string) => call("cancelFolderSize", id);
 /**
  * Open a finished download with the OS default application (a file) or the file manager (a
  * folder). The backend accepts only the local path of a completed download or finished folder

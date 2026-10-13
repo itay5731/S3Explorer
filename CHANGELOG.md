@@ -5,6 +5,10 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Folder size.** Right-click a folder and choose Calculate size, or use Calculate in the details panel, to see how many objects and how many bytes it holds. Select several folders to get their total. The size then shows in the file list too, stays for the session, and is cleared as soon as anything inside the folder is uploaded, deleted, moved or copied. Very large folders stop counting at 200,000 keys and say "at least"; Cancel stops a count at any time.
+
 ## [0.7.0] - 2026-10-11
 
 ### New

@@ -1287,6 +1287,28 @@ pub struct SearchResult {
     pub parsed: ParsedSearch,
 }
 
+// ---- Folder size (added after v0.7.0) -------------------------------------------------------
+
+/// `folder_size` lists at most this many keys (folder markers included).
+pub const FOLDER_SIZE_SCAN_LIMIT: u64 = 200_000;
+/// `folder_size` lists at most this many pages (a server paging in tiny or empty pages).
+pub const FOLDER_SIZE_MAX_PAGES: u64 = 2_000;
+/// `folder_size` scans running at once; more wait for a slot.
+pub const FOLDER_SIZE_PARALLEL_SCANS: usize = 4;
+
+/// `FolderSize` in `types.ts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderSize {
+    /// Objects counted; folder markers (keys ending in `/`) are not.
+    pub objects: u64,
+    pub bytes: u64,
+    /// Keys listed, markers included.
+    pub scanned: u64,
+    /// A bound stopped the scan with more keys left: the numbers are a lower bound.
+    pub truncated: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
