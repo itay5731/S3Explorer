@@ -41,6 +41,7 @@ import { forgetSavedConnection, readPref, setConnected, writePref } from "../sto
 import { toast } from "../store/toasts";
 import { Logo } from "./Logo";
 import { SettingsButton } from "./SettingsDialog";
+import { UpdatePill } from "./UpdateDialog";
 import { ThemeToggle } from "./ThemeToggle";
 import { TransferBackdrop } from "./TransferBackdrop";
 import { useTileReorder } from "./useTileReorder";
@@ -760,6 +761,7 @@ export function ConnectScreen() {
 
         <TransferBackdrop />
         <div className="screen-corner">
+          <UpdatePill />
           <ThemeToggle />
           <SettingsButton />
         </div>
@@ -781,6 +783,7 @@ export function ConnectScreen() {
 
         <TransferBackdrop />
         <div className="screen-corner">
+          <UpdatePill />
           <ThemeToggle />
           <SettingsButton />
         </div>
@@ -885,6 +888,7 @@ export function ConnectScreen() {
 
       <TransferBackdrop />
       <div className="screen-corner">
+        <UpdatePill />
         <ThemeToggle />
         <SettingsButton />
       </div>

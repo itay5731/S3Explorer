@@ -143,7 +143,7 @@ mod tests {
                 "maxConcurrentParts": 8,
                 "maxConcurrentTransfers": 4,
                 "theme": "system",
-                "checkUpdatesOnStartup": false,
+                "checkUpdatesOnStartup": true,
                 "notifyOnFinish": true,
                 "textSize": 100,
                 "textWeight": 400,
@@ -188,7 +188,7 @@ mod tests {
     fn full(mut v: serde_json::Value) -> serde_json::Value {
         let o = v.as_object_mut().expect("object");
         o.entry("theme").or_insert(json!("system"));
-        o.entry("checkUpdatesOnStartup").or_insert(json!(false));
+        o.entry("checkUpdatesOnStartup").or_insert(json!(true));
         o.entry("notifyOnFinish").or_insert(json!(true));
         o.entry("textSize").or_insert(json!(100));
         o.entry("textWeight").or_insert(json!(400));
@@ -652,7 +652,7 @@ mod tests {
                 max_concurrent_parts: 12,
                 max_concurrent_transfers: 3,
                 theme: ThemeMode::System,
-                check_updates_on_startup: false,
+                check_updates_on_startup: true,
                 notify_on_finish: true,
                 text_size: 100,
                 text_weight: 400,

@@ -167,7 +167,7 @@ export const TEXT_SETTINGS_LIMITS = {
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   ...DEFAULT_TRANSFER_SETTINGS,
   theme: "system",
-  checkUpdatesOnStartup: false,
+  checkUpdatesOnStartup: true,
   notifyOnFinish: true,
   textSize: 100,
   textWeight: 400,

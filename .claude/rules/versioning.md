@@ -15,6 +15,16 @@ version, and `npm install --package-lock-only` so `package-lock.json` does too.
 Patch notes live in `CHANGELOG.md`. Add user-facing changes under `## [Unreleased]` as they land,
 written for users (what they can now do, what was fixed), not as commit summaries.
 
+**Every tag comes with an explanation of its changes.** The app shows the `## [X.Y.Z]` section to users
+twice: in the update popup before they install, and as "What's new" the first time the new version runs
+(see "Update popup" in `docs/CONTRACT.md`). So a tag without a complete section is a broken release, not
+a cosmetic gap. Before tagging, check that the section:
+- names every user-facing change, one bullet each, saying what the user can now do or what was fixed and,
+  where it matters, what they should do differently (a changed default, a new place for a control);
+- is readable without the code: no command names, file names or commit subjects;
+- is the whole story of the tag: a change that is not in the section does not ship under that tag.
+The tag message (`git tag -a vX.Y.Z -m "..."`) carries a one-line summary of the same section.
+
 Release procedure (orchestrator only, after the `verify` gate passes):
 1. In `CHANGELOG.md`, rename `## [Unreleased]` content into a new `## [X.Y.Z] - YYYY-MM-DD` section and
    leave an empty `## [Unreleased]` above it. The heading must be exactly `## [X.Y.Z]` plus the date:

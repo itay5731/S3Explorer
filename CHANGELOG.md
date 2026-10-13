@@ -15,6 +15,13 @@ The section for a version becomes the text of its GitHub Release.
 - **History.** The Activity panel has a History tab next to Now: every finished upload and download, folder transfers, and file operations too (copy, move, rename, delete, tag changes and archive restores), kept after you close the app (the last 500). Show all, only transfers or only file operations, filter by name or path, and see when each one finished and what failed. From a transfer you can open the file, show it in its folder, go to the object, download or upload it again; from a file operation you can go to where it went and copy its source or destination path. Clear history empties the list without touching any file.
 - **Speed limits for transfers.** Settings → Transfers can cap download and upload speed (from 64 KiB/s up), shared by every running transfer, so the app no longer fills your connection. A change applies to running transfers within a second, and the Activity bar shows when a limit is on.
 - **Pause and resume transfers.** Pause a download, an upload or a whole folder transfer from its row in Activity (or its right-click menu), and resume it later: it continues with the parts it has not finished, and a paused transfer leaves its slot to the next one in line. "Pause all" and "Resume all" are in the Activity bar. If the object (download) or the local file (upload) changed while paused, the transfer fails safely instead of mixing old and new data. Paused transfers are cancelled when you quit the app.
+- **You are told about updates.** When a newer version is out, a window pops up at startup with what changed and an Install button; Later brings it back next time, and a small "vX.Y.Z available" pill in the title bar reopens it. The startup check is now on by default (turn it off in Settings → Updates).
+- **What's new after an update.** The first launch of a new version shows its patch notes, so you know what changed in what you just installed.
+
+### Improved
+
+- **The workspace is complete as soon as you connect.** The toolbar, the search row and the details panel are there before you open a bucket (greyed out until you do), with "Pick a bucket" in the middle, so nothing jumps around when you pick one.
+- **The search box has its own row** under the toolbar, as wide as the window, with the folder / whole-bucket choice at its right. While you type, a hint says whether you are searching this folder or the whole bucket, that results come half a second after you stop, and that Enter searches right away.
 
 ## [0.7.0] - 2026-10-11
 
