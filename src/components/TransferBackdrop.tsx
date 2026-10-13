@@ -1,6 +1,78 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type CSSProperties } from "react";
+import { Component, lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type ReactNode } from "react";
 import * as api from "../lib/api";
 import { DefendGame } from "./DefendGame";
+import { RaidLoadingScreen } from "./RaidLoading";
+
+/** The second hidden game is loaded only when someone types its word; trying again imports it again. */
+const loadRaid = () => import("./RaidGame").then((m) => ({ default: m.RaidGame }));
+
+/** Esc while the raid is loading or cannot start goes back to the start screen. */
+function useEscape(onEscape: () => void) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code === "Escape") onEscape();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onEscape]);
+}
+
+/**
+ * Shown while the raid's code downloads: never a blank page. The download's own progress cannot be
+ * measured, so this first stage eases toward its share of the bar and the game continues from there.
+ */
+function RaidLoading({ onCancel }: { onCancel(): void }) {
+  useEscape(onCancel);
+  const [progress, setProgress] = useState(0.02);
+  useEffect(() => {
+    const start = performance.now();
+    const id = window.setInterval(() => setProgress(0.02 + 0.16 * (1 - Math.exp(-(performance.now() - start) / 1500))), 120);
+    return () => window.clearInterval(id);
+  }, []);
+  return (
+    <div className="raid-game raid-loading">
+      <RaidLoadingScreen progress={progress} step="Downloading the engine" />
+    </div>
+  );
+}
+
+function RaidError({ message, onRetry, onExit }: { message: string; onRetry(): void; onExit(): void }) {
+  useEscape(onExit);
+  return (
+    <div className="raid-game raid-loading">
+      <div className="raid-boot raid-error" role="alert">
+        <span className="raid-kicker">Raid the HQ</span>
+        <h2>Couldn't start the game</h2>
+        <p>{message || "Something went wrong while loading it."}</p>
+        <div>
+          <button type="button" className="btn btn-primary" onClick={onRetry}>
+            Try again
+          </button>
+          <button type="button" className="btn" onClick={onExit}>
+            Back to the start screen
+          </button>
+        </div>
+        <small>Esc to go back</small>
+      </div>
+    </div>
+  );
+}
+
+/** Catches a failed download of the raid or an error inside it, so the start screen never goes blank. */
+class RaidBoundary extends Component<{ children: ReactNode; onRetry(): void; onExit(): void; onFail(): void }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+  static getDerivedStateFromError(error: unknown) {
+    return { error: error instanceof Error ? error : new Error(String(error)) };
+  }
+  componentDidCatch() {
+    document.documentElement.classList.remove("playing-game");
+    this.props.onFail();
+  }
+  render() {
+    if (!this.state.error) return this.props.children;
+    return <RaidError message={this.state.error.message} onRetry={this.props.onRetry} onExit={this.props.onExit} />;
+  }
+}
 
 /** Grid cell size in px. Keep in sync with `--cell` on `.backdrop` in styles.css. */
 const CELL = 48;
@@ -181,6 +253,10 @@ function arrivalSeconds(points: Cell[], to: TileBox, seconds: number): number {
 /** The hidden game starts after this many clicks on a server within this long. */
 const SECRET_CLICKS = 5;
 const SECRET_WINDOW_MS = 2000;
+/** Typing this on the start screen (outside a text box) starts the other hidden game. */
+const SECRET_WORD = "secret";
+
+type Game = "defend" | "raid";
 
 /**
  * Decoration behind the start screen: three servers scattered on a faint grid, and pulses that
@@ -191,29 +267,61 @@ export function TransferBackdrop() {
   const [columns, rows] = useSyncExternalStore(subscribeToResize, gridSize).split(",").map(Number);
   const { tiles, list } = useTileBoxes();
 
-  // Hidden game: clicking a server SECRET_CLICKS times in quick succession starts it.
-  const [playing, setPlaying] = useState(false);
+  // Hidden games: clicking a server SECRET_CLICKS times in quick succession starts one, typing
+  // SECRET_WORD starts the other.
+  const [game, setGame] = useState<Game | null>(null);
+  const playing = game !== null;
   const clicks = useRef<number[]>([]);
   /** The lock request in flight (or done) for the current game; null when no game was started. */
   const locking = useRef<Promise<void> | null>(null);
+  const startGame = (which: Game) => {
+    // A game is played at the window's default size: lock the window there first, so the game
+    // measures the final layout, and start even if the window could not be locked.
+    locking.current = api
+      .lockWindowSize(true)
+      .catch(() => {})
+      .then(() => setGame(which));
+  };
   const countClick = () => {
+    if (playing) return;
     const now = Date.now();
     clicks.current = [...clicks.current.filter((t) => now - t < SECRET_WINDOW_MS), now];
     if (clicks.current.length >= SECRET_CLICKS) {
       clicks.current = [];
-      // The game is played at the window's default size: lock the window there first, so the game
-      // measures the final layout, and start even if the window could not be locked.
-      locking.current = api
-        .lockWindowSize(true)
-        .catch(() => {})
-        .then(() => setPlaying(true));
+      startGame("defend");
     }
   };
   const stopPlaying = useCallback(() => {
-    setPlaying(false);
+    setGame(null);
     locking.current = null;
     api.lockWindowSize(false).catch(() => {});
   }, []);
+  // Each attempt at the raid gets a fresh lazy component, so Try again downloads it again.
+  const [raidAttempt, setRaidAttempt] = useState(0);
+  const RaidGame = useMemo(() => lazy(loadRaid), [raidAttempt]);
+  const raidFailed = useCallback(() => {
+    api.lockWindowSize(false).catch(() => {});
+  }, []);
+  const retryRaid = useCallback(() => {
+    locking.current = api
+      .lockWindowSize(true)
+      .catch(() => {})
+      .then(() => setRaidAttempt((n) => n + 1));
+  }, []);
+  // The typed word: the last letters pressed anywhere on the start screen except in a text box.
+  useEffect(() => {
+    if (playing) return;
+    let typed = "";
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      typed = (typed + e.key.toLowerCase()).slice(-SECRET_WORD.length);
+      if (typed === SECRET_WORD) startGame("raid");
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [playing]);
   // The start screen can go away with the game still open (a saved connection connects, the window
   // closes): never leave the window locked then.
   // A lock still in flight is waited for, so the unlock lands after it.
@@ -330,9 +438,16 @@ export function TransferBackdrop() {
           <ServerDrawing key={i} at={cell} ringDelay={i * -1.7} color={deliveries[i]?.to.color} onClick={countClick} />
         ))}
         {/* The game gets a fourth shooter, at the top of the window; it is not part of the backdrop otherwise. */}
-        {playing && <ServerDrawing at={[Math.round(columns / 2), 2]} ringDelay={-0.8} onClick={countClick} />}
+        {game === "defend" && <ServerDrawing at={[Math.round(columns / 2), 2]} ringDelay={-0.8} onClick={countClick} />}
       </svg>
-      {playing && <DefendGame onExit={stopPlaying} />}
+      {game === "defend" && <DefendGame onExit={stopPlaying} />}
+      {game === "raid" && (
+        <RaidBoundary key={raidAttempt} onRetry={retryRaid} onExit={stopPlaying} onFail={raidFailed}>
+          <Suspense fallback={<RaidLoading onCancel={stopPlaying} />}>
+            <RaidGame onExit={stopPlaying} />
+          </Suspense>
+        </RaidBoundary>
+      )}
     </>
   );
 }
