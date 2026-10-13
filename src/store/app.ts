@@ -4,7 +4,7 @@
 import { useContext } from "react";
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry, ObjectVersion } from "../lib/types";
+import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionConfig, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry, ObjectVersion } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
 import { clearClipboard } from "./clipboard";
 import { selectActiveBatchCount, useBatches } from "./batches";
@@ -12,8 +12,9 @@ import { selectActiveJobCount, useJobs } from "./jobs";
 import { clearRecent } from "./recent";
 import { clearArchive } from "./archive";
 import { clearVersioning } from "./versions";
+import { clearBookmarksConnection, forgetBookmarks, setBookmarksConnection } from "./bookmarks";
 import { selectActiveCount, useTransfers } from "./transfers";
-import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, usePanes, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
+import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, tabEntry, usePanes, usePaneTabs, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
 import { readPref, writePref } from "./prefs";
 
 export type { Listing, PaneId, PaneState, SortKey, SortState } from "./panes";
@@ -46,10 +47,12 @@ export type Modal =
   /** The bucket's lifecycle rules (load, edit, confirm, save the whole configuration). */
   | { kind: "lifecycle"; bucket: string }
   | { kind: "objectTags"; bucket: string; key: string }
+  /** Edit one object's content type and metadata (a copy onto itself, confirmed before it runs). */
+  | { kind: "editMetadata"; bucket: string; key: string }
   /** Tag several objects at once (a "tag" job). `items` are exact keys/prefixes from the selection. */
   | { kind: "bulkTags"; bucket: string; prefix: string; items: JobItem[] }
   /** Upload a local folder (a batch). `localPath` came from the picker or an OS drop. */
-  | { kind: "uploadFolder"; bucket: string; prefix: string; localPath: string; initialPreview?: BatchPreview }
+  | { kind: "uploadFolder"; bucket: string; prefix: string; localPath: string; initialPreview?: BatchPreview; initialDest?: string }
   /** Download folders (one batch each) into `dir`. `folders` are exact prefixes from the listing. */
   | { kind: "downloadFolders"; bucket: string; folders: FolderEntry[]; dir: string }
   /** Disconnect while transfers or jobs are still running. */
@@ -60,6 +63,8 @@ export type Modal =
   | { kind: "bulkRestore"; bucket: string; prefix: string; items: JobItem[]; deepArchive: boolean; allDeep: boolean }
   /** Confirm an action on one version of an object (shown from the details panel). */
   | { kind: "versionAction"; action: "restore" | "delete" | "undelete"; bucket: string; key: string; version: ObjectVersion; onlyVersion: boolean; previousIsMarker: boolean }
+  /** Quick look: a large preview of the selected object; it follows the selection while open. */
+  | { kind: "quickLook" }
   | null;
 
 /** Modals that make sense without an open bucket. */
@@ -182,12 +187,19 @@ export function onPaneReset(cb: (pane: PaneId) => void): () => void {
  */
 const freshPanes = new Set<PaneId>();
 
-/** Forget everything a pane shows (stops its in-flight listing and search). */
+/** Forget everything a pane shows (stops its in-flight listing and search), and all its tabs but one. */
 function resetPane(id: PaneId) {
   resetListeners.forEach((cb) => cb(id));
   freshPanes.add(id);
   listSeq[id]++;
-  setPane(id, { ...freshPane(getPane(id).sort), search: emptySearch });
+  const fresh = { ...freshPane(getPane(id).sort), search: emptySearch };
+  usePaneTabs.setState({ [id]: [tabEntry(fresh.tab)] } as Partial<Record<PaneId, never>>);
+  setPane(id, fresh);
+}
+
+/** Stop a pane's listing in flight: its result is dropped (a tab of the pane is being hidden). */
+export function stopListing(pane: PaneId) {
+  listSeq[pane]++;
 }
 
 /**
@@ -230,17 +242,109 @@ async function fetchPage(pane: PaneId, bucket: string, prefix: string, token: st
 
 /** The saved connection the app is connected through (null: connected without saving, or not connected). */
 let savedConnectionId: string | null = null;
+/** The key of the connection in use (see `connectionKey`); null while disconnected. */
+let currentConnectionKey: string | null = null;
+
+/**
+ * The connection in use, after a window reload: the webview reconnects through `connection_status`
+ * without knowing the saved id or the full credentials identity, so the last key is kept for the
+ * tab's session and reused when the reconnected `ConnectionInfo` matches it.
+ */
+const CONNECTION_SESSION_KEY = "s3x.connection.session";
+interface ConnectionSession {
+  key: string;
+  savedId: string | null;
+  label: string;
+  region: string;
+  endpoint: string | null;
+}
+
+function readConnectionSession(): ConnectionSession | null {
+  try {
+    const v = sessionStorage.getItem(CONNECTION_SESSION_KEY);
+    const s = v ? (JSON.parse(v) as Partial<ConnectionSession>) : null;
+    if (!s || typeof s.key !== "string" || typeof s.label !== "string" || typeof s.region !== "string") return null;
+    return { key: s.key, savedId: typeof s.savedId === "string" ? s.savedId : null, label: s.label, region: s.region, endpoint: typeof s.endpoint === "string" ? s.endpoint : null };
+  } catch {
+    return null;
+  }
+}
+
+function writeConnectionSession(s: ConnectionSession | null) {
+  try {
+    if (s) sessionStorage.setItem(CONNECTION_SESSION_KEY, JSON.stringify(s));
+    else sessionStorage.removeItem(CONNECTION_SESSION_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/**
+ * The identity of a connection made without saving it, from what was typed in: the kind plus the
+ * profile name or the access key id (never a secret), the endpoint and the region.
+ */
+export function connectionIdentity(config: ConnectionConfig, info: ConnectionInfo): string {
+  const who = config.kind === "profile" ? `profile:${config.profile}` : `static:${config.accessKeyId.trim()}`;
+  return `conn:${who}|${info.endpoint ?? ""}|${info.region}`;
+}
+
+/** The saved connection's key, as `connectionKey()` returns it while connected through it. */
+export const savedConnectionKey = (id: string) => `saved:${id}`;
+
+/**
+ * One key for everything remembered per connection (tabs, bookmarks, history): `saved:<id>` when
+ * connected through a saved connection, else the kind, profile or access key id, endpoint and region
+ * (`connectionIdentity`). Null while disconnected. Never only the display label, never a secret.
+ */
+export function connectionKey(): string | null {
+  return currentConnectionKey;
+}
+
+/** The saved connection in use, or null. */
+export function currentSavedConnectionId(): string | null {
+  return savedConnectionId;
+}
+
+const connectionListeners = new Set<(key: string | null) => void>();
+/**
+ * Called with a key that identifies the connection once it is set up (panes reset, connection set),
+ * and with null before panes are reset for a new connection or a disconnect (remembered tabs).
+ */
+export function onConnectionChange(cb: (key: string | null) => void): () => void {
+  connectionListeners.add(cb);
+  return () => connectionListeners.delete(cb);
+}
+const notifyConnection = (key: string | null) => connectionListeners.forEach((cb) => cb(key));
 
 function resetPanes() {
   for (const id of PANE_IDS) resetPane(id);
 }
 
-export function setConnected(info: ConnectionInfo, savedId: string | null = null) {
+/**
+ * Connected. `savedId`: through a saved connection. `identity`: from `connectionIdentity` when the
+ * config is known (a connection made without saving); without either (a window reload), the key the
+ * window used before is reused when the connection matches, else one from the label, endpoint and region.
+ */
+export function setConnected(info: ConnectionInfo, savedId: string | null = null, identity: string | null = null) {
+  notifyConnection(null);
+  let key: string;
+  if (savedId) key = savedConnectionKey(savedId);
+  else if (identity) key = identity;
+  else {
+    const s = readConnectionSession();
+    if (s && s.label === info.label && s.region === info.region && s.endpoint === info.endpoint) {
+      key = s.key;
+      savedId = s.savedId;
+    } else key = `conn:${info.label}|${info.endpoint ?? ""}|${info.region}`;
+  }
+  writeConnectionSession({ key, savedId, label: info.label, region: info.region, endpoint: info.endpoint });
   savedConnectionId = savedId;
+  currentConnectionKey = key;
   clearClipboard();
   clearRecent();
   clearArchive();
   clearVersioning();
+  setBookmarksConnection(key);
   resetPanes();
   set({
     connection: info,
@@ -252,20 +356,25 @@ export function setConnected(info: ConnectionInfo, savedId: string | null = null
   });
   if (info.canListBuckets) void loadBuckets();
   void loadAddedBuckets();
+  notifyConnection(key);
 }
 
 /** `cancelActive`: cancel every queued or running transfer, folder transfer and job before disconnecting. */
 export async function disconnect(cancelActive = false) {
+  notifyConnection(null);
   try {
     await api.disconnect(cancelActive);
   } catch {
     /* disconnect is best effort */
   }
   savedConnectionId = null;
+  currentConnectionKey = null;
+  writeConnectionSession(null);
   clearClipboard();
   clearRecent();
   clearArchive();
   clearVersioning();
+  clearBookmarksConnection();
   // Both panes go; the split preference stays.
   resetPanes();
   set({
@@ -289,12 +398,23 @@ export function requestDisconnect() {
 
 /**
  * A saved connection was deleted. The backend also forgets the buckets added by name for it, so if
- * it is the one in use, the cached list of added buckets goes too.
+ * it is the one in use, the cached list of added buckets goes too. Everything remembered for it in
+ * this app goes in any case: bookmarks, remembered tabs and history entries.
  */
 export function forgetSavedConnection(id: string) {
+  const key = savedConnectionKey(id);
+  forgetBookmarks(key);
+  forgetConnectionListeners.forEach((cb) => cb(key));
   if (savedConnectionId !== id) return;
   savedConnectionId = null;
   set({ addedBuckets: [], addedError: null });
+}
+
+const forgetConnectionListeners = new Set<(key: string) => void>();
+/** Called with a connection key whose remembered state (tabs, bookmarks, history) must be forgotten. */
+export function onForgetConnection(cb: (key: string) => void): () => void {
+  forgetConnectionListeners.add(cb);
+  return () => forgetConnectionListeners.delete(cb);
 }
 
 export async function loadBuckets() {
@@ -331,6 +451,13 @@ export async function addSharedBucket(input: string): Promise<AddedBucket> {
   return added;
 }
 
+const bucketForgottenListeners = new Set<(bucket: string) => void>();
+/** Called when an added bucket leaves the list and is not a listed bucket either (remembered tabs). */
+export function onBucketForgotten(cb: (bucket: string) => void): () => void {
+  bucketForgottenListeners.add(cb);
+  return () => bucketForgottenListeners.delete(cb);
+}
+
 /** Forget an added bucket. Only the local list changes; the bucket and its contents are untouched. */
 export async function removeSharedBucket(name: string): Promise<void> {
   await api.removeAddedBucket(name);
@@ -338,6 +465,12 @@ export async function removeSharedBucket(name: string): Promise<void> {
   set((s) => ({ addedBuckets: s.addedBuckets.filter((b) => b.name !== name) }));
   // Close it in every pane that shows it, unless it is also in the regular list.
   if (buckets.some((b) => b.name === name)) return;
+  bucketForgottenListeners.forEach((cb) => cb(name));
+  usePaneTabs.setState((s) => {
+    const next = { ...s };
+    for (const id of PANE_IDS) next[id] = s[id].filter((t) => t.saved?.bucket !== name);
+    return next;
+  });
   for (const id of PANE_IDS) {
     if (getPane(id).bucket !== name) continue;
     listSeq[id]++;
@@ -400,7 +533,12 @@ export function goHistory(delta: -1 | 1, pane: PaneId = activePane()): boolean {
  * Open `bucket`/`prefix` in a pane (default: the active pane). Every navigation is recorded in the
  * pane's history except Back / Forward themselves (`fromHistory`).
  */
-export function navigate(bucket: string, prefix: string, pane: PaneId = activePane(), opts: { fromHistory?: boolean; replaceHistory?: boolean } = {}) {
+export function navigate(
+  bucket: string,
+  prefix: string,
+  pane: PaneId = activePane(),
+  opts: { fromHistory?: boolean; replaceHistory?: boolean; alone?: boolean } = {},
+) {
   navigateListeners.forEach((cb) => cb(pane));
   freshPanes.delete(pane);
   // Server-provided prefixes are used verbatim (see asFolderPrefix / normalizePrefix).
@@ -420,7 +558,8 @@ export function navigate(bucket: string, prefix: string, pane: PaneId = activePa
   // Split view with the other pane still empty since connecting (the split was saved and this is
   // the first bucket opened): it opens at the same place, as when the split is opened.
   const other = otherPane(pane);
-  if (isSplitShown() && freshPanes.has(other) && !getPane(other).bucket) navigate(bucket, p, other);
+  // `alone`: the other pane is about to be opened somewhere itself (restoring remembered tabs).
+  if (!opts.alone && isSplitShown() && freshPanes.has(other) && !getPane(other).bucket) navigate(bucket, p, other);
 }
 
 let scrollSeq = 0;
@@ -459,8 +598,8 @@ async function continueReveal(pane: PaneId) {
   if (getPane(pane).reveal) setPane(pane, { reveal: null, selection: new Set(), anchor: null, focus: null });
 }
 
-export function refresh(pane: PaneId = activePane()) {
-  void loadFirstPage(pane, true);
+export function refresh(pane: PaneId = activePane()): Promise<void> {
+  return loadFirstPage(pane, true);
 }
 
 async function loadFirstPage(pane: PaneId, keepSelection = false) {
@@ -488,6 +627,7 @@ async function loadFirstPage(pane: PaneId, keepSelection = false) {
           error: null,
         },
         selection,
+        listedAt: Date.now(),
       };
     });
     if (getPane(pane).reveal) void continueReveal(pane);
@@ -551,6 +691,7 @@ async function reloadKeepingPosition(pane: PaneId) {
     const selection = new Set([...s.selection].filter((id) => ids.has(id)));
     return {
       listing: { folders, objects, token, truncated, loading: false, loadingMore: false, error: null },
+      listedAt: Date.now(),
       selection: selection.size === s.selection.size ? s.selection : selection,
       anchor: s.anchor && ids.has(s.anchor) ? s.anchor : null,
       focus: s.focus && ids.has(s.focus) ? s.focus : null,
@@ -595,6 +736,30 @@ export function upsertListedObject(bucket: string, obj: ObjectEntry, pane: PaneI
   if (i >= 0) objects[i] = obj;
   else objects.push(obj);
   setPane(pane, { listing: { ...s.listing, objects } });
+}
+
+/**
+ * An object changed in place (its metadata was edited): every pane and hidden tab whose listing has
+ * this exact key gets the new entry (size, Last modified, ETag). Nothing is added where it isn't listed.
+ */
+export function replaceListedObject(bucket: string, obj: ObjectEntry) {
+  const swap = (s: PaneState): PaneState | null => {
+    if (s.bucket !== bucket) return null;
+    const i = s.listing.objects.findIndex((o) => o.key === obj.key);
+    if (i < 0) return null;
+    const objects = s.listing.objects.slice();
+    objects[i] = obj;
+    return { ...s, listing: { ...s.listing, objects } };
+  };
+  for (const id of PANE_IDS) {
+    const next = swap(getPane(id));
+    if (next) setPane(id, { listing: next.listing });
+  }
+  usePaneTabs.setState((t) => {
+    const out = { ...t };
+    for (const id of PANE_IDS) out[id] = t[id].map((e) => (e.saved ? { ...e, saved: swap(e.saved) ?? e.saved } : e));
+    return out;
+  });
 }
 
 /** Ensure a sub-folder entry exists in a pane's listing (after an upload into a new sub-path). */

@@ -1,0 +1,376 @@
+// Object preview: what is inside a file, read with preview_object (see "Object preview" in
+// docs/CONTRACT.md). Shown at the top of the details panel and, larger, in Quick look (QuickLook.tsx).
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { AlertCircle, Eye, FileQuestion, ImageDown, Loader2, Maximize2, RotateCw } from "lucide-react";
+import * as api from "../lib/api";
+import { PREVIEW_LIMITS, type AppError, type ObjectEntry, type ObjectPreview } from "../lib/types";
+import { openModal } from "../store/app";
+import { useKeyHint, withKey } from "../store/keyboard";
+import { useSettings } from "../store/settings";
+import { formatBytes } from "../lib/format";
+
+// ---- kinds -------------------------------------------------------------------------------------
+
+/** Image extensions the backend previews, with the type the bytes are shown as. */
+const IMAGE_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  ico: "image/x-icon",
+  avif: "image/avif",
+  svg: "image/svg+xml",
+};
+
+const extOf = (key: string) => {
+  const name = key.slice(key.lastIndexOf("/") + 1).toLowerCase();
+  const i = name.lastIndexOf(".");
+  return i >= 0 ? name.slice(i + 1) : "";
+};
+
+/**
+ * Text extensions the backend previews as text (see "Object preview" in docs/CONTRACT.md). A text
+ * extension wins over an image content type, so such a file is never read whole: at most the first
+ * `textMaxBytes`, whatever its size.
+ */
+const TEXT_EXTENSIONS = new Set(
+  (
+    "txt md markdown json jsonl csv tsv log xml yaml yml toml ini conf cfg env sql sh bat ps1 py js mjs ts tsx jsx css scss html htm " +
+    "rs go java kt c h cpp cs rb php swift tf hcl properties gitignore dockerfile"
+  ).split(" "),
+);
+const isTextKey = (key: string) => {
+  const name = key.slice(key.lastIndexOf("/") + 1).toLowerCase();
+  return TEXT_EXTENSIONS.has(extOf(key)) || name === "dockerfile";
+};
+
+/** Extensions that are never text or an image: no preview, and nothing is read for a large one. */
+const BINARY_EXTENSIONS = new Set(
+  (
+    "zip gz tgz bz2 xz zst 7z rar tar pdf parquet avro orc arrow feather exe dll so dylib bin iso img dmg msi deb rpm apk jar class " +
+    "wasm mp4 mov mkv avi webm m4v mp3 wav flac ogg m4a aac doc docx xls xlsx ppt pptx odt ods woff woff2 ttf otf db sqlite pkl npy npz h5"
+  ).split(" "),
+);
+
+const ctypeOf = (contentType: string | null | undefined) => contentType?.split(";")[0].trim().toLowerCase() ?? "";
+const TEXT_TYPES = new Set(["application/json", "application/xml", "application/x-yaml"]);
+
+/**
+ * What to do with an object before reading anything (see "Object preview"):
+ * - `auto`: read it. Small objects, text files (at most `textMaxBytes` is read whatever the size) and
+ *   anything above `imageMaxBytes` (an image that big is refused without being read; anything else is
+ *   only sniffed) are always safe to read.
+ * - `ask`: a large image (by extension, or an image content type with no telling extension) is read
+ *   whole, so it waits for "Load preview". Decided by size, never by extension alone.
+ * - `binary`: a large file of a known binary type (zip, pdf, parquet…): the binary-file note, nothing read.
+ * - `pending`: large, no telling extension: the content type decides (one HeadObject first).
+ */
+export type PreviewGate = "auto" | "ask" | "binary" | "pending";
+export function previewGate(o: Pick<ObjectEntry, "key" | "size">, contentType?: string | null): PreviewGate {
+  if (o.size <= PREVIEW_LIMITS.imageAutoBytes || o.size > PREVIEW_LIMITS.imageMaxBytes || isTextKey(o.key)) return "auto";
+  const ext = extOf(o.key);
+  if (ext in IMAGE_TYPES) return "ask";
+  if (contentType === undefined) return BINARY_EXTENSIONS.has(ext) ? "binary" : "pending";
+  const ct = ctypeOf(contentType);
+  if (ct.startsWith("image/")) return "ask";
+  if (BINARY_EXTENSIONS.has(ext)) return "binary";
+  if (ct.startsWith("text/") || TEXT_TYPES.has(ct)) return "auto";
+  // Anything else is only sniffed (8 KiB, then at most `textMaxBytes` if it is text).
+  return "auto";
+}
+
+/** The type an image is shown as: by extension (an SVG must be `image/svg+xml` to render), else as stored. */
+function imageType(key: string, contentType: string | null): string {
+  const ct = contentType?.split(";")[0].trim().toLowerCase();
+  return IMAGE_TYPES[extOf(key)] ?? (ct?.startsWith("image/") ? ct : "application/octet-stream");
+}
+
+// ---- loading -----------------------------------------------------------------------------------
+
+/** The last few previews, so the details panel and Quick look share one read of the same object. */
+const CACHE_MAX = 6;
+const cache = new Map<string, Promise<ObjectPreview>>();
+
+function loadPreview(bucket: string, o: ObjectEntry, force: boolean): Promise<ObjectPreview> {
+  const id = `${bucket}\n${o.key}\n${o.etag ?? ""}\n${o.lastModified ?? ""}`;
+  const hit = cache.get(id);
+  if (hit && !force) {
+    cache.delete(id); // most recently used goes last
+    cache.set(id, hit);
+    return hit;
+  }
+  const p = api.previewObject(bucket, o.key);
+  cache.set(id, p);
+  // A failed read is not remembered: Retry (or selecting it again) reads again.
+  p.catch(() => cache.get(id) === p && cache.delete(id));
+  while (cache.size > CACHE_MAX) cache.delete(cache.keys().next().value!);
+  return p;
+}
+
+type PreviewState =
+  | { status: "loading" }
+  /** A large image: loaded only when asked for. */
+  | { status: "ask" }
+  /** Automatic previews are off (Settings → Behavior): loaded only when asked for. */
+  | { status: "manual" }
+  /** A large file of a known binary type: nothing to show, nothing read. */
+  | { status: "binary" }
+  | { status: "ok"; preview: ObjectPreview }
+  | { status: "error"; error: AppError };
+
+/**
+ * The preview of `o`, tagged with the object it was read for so a late answer for a previous
+ * selection is never shown. Images above `imageAutoBytes` wait for `load()`.
+ */
+function usePreviewOf(bucket: string, o: ObjectEntry, auto: boolean): [PreviewState, () => void] {
+  const id = `${bucket}\n${o.key}\n${o.etag ?? ""}\n${o.lastModified ?? ""}`;
+  // The content type, read only when the extension does not tell (large files without one).
+  const [ctype, setCtype] = useState<{ id: string; value: string | null } | null>(null);
+  const known = ctype?.id === id ? ctype.value : undefined;
+  const gate = previewGate(o, known);
+  useEffect(() => {
+    if (gate !== "pending" || !auto) return;
+    let stale = false;
+    const t = setTimeout(() => {
+      api.headObject(bucket, o.key).then(
+        (m) => !stale && setCtype({ id, value: m.contentType }),
+        // Unknown: it is only sniffed, never read whole unless it is an image, so asking is the safe side.
+        () => !stale && setCtype({ id, value: "image/unknown" }),
+      );
+    }, 120);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [bucket, id, o.key, gate, auto]);
+  const ask = !auto || gate !== "auto";
+  const [state, setState] = useState<{ id: string; attempt: number; value: PreviewState | null }>({ id, attempt: 0, value: null });
+  const [wanted, setWanted] = useState<{ id: string; attempt: number } | null>(null);
+  const current = state.id === id ? state : null;
+  // -1: waiting for `load()`; 0: the first read; above: a retry, which reads again.
+  const attempt = wanted?.id === id ? wanted.attempt : ask ? -1 : 0;
+  const objRef = useRef(o);
+  objRef.current = o;
+
+  useEffect(() => {
+    if (attempt < 0) return;
+    let stale = false;
+    // Debounced like the metadata, so arrowing through rows does not read every object.
+    const t = setTimeout(() => {
+      loadPreview(bucket, objRef.current, attempt > 0).then(
+        (preview) => !stale && setState({ id, attempt, value: { status: "ok", preview } }),
+        (error: AppError) => !stale && setState({ id, attempt, value: { status: "error", error } }),
+      );
+    }, 120);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [bucket, id, attempt]);
+
+  const value: PreviewState =
+    attempt < 0
+      ? !auto
+        ? { status: "manual" }
+        : gate === "pending"
+          ? { status: "loading" }
+          : gate === "binary"
+            ? { status: "binary" }
+            : { status: "ask" }
+      : current && current.attempt === attempt && current.value ? current.value : { status: "loading" };
+  const load = () => setWanted((w) => ({ id, attempt: w?.id === id ? w.attempt + 1 : 1 }));
+  return [value, load];
+}
+
+// ---- rendering ---------------------------------------------------------------------------------
+
+/**
+ * `<img>` from a `blob:` URL of the bytes (allowed by the CSP's `img-src blob:`). The URL is made and
+ * revoked by the same effect and kept in state, so StrictMode's simulated unmount (which runs the
+ * cleanup and then the effect again) never leaves the image pointing at a revoked URL.
+ */
+function ImageView({ data, type, alt }: { data: string; type: string; alt: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    const bin = atob(data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const made = URL.createObjectURL(new Blob([bytes], { type }));
+    setUrl(made);
+    return () => {
+      URL.revokeObjectURL(made);
+      setUrl((u) => (u === made ? null : u));
+    };
+  }, [data, type]);
+  const [broken, setBroken] = useState(false);
+  if (broken) return <Unsupported reason="This image could not be shown" />;
+  if (!url) return <div className="pv-image" />;
+  return (
+    <div className="pv-image">
+      <img src={url} alt={alt} draggable={false} onError={() => setBroken(true)} />
+    </div>
+  );
+}
+
+const CSV_ROWS = 200;
+const CSV_COLS = 50;
+
+/** The first rows of a CSV/TSV text (quoted fields, doubled quotes, CRLF). */
+export function parseDelimited(text: string, sep: string, maxRows = CSV_ROWS): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let quoted = false;
+  for (let i = 0; i < text.length && rows.length < maxRows; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') {
+        field += '"';
+        i++;
+      } else if (c === '"') quoted = false;
+      else field += c;
+    } else if (c === '"' && field === "") quoted = true;
+    else if (c === sep) {
+      row.push(field);
+      field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else field += c;
+  }
+  if (rows.length < maxRows && (field !== "" || row.length)) rows.push([...row, field]);
+  return rows;
+}
+
+function TableView({ text, sep }: { text: string; sep: string }) {
+  const rows = useMemo(() => parseDelimited(text, sep), [text, sep]);
+  const cols = Math.min(CSV_COLS, Math.max(0, ...rows.map((r) => r.length)));
+  if (!rows.length) return <div className="muted small">Empty file</div>;
+  const [head, ...body] = rows;
+  return (
+    <div className="pv-table-wrap">
+      <table className="pv-table">
+        <thead>
+          <tr>
+            {Array.from({ length: cols }, (_, i) => (
+              <th key={i}>{head[i] ?? ""}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {body.map((r, ri) => (
+            <tr key={ri}>
+              {Array.from({ length: cols }, (_, i) => (
+                <td key={i}>{r[i] ?? ""}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TextView({ text, ext }: { text: string; ext: string }) {
+  const shown = useMemo(() => {
+    if (ext !== "json") return text;
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return text; // not valid JSON (or cut by the read limit): as it is
+    }
+  }, [text, ext]);
+  if (!text) return <div className="muted small">Empty file</div>;
+  return <pre className="pv-text">{shown}</pre>;
+}
+
+export function Unsupported({ reason }: { reason: string }) {
+  return (
+    <div className="pv-none">
+      <FileQuestion size={22} strokeWidth={1.5} />
+      <span>{reason}</span>
+    </div>
+  );
+}
+
+/** The preview area for one object: loading, the ask for a large image, an error with Retry, or the content. */
+export function PreviewView({ bucket, object, auto = true }: { bucket: string; object: ObjectEntry; auto?: boolean }) {
+  const [state, load] = usePreviewOf(bucket, object, auto);
+  if (state.status === "loading") {
+    return (
+      <div className="pv-none">
+        <Loader2 size={16} className="spin" />
+        <span>Loading preview…</span>
+      </div>
+    );
+  }
+  if (state.status === "ask") {
+    return (
+      <div className="pv-none">
+        <button type="button" className="btn btn-sm" onClick={load}>
+          <ImageDown size={13} /> Load preview ({formatBytes(object.size)})
+        </button>
+      </div>
+    );
+  }
+  if (state.status === "binary") return <Unsupported reason="Binary file" />;
+  if (state.status === "manual") {
+    return (
+      <div className="pv-none">
+        <button type="button" className="btn btn-sm" onClick={load} title="Read the start of the file to show what is inside">
+          <Eye size={13} /> Preview
+        </button>
+      </div>
+    );
+  }
+  if (state.status === "error") {
+    return (
+      <div className="inline-error">
+        <AlertCircle size={13} />
+        <div className="grow">
+          <div>{state.error.message}</div>
+          <button type="button" className="link-btn pv-retry" onClick={load}>
+            <RotateCw size={12} /> Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+  const p = state.preview;
+  const ext = extOf(object.key);
+  let content;
+  if (p.kind === "image" && p.dataBase64 !== null) content = <ImageView data={p.dataBase64} type={imageType(object.key, p.contentType)} alt={object.name} />;
+  else if (p.kind === "text" && p.text !== null && (ext === "csv" || ext === "tsv")) content = <TableView text={p.text} sep={ext === "tsv" ? "\t" : ","} />;
+  else if (p.kind === "text" && p.text !== null) content = <TextView text={p.text} ext={ext} />;
+  else content = <Unsupported reason={p.reason ?? "No preview for this file"} />;
+  return (
+    <>
+      {content}
+      {p.truncated && <div className="muted small pv-note">Showing the first {formatBytes(PREVIEW_LIMITS.textMaxBytes)}</div>}
+    </>
+  );
+}
+
+/** The details panel's Preview section (one object selected). */
+export function PreviewSection({ bucket, object }: { bucket: string; object: ObjectEntry }) {
+  const hint = useKeyHint("act.preview");
+  // Settings → Behavior, "Preview files automatically" (Quick look always reads).
+  const auto = useSettings((s) => s.settings?.previewAutomatically ?? true);
+  return (
+    <div className="dsection pv-section">
+      <div className="dsection-title dsection-title-row">
+        <span>Preview</span>
+        <button type="button" className="link-btn" onClick={() => openModal({ kind: "quickLook" })} title={withKey("Quick look", hint)}>
+          <Maximize2 size={12} /> Quick look
+        </button>
+      </div>
+      <PreviewView key={`${bucket}\n${object.key}`} bucket={bucket} object={object} auto={auto} />
+    </div>
+  );
+}

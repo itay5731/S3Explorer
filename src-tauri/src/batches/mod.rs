@@ -17,7 +17,7 @@ pub mod plan;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,13 @@ pub struct BatchEntry {
     transfer_ids: Mutex<Vec<String>>,
     /// Batch download under `skip`: a file that appeared after planning counts as skipped.
     no_replace: bool,
+    /// Paused by the user: its files are paused and new ones start paused. Changed and read
+    /// under the record lock, together with the status.
+    paused: AtomicBool,
+    /// Serializes pause, resume and the start of each file: held across the flag change and the
+    /// walk over the batch's files, so a Pause all racing a Resume all cannot interleave and leave
+    /// the batch `queued` with every file paused (or the other way round).
+    control: tokio::sync::Mutex<()>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -127,7 +134,7 @@ fn apply_finished(b: &mut Batch, t: &Transfer, batch_cancelled: bool, no_replace
         }
         TransferStatus::Cancelled if batch_cancelled => {}
         TransferStatus::Cancelled => push_failure(b, path, "Cancelled".to_string()),
-        TransferStatus::Queued | TransferStatus::Running => {}
+        TransferStatus::Queued | TransferStatus::Running | TransferStatus::Paused => {}
     }
 }
 
@@ -304,6 +311,8 @@ impl BatchManager {
             idle: Notify::new(),
             transfer_ids: Mutex::new(Vec::new()),
             no_replace: req.kind == BatchKind::Download && req.on_conflict == ConflictPolicy::Skip,
+            paused: AtomicBool::new(false),
+            control: tokio::sync::Mutex::new(()),
         });
         self.entries.insert(id.clone(), entry.clone());
         entry.publish(self.sink.as_ref());
@@ -346,7 +355,10 @@ impl BatchManager {
         if files.is_empty() {
             return Ok(());
         }
-        entry.lock().status = BatchStatus::Queued;
+        {
+            let mut b = entry.lock();
+            b.status = if entry.paused.load(Ordering::SeqCst) { BatchStatus::Paused } else { BatchStatus::Queued };
+        }
         entry.publish(self.sink.as_ref());
 
         // ---- transfers, in path order, into the normal queue ----
@@ -357,7 +369,11 @@ impl BatchManager {
             if entry.cancel.is_cancelled() {
                 break;
             }
-            let link = BatchLink { batch_id: batch_id.clone(), cancel: entry.cancel.clone(), observer: observer.clone() };
+            // Under the control lock: a pause or resume either sees this file in `transfer_ids`
+            // or happened before it read the flag, never in between.
+            let control = entry.control.lock().await;
+            let paused = entry.paused.load(Ordering::SeqCst);
+            let link = BatchLink { batch_id: batch_id.clone(), cancel: entry.cancel.clone(), observer: observer.clone(), paused };
             entry.outstanding.fetch_add(1, Ordering::AcqRel);
             let started = match req.kind {
                 BatchKind::Upload => {
@@ -375,6 +391,7 @@ impl BatchManager {
                     push_failure(&mut entry.lock(), f.key.clone(), e.message);
                 }
             }
+            drop(control);
             // Thousands of starts in a row: let other tasks (and the transfers) run.
             if i % 256 == 255 {
                 tokio::task::yield_now().await;
@@ -398,6 +415,55 @@ impl BatchManager {
     pub fn cancel(&self, id: &str) -> AppResult<()> {
         let entry = self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown batch id"))?;
         entry.cancel.cancel();
+        Ok(())
+    }
+
+    /// Pauses the batch's queued and running files and makes the ones it starts from now on start
+    /// paused. `InvalidInput` for an unknown id or a finished batch; no-op if already paused.
+    pub async fn pause(&self, id: &str) -> AppResult<()> {
+        let entry = self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown batch id"))?;
+        let _control = entry.control.lock().await;
+        {
+            let mut b = entry.lock();
+            if !b.status.is_active() {
+                return Err(AppError::invalid("The folder transfer has already finished"));
+            }
+            if entry.paused.swap(true, Ordering::SeqCst) {
+                return Ok(());
+            }
+            // Still planning: it becomes `paused` instead of `queued` when the plan is done.
+            if matches!(b.status, BatchStatus::Queued | BatchStatus::Running) {
+                b.status = BatchStatus::Paused;
+            }
+        }
+        entry.publish(self.sink.as_ref());
+        let ids = lock(&entry.transfer_ids).clone();
+        for t in ids {
+            // Finished files refuse; that is fine.
+            let _ = self.transfers.pause(&t);
+        }
+        Ok(())
+    }
+
+    /// Resumes a paused batch: its files go back to the queue at their places, and it is `queued`
+    /// until one of them runs. `InvalidInput` for an unknown id; no-op unless paused.
+    pub async fn resume(&self, id: &str) -> AppResult<()> {
+        let entry = self.entries.get(id).map(|e| e.clone()).ok_or_else(|| AppError::invalid("Unknown batch id"))?;
+        let _control = entry.control.lock().await;
+        {
+            let mut b = entry.lock();
+            if !entry.paused.swap(false, Ordering::SeqCst) {
+                return Ok(());
+            }
+            if b.status == BatchStatus::Paused {
+                b.status = BatchStatus::Queued;
+            }
+        }
+        entry.publish(self.sink.as_ref());
+        let ids = lock(&entry.transfer_ids).clone();
+        for t in ids {
+            let _ = self.transfers.resume(&t);
+        }
         Ok(())
     }
 
@@ -446,7 +512,7 @@ impl BatchManager {
             .collect()
     }
 
-    /// True while any batch is planning, queued or running (the updater refuses to install then).
+    /// True while any batch is planning, queued, running or paused (the updater refuses to install then).
     pub fn has_active(&self) -> bool {
         self.entries.iter().any(|e| e.status().is_active())
     }

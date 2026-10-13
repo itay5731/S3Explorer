@@ -37,10 +37,11 @@ import {
   type SavedConnection,
 } from "../lib/types";
 import { formatExact, formatRelative, nameTone } from "../lib/format";
-import { forgetSavedConnection, readPref, setConnected, writePref } from "../store/app";
+import { connectionIdentity, forgetSavedConnection, readPref, setConnected, writePref } from "../store/app";
 import { toast } from "../store/toasts";
 import { Logo } from "./Logo";
 import { SettingsButton } from "./SettingsDialog";
+import { UpdatePill } from "./UpdateDialog";
 import { ThemeToggle } from "./ThemeToggle";
 import { TransferBackdrop } from "./TransferBackdrop";
 import { useTileReorder } from "./useTileReorder";
@@ -681,7 +682,7 @@ export function ConnectScreen() {
         forcePathStyle,
       };
       writePref(PREF_KEY, toRemember);
-      setConnected(info);
+      setConnected(info, null, connectionIdentity(config, info));
     } catch (err) {
       setError(err as AppError);
       setErrorText((err as AppError).message);
@@ -760,6 +761,7 @@ export function ConnectScreen() {
 
         <TransferBackdrop />
         <div className="screen-corner">
+          <UpdatePill />
           <ThemeToggle />
           <SettingsButton />
         </div>
@@ -781,6 +783,7 @@ export function ConnectScreen() {
 
         <TransferBackdrop />
         <div className="screen-corner">
+          <UpdatePill />
           <ThemeToggle />
           <SettingsButton />
         </div>
@@ -885,6 +888,7 @@ export function ConnectScreen() {
 
       <TransferBackdrop />
       <div className="screen-corner">
+        <UpdatePill />
         <ThemeToggle />
         <SettingsButton />
       </div>

@@ -46,6 +46,24 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     drag and drop, keyboard and the context menu (see "v0.7.0 additions" in `docs/CONTRACT.md`).
 27. (v0.7.0) Every action has a keyboard binding, all rebindable in Settings → Keyboard with export/import to a
     file; search runs as you type; type-to-search from the file list; per-pane back/forward history.
+28. Folder size on demand: a bounded, cancellable count of objects and bytes under a folder, from the
+    context menu and the details panel, cached for the session (added on request after v0.7.0; see
+    "Folder size" in `docs/CONTRACT.md`).
+29. Bookmarked folders per connection in a bookmarks bar under the toolbar, toggled from the path bar,
+    `Mod+Shift+D` or the right-click menus (added on request after v0.7.0; see "Bookmarks" in `docs/CONTRACT.md`).
+30. Tabs in each pane: several locations open at once, remembered per connection (added on request after
+    v0.7.0; see "Tabs" in `docs/CONTRACT.md`).
+31. Edit an object's content type, Cache-Control, Content-Disposition and user metadata (a copy onto itself,
+    confirmed before it runs; added on request after v0.7.0; see "Edit content type and metadata" in `docs/CONTRACT.md`).
+32. Preview of text files and images in the details panel and a Quick look dialog (`F3`), read into
+    memory without a download (added on request after v0.7.0; see "Object preview" in `docs/CONTRACT.md`).
+33. History: finished transfers, folder transfers and file operations (jobs) kept across restarts in a
+    History tab of the Activity panel, with filter chips, search, and open / go-to / re-run (transfers
+    only) actions (added on request after v0.7.0; see "History" in `docs/CONTRACT.md`).
+34. Download and upload speed limits shared by all transfers, applied live (added on request after
+    v0.7.0; see "Bandwidth limit" in `docs/CONTRACT.md`).
+35. Pause and resume downloads, uploads and folder transfers, in memory only (added on request after v0.7.0;
+    see "Pause and resume transfers" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

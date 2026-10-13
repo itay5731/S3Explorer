@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, RefreshCw, Snowflake, Trash2, X, Files, AlertCircle, Tags } from "lucide-react";
+import { ArchiveRestore, ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, RefreshCw, Snowflake, Trash2, X, Files, AlertCircle, Tags, FileCog } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
 import { navigate, openModal, setDetailsOpen, usePane } from "../store/app";
@@ -16,6 +16,9 @@ import { plural } from "../lib/ops";
 import { getSelected, useSelectionInfo } from "../store/view";
 import { displayName, formatBytes, formatExact, formatRelative, formatStorageClass, s3Uri } from "../lib/format";
 import { FileIcon } from "./FileIcon";
+import { FolderSizeField } from "./FolderSize";
+import { MAX_EDIT_BYTES } from "../lib/metadata";
+import { PreviewSection } from "./Preview";
 
 function Field({ label, children, mono, copy }: { label: string; children: ReactNode; mono?: boolean; copy?: string }) {
   return (
@@ -182,6 +185,11 @@ export function DetailsPanel() {
   }, [bucket, objKey, rev]);
   const blocked = useArchiveBlocked(bucket, obj);
   // Archived objects in a multiple selection (for "Restore archived…").
+  // Folders in a multiple selection (their sizes are calculated and summed together).
+  const selectedFolders = useMemo(
+    () => (sel.folders > 0 && sel.folders + sel.objects > 1 ? getSelected().folders.map((f) => f.prefix) : []),
+    [sel],
+  );
   const archivedSelected = useMemo(
     () => (sel.folders + sel.objects > 1 ? getSelected().objects.filter((o) => isArchiveClass(o.storageClass)).length : 0),
     [sel],
@@ -198,6 +206,16 @@ export function DetailsPanel() {
   } else if (obj) {
     const m = meta && meta.key === obj.key ? meta : null;
     const metaEntries = m ? Object.entries(m.metadata) : [];
+    const editBlocked = !m
+      ? null
+      : isArchiveClass(m.storageClass)
+        ? "Objects in Glacier or Deep Archive can’t be edited: the copy would put them back in the archive"
+        : m.archived
+          ? "The object is archived; restore it first to edit its metadata"
+          : m.size > MAX_EDIT_BYTES
+          ? "Objects over 5 GiB can’t be edited (S3 copies at most 5 GiB in one request)"
+          : null;
+    const editable = !!m && !editBlocked;
     body = (
       <>
         <div className="dhero">
@@ -236,6 +254,7 @@ export function DetailsPanel() {
             {obj.key}
           </Field>
         </div>
+        <PreviewSection bucket={bucket} object={obj} />
         <ObjectTagsSection bucket={bucket} objKey={obj.key} />
         <VersionsSection bucket={bucket} objKey={obj.key} name={obj.name} />
         <div className="dsection">
@@ -251,12 +270,33 @@ export function DetailsPanel() {
               <Field label="Content type" mono>
                 {m ? m.contentType ?? "—" : loading ? <Loader2 size={12} className="spin" /> : "—"}
               </Field>
+              {m?.cacheControl && (
+                <Field label="Cache-Control" mono>
+                  {m.cacheControl}
+                </Field>
+              )}
+              {m?.contentDisposition && (
+                <Field label="Content-Disposition" mono>
+                  {m.contentDisposition}
+                </Field>
+              )}
               {m?.versionId && (
                 <Field label="Version ID" mono copy={m.versionId}>
                   {m.versionId}
                 </Field>
               )}
-              <div className="dsection-title">User metadata</div>
+              <div className="dsection-title dsection-title-row">
+                <span>User metadata</span>
+                <button
+                  type="button"
+                  className="link-btn"
+                  onClick={() => openModal({ kind: "editMetadata", bucket, key: obj.key })}
+                  disabled={!editable}
+                  title={editBlocked ?? "Edit the content type, Cache-Control, Content-Disposition and user metadata"}
+                >
+                  <FileCog size={12} /> Edit
+                </button>
+              </div>
               {metaError ? (
                 <div className="inline-error">
                   <AlertCircle size={13} /> {metaError.message}
@@ -314,6 +354,7 @@ export function DetailsPanel() {
           </button>
         </div>
         <div className="dsection">
+          <FolderSizeField bucket={bucket} prefixes={[f.prefix]} />
           <Field label="Prefix" mono copy={f.prefix}>
             {f.prefix}
           </Field>
@@ -357,6 +398,11 @@ export function DetailsPanel() {
             <Tags size={14} /> Edit tags for {(sel.folders + sel.objects).toLocaleString()} items…
           </button>
         </div>
+        {selectedFolders.length > 0 && (
+          <div className="dsection">
+            <FolderSizeField bucket={bucket} prefixes={selectedFolders} />
+          </div>
+        )}
         {archivedSelected > 0 && (
           <div className="dactions">
             <button className="btn" onClick={() => requestRestoreArchived()}>

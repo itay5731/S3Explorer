@@ -1,6 +1,6 @@
 [package]
 name = "s3explorer"
-version = "0.7.0"
+version = "0.8.0"
 description = "Fast cross-platform S3 explorer"
 authors = ["s3explorer"]
 edition = "2021"
@@ -24,11 +24,13 @@ tokio = { version = "1", features = ["full"] }
 aws-config = { version = "1", features = ["behavior-version-latest", "credentials-login"] }
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
-aws-smithy-types = "1"
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
 # Only to recognize a response checksum mismatch (already a dependency of aws-sdk-s3).
 aws-smithy-checksums = "0.65"
 thiserror = "2"
 futures = "0.3"
+# Only to throttle upload bodies (the Body trait the SDK's `SdkBody` takes; already in the tree).
+http-body = "1"
 bytes = "1"
 dashmap = "6"
 uuid = { version = "1", features = ["v4"] }

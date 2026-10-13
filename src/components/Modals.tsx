@@ -20,7 +20,9 @@ const UploadFolderModal = lazy(() => import("./BatchDialogs").then((m) => ({ def
 const DownloadFoldersModal = lazy(() => import("./BatchDialogs").then((m) => ({ default: m.DownloadFoldersModal })));
 const RestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ default: m.RestoreModal })));
 const BulkRestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ default: m.BulkRestoreModal })));
+const MetadataDialog = lazy(() => import("./MetadataDialog").then((m) => ({ default: m.MetadataDialog })));
 const VersionActionModal = lazy(() => import("./VersionDialogs").then((m) => ({ default: m.VersionActionModal })));
+const QuickLookModal = lazy(() => import("./QuickLook").then((m) => ({ default: m.QuickLookModal })));
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
@@ -34,12 +36,15 @@ export function ModalShell({
   busy,
   labelledBy,
   wide,
+  className,
 }: {
   children: ReactNode;
   onClose: () => void;
   busy?: boolean;
   labelledBy?: string;
   wide?: boolean;
+  /** An extra class on the dialog (its own size and layout). */
+  className?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
@@ -101,7 +106,7 @@ export function ModalShell({
 
   return (
     <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
-      <div ref={ref} className={`modal ${wide ? "modal-wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby={labelledBy} tabIndex={-1}>
+      <div ref={ref} className={`modal ${wide ? "modal-wide" : ""} ${className ?? ""}`} role="dialog" aria-modal="true" aria-labelledby={labelledBy} tabIndex={-1}>
         {children}
       </div>
     </div>
@@ -716,6 +721,8 @@ function ModalSwitch() {
       );
     case "objectTags":
       return <ObjectTagsModal key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} />;
+    case "editMetadata":
+      return <MetadataDialog key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} />;
     case "bulkTags":
       return <BulkTagsModal bucket={modal.bucket} prefix={modal.prefix} items={modal.items} />;
     case "disconnect":
@@ -739,7 +746,7 @@ function ModalSwitch() {
     case "uploadFolder":
       return (
         <Suspense fallback={null}>
-          <UploadFolderModal key={modal.localPath} bucket={modal.bucket} prefix={modal.prefix} localPath={modal.localPath} initialPreview={modal.initialPreview} />
+          <UploadFolderModal key={modal.localPath} bucket={modal.bucket} prefix={modal.prefix} localPath={modal.localPath} initialPreview={modal.initialPreview} initialDest={modal.initialDest} />
         </Suspense>
       );
     case "downloadFolders":
@@ -748,6 +755,8 @@ function ModalSwitch() {
           <DownloadFoldersModal bucket={modal.bucket} folders={modal.folders} dir={modal.dir} />
         </Suspense>
       );
+    case "quickLook":
+      return bucket ? <QuickLookModal bucket={bucket} /> : null;
     case "newFolder":
       return <NewFolderModal bucket={modal.bucket} prefix={modal.prefix} />;
     case "delete":

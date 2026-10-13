@@ -1,5 +1,6 @@
 //! Plain S3 operations (no Tauri dependency) used by the commands and the smoke test.
 
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 
@@ -131,8 +132,12 @@ pub async fn head_object(client: &Client, bucket: &str, key: &str) -> AppResult<
         return Err(AppError::invalid("Object key is required"));
     }
     let h = client.head_object().bucket(bucket).key(key).send().await?;
-    let archive = crate::archive::ArchiveInfo::from_head(&h);
-    Ok(ObjectMeta {
+    Ok(meta_from_head(key, &h))
+}
+
+pub(crate) fn meta_from_head(key: &str, h: &HeadObjectOutput) -> ObjectMeta {
+    let archive = crate::archive::ArchiveInfo::from_head(h);
+    ObjectMeta {
         key: key.to_string(),
         name: last_segment(key),
         size: h.content_length().unwrap_or(0).max(0) as u64,
@@ -144,7 +149,9 @@ pub async fn head_object(client: &Client, bucket: &str, key: &str) -> AppResult<
         version_id: h.version_id().map(str::to_string),
         archived: archive.archived(chrono::Utc::now()),
         restore: archive.restore,
-    })
+        cache_control: h.cache_control().map(str::to_string),
+        content_disposition: h.content_disposition().map(str::to_string),
+    }
 }
 
 /// Folder prefixes are used exactly as given (S3 keys may legitimately contain "//" or a

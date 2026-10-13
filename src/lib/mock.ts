@@ -16,6 +16,7 @@ import type {
   ConnectionInfo,
   ErrorCode,
   FolderEntry,
+  FolderSize,
   Job,
   JobItem,
   JobPreview,
@@ -23,8 +24,10 @@ import type {
   LifecycleConfiguration,
   LifecycleRule,
   ListPage,
+  MetadataEdit,
   ObjectEntry,
   ObjectMeta,
+  ObjectPreview,
   ProfileInfo,
   RecentListing,
   RestoreRequest,
@@ -39,10 +42,11 @@ import type {
   UpdateProgress,
   VersionListing,
 } from "./types";
-import { BATCH_LIMITS, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { BATCH_LIMITS, FOLDER_SIZE_SCAN_LIMIT, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS, PREVIEW_LIMITS } from "./types";
 import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
+import { MAX_EDIT_BYTES, metadataEditError } from "./metadata";
 import { validateLifecycleConfig } from "./lifecycleCheck";
 import { sameConfiguration } from "./lifecycle";
 import { sanitizeFileName } from "./format";
@@ -91,6 +95,8 @@ interface MockObject {
   metadata: Record<string, string>;
   versionId: string | null;
   tags?: Tag[];
+  cacheControl?: string;
+  contentDisposition?: string;
 }
 
 interface MockBucket {
@@ -709,6 +715,29 @@ function needsRestore(bucket: string, key: string, o: MockObject): boolean {
   return !(st && !st.inProgress && st.expiresAt);
 }
 
+/** What head_object returns for a mock object. */
+function objectMeta(bucket: string, key: string, o: MockObject): ObjectMeta {
+  const st = restoreStateOf(bucket, key);
+  return {
+    key,
+    name: key.split("/").filter(Boolean).pop() ?? key,
+    size: o.size,
+    lastModified: o.lastModified,
+    etag: o.etag,
+    storageClass: o.storageClass,
+    contentType: o.contentType,
+    metadata: { ...o.metadata },
+    versionId: versioningOf(bucket) === "Off" ? o.versionId : historyOf(bucket, key)[0]?.versionId ?? o.versionId,
+    restore: isArchiveClass(o.storageClass) && st ? { inProgress: st.inProgress, expiresAt: st.expiresAt } : null,
+    archived: needsRestore(bucket, key, o),
+    cacheControl: o.cacheControl ?? null,
+    contentDisposition: o.contentDisposition ?? null,
+  };
+}
+
+/** Every update_object_metadata call, for checks from the browser console. */
+const metadataCallLog: { edit: MetadataEdit; at: string }[] = [];
+
 function validateRestoreRequest(req: RestoreRequest | undefined | null) {
   if (!req || typeof req !== "object") throw fail("InvalidInput", "restore is required");
   if (req.tier !== "Bulk" && req.tier !== "Standard" && req.tier !== "Expedited") throw fail("InvalidInput", "restore.tier must be Bulk, Standard or Expedited");
@@ -909,12 +938,17 @@ interface Sim {
   partSize: number;
   failAt: number | null; // fraction at which it fails
   failMessage: string;
+  /** Bytes through so far, before uploads round down to whole parts. */
+  sent: number;
 }
 
 const sims = new Map<string, Sim>();
 const progressListeners = new Set<(t: Transfer) => void>();
 let ticker: ReturnType<typeof setInterval> | null = null;
 let idSeq = 0;
+
+/** Queued, running or paused (paused still holds its temp file / multipart upload). */
+const simActive = (t: Transfer) => t.status === "running" || t.status === "queued" || t.status === "paused";
 
 function emit(t: Transfer) {
   const copy = { ...t };
@@ -938,7 +972,8 @@ function startQueued() {
     s.partSize = plan.partBytes;
     s.t.partsTotal = plan.parts;
     s.t.status = "running";
-    s.startedMs = now;
+    // A resumed transfer continues from its finished parts.
+    s.startedMs = now - (s.t.totalBytes ? (s.t.transferredBytes / s.t.totalBytes) * s.durationMs : 0);
     running++;
     emit(s.t);
   }
@@ -947,6 +982,9 @@ function startQueued() {
 function tick() {
   const now = Date.now();
   startQueued();
+  // Like the backend's shared limiter: each direction's limit is split across its running transfers.
+  const runningOf = { download: 0, upload: 0 };
+  for (const s of sims.values()) if (s.t.status === "running") runningOf[s.t.kind]++;
   let active = 0;
   for (const s of sims.values()) {
     if (s.t.status !== "running") {
@@ -954,11 +992,21 @@ function tick() {
       continue;
     }
     active++;
-    const frac = Math.min(1, (now - s.startedMs) / s.durationMs);
+    let frac = Math.min(1, (now - s.startedMs) / s.durationMs);
     // ease a little + jitter so speed looks alive
     const shaped = Math.min(1, frac * (0.92 + Math.random() * 0.16));
     const prev = s.t.transferredBytes;
-    let next = Math.max(prev, Math.floor(s.t.totalBytes * shaped));
+    const prevSent = s.sent;
+    let sent = Math.max(prevSent, Math.floor(s.t.totalBytes * shaped));
+    const limit = s.t.kind === "upload" ? settings.uploadLimitKibps : settings.downloadLimitKibps;
+    if (limit !== null && s.t.totalBytes > 0) {
+      sent = Math.min(sent, Math.floor(prevSent + (limit * 1024 * 0.1) / runningOf[s.t.kind]));
+      // Hold the clock back to match, so the transfer finishes when its bytes are through.
+      frac = Math.min(1, sent / s.t.totalBytes);
+      s.startedMs = now - frac * s.durationMs;
+    }
+    s.sent = sent;
+    let next = Math.max(prev, sent);
     if (s.t.kind === "upload") {
       // Uploads only report whole completed parts (small files jump 0 -> 100%).
       next = s.t.partsTotal <= 1 ? 0 : Math.max(prev, Math.floor(next / s.partSize) * s.partSize);
@@ -986,8 +1034,7 @@ function tick() {
       emit(s.t);
       continue;
     }
-    const elapsed = Math.max(0.1, (now - s.startedMs) / 1000);
-    const instant = s.t.kind === "upload" ? next / elapsed : (next - prev) / 0.1 || 0;
+    const instant = (sent - prevSent) / 0.1 || 0;
     s.t.bytesPerSec = s.t.bytesPerSec ? s.t.bytesPerSec * 0.7 + instant * 0.3 : instant;
     s.t.transferredBytes = next;
     s.t.partsDone = Math.min(s.t.partsTotal, Math.floor(next / s.partSize));
@@ -1034,6 +1081,7 @@ function startSim(
     partSize,
     failAt: failMessage ? (opts.batchId ? 0.5 : 0.05) : null,
     failMessage: failMessage ?? "",
+    sent: 0,
   });
   emit(t);
   ensureTicker();
@@ -1260,6 +1308,8 @@ interface BatchSim {
   baseBytes: number; // bytes of finished files
   everRan: boolean;
   transferIds: string[];
+  /** Paused by the user (also while still planning). */
+  paused: boolean;
 }
 
 const batchSims = new Map<string, BatchSim>();
@@ -1270,7 +1320,7 @@ const batchCallLog: { cmd: "preview_batch" | "start_batch" | "cancel_batch"; req
 const batchPreviewDelay: { next: number | null } = { next: null };
 
 const cloneBatch = (b: Batch): Batch => ({ ...b, errors: b.errors.map((e) => ({ ...e })) });
-const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running";
+const isBatchActive = (b: Batch) => b.status === "planning" || b.status === "queued" || b.status === "running" || b.status === "paused";
 
 function emitBatch(b: Batch) {
   const copy = cloneBatch(b);
@@ -1339,10 +1389,12 @@ function batchTick() {
         sim.req.kind === "upload"
           ? `Upload ${name}/ (${b.totalFiles.toLocaleString()} file${b.totalFiles === 1 ? "" : "s"})`
           : `Download ${name}/ to ${sim.req.localPath}`;
-      b.status = "queued";
+      b.status = sim.paused ? "paused" : "queued";
       emitBatch(b);
       continue;
     }
+    // Paused: its files are paused and no new ones start.
+    if (b.status === "paused") continue;
     let liveBytes = 0;
     let speed = 0;
     let running = false;
@@ -1416,7 +1468,7 @@ function startBatchSim(req: BatchPlanRequest): string {
     startedAt: new Date().toISOString(),
     finishedAt: null,
   };
-  batchSims.set(id, { b, req, planningUntil: Date.now() + 900, files: null, pos: 0, active: new Map(), baseBytes: 0, everRan: false, transferIds: [] });
+  batchSims.set(id, { b, req, planningUntil: Date.now() + 900, files: null, pos: 0, active: new Map(), baseBytes: 0, everRan: false, transferIds: [], paused: false });
   emitBatch(b);
   if (!batchTicker) batchTicker = setInterval(batchTick, 100);
   return id;
@@ -1425,7 +1477,7 @@ function startBatchSim(req: BatchPlanRequest): string {
 function cancelBatchSim(sim: BatchSim) {
   for (const tid of sim.active.keys()) {
     const s = sims.get(tid);
-    if (s && (s.t.status === "running" || s.t.status === "queued")) {
+    if (s && simActive(s.t)) {
       s.t.status = "cancelled";
       s.t.bytesPerSec = 0;
       s.t.finishedAt = new Date().toISOString();
@@ -1435,6 +1487,28 @@ function cancelBatchSim(sim: BatchSim) {
   sim.active.clear();
   sim.pos = sim.files?.length ?? 0;
   finishBatch(sim, "cancelled");
+}
+
+function pauseSim(s: Sim) {
+  if (s.t.status !== "running" && s.t.status !== "queued") return;
+  // In-flight parts are dropped: progress falls back to the finished parts.
+  if (s.t.partsTotal > 1) {
+    s.t.partsDone = Math.min(s.t.partsTotal, Math.floor(s.t.transferredBytes / s.partSize));
+    s.t.transferredBytes = s.t.partsDone * s.partSize;
+  } else {
+    s.t.partsDone = 0;
+    s.t.transferredBytes = 0;
+  }
+  s.t.status = "paused";
+  s.t.bytesPerSec = 0;
+  emit(s.t);
+}
+
+function resumeSim(s: Sim) {
+  if (s.t.status !== "paused") return;
+  s.t.status = "queued";
+  emit(s.t);
+  ensureTicker();
 }
 
 function logBatchCall(cmd: "preview_batch" | "start_batch" | "cancel_batch", request: unknown) {
@@ -1501,6 +1575,20 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
   localExists: (path: string) => localExisting.has(path.toLowerCase()),
   batchTransfers: (id: string) => (batchSims.get(id)?.transferIds ?? []).map((t) => (sims.get(t) ? { ...sims.get(t)!.t } : null)),
   tagCalls: tagCallLog,
+  metadataCalls: metadataCallLog,
+  /** Rewrite an object behind the UI's back (new ETag), to exercise the metadata edit's Conflict. */
+  touchObject: (bucket: string, key: string) => {
+    const o = buckets.get(bucket)?.objects.get(key);
+    if (o) o.etag = hex(32);
+  },
+  /** Another client edits only the metadata (same ETag, new LastModified), to exercise the same Conflict. */
+  touchObjectMetadata: (bucket: string, key: string) => {
+    const o = buckets.get(bucket)?.objects.get(key);
+    if (o) {
+      o.metadata = { ...o.metadata, "changed-elsewhere": "yes" };
+      o.lastModified = new Date(Date.parse(o.lastModified) + 2000).toISOString();
+    }
+  },
   objectTags: (bucket: string, key: string) => copyTags(buckets.get(bucket)?.objects.get(key)?.tags),
   bucketTags: (bucket: string) => copyTags(buckets.get(bucket)?.tags),
   /** Make the next tag / lifecycle save fail (see InjectedFailure). */
@@ -1561,7 +1649,7 @@ function logJobCall(cmd: "preview_job" | "start_job", request: JobRequest) {
     windowFocus.fail = f;
   },
   activeCounts: () => ({
-    transfers: [...sims.values()].filter((x) => x.t.status === "running" || x.t.status === "queued").length,
+    transfers: [...sims.values()].filter((x) => simActive(x.t)).length,
     batches: [...batchSims.values()].filter((x) => isBatchActive(x.b)).length,
     jobs: [...jobSims.values()].filter((x) => x.job.status === "running" || x.job.status === "queued").length,
   }),
@@ -2051,6 +2139,68 @@ function folderEntryOf(prefix: string): FolderEntry {
   return { prefix, name: body.slice(body.lastIndexOf("/") + 1) };
 }
 
+// ---- object preview (see "Object preview" in docs/CONTRACT.md) ----
+
+const PREVIEW_IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "svg"];
+const PREVIEW_TEXT_EXT = new Set(
+  "txt md markdown json jsonl csv tsv log xml yaml yml toml ini conf cfg env sql sh bat ps1 py js mjs ts tsx jsx css scss html htm rs go java kt c h cpp cs rb php swift tf hcl properties gitignore dockerfile".split(" "),
+);
+
+/** A made-up picture for an image key: a gradient with the file name, encoded as the key's type. */
+function mockImage(key: string, ext: string): string {
+  const name = key.slice(key.lastIndexOf("/") + 1);
+  const hue = [...key].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+  if (ext === "svg") {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="320"><rect width="480" height="320" fill="hsl(${hue},55%,45%)"/><circle cx="240" cy="160" r="90" fill="hsl(${(hue + 120) % 360},60%,60%)"/></svg>`;
+    return btoa(svg);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = 640;
+  canvas.height = 420;
+  const g = canvas.getContext("2d");
+  if (g) {
+    const grad = g.createLinearGradient(0, 0, 640, 420);
+    grad.addColorStop(0, `hsl(${hue}, 60%, 55%)`);
+    grad.addColorStop(1, `hsl(${(hue + 70) % 360}, 55%, 30%)`);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 640, 420);
+    g.fillStyle = "rgba(255,255,255,0.9)";
+    g.font = "600 28px sans-serif";
+    g.fillText(name.slice(0, 36), 32, 380);
+  }
+  const type = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "webp" ? "image/webp" : "image/png";
+  return canvas.toDataURL(type).split(",")[1] ?? "";
+}
+
+function mockText(key: string, ext: string): string {
+  const name = key.slice(key.lastIndexOf("/") + 1);
+  if (ext === "json") return JSON.stringify({ name, generatedBy: "mock", items: [1, 2, 3].map((i) => ({ id: i, label: `Item ${i}`, ok: i % 2 === 1 })) });
+  if (ext === "csv" || ext === "tsv") {
+    const sep = ext === "tsv" ? "\t" : ",";
+    const rows = [["id", "name", "city", "amount"].join(sep)];
+    for (let i = 1; i <= 240; i++) rows.push([i, `"Customer ${i}"`, ["Lisbon", "Oslo", "Tel Aviv", "Austin"][i % 4], (i * 17.35).toFixed(2)].join(sep));
+    return rows.join("\n");
+  }
+  if (ext === "log") return Array.from({ length: 400 }, (_, i) => `2026-10-12T08:${String(i % 60).padStart(2, "0")}:00Z INFO request ${i} served in ${(i * 7) % 300} ms`).join("\n");
+  return `# ${name}\n\nThis is a preview from the mock backend.\nA very long line follows to show soft wrapping: ${"lorem ipsum dolor sit amet ".repeat(12)}\n`;
+}
+
+function mockPreview(bucket: string, key: string, o: MockObject): ObjectPreview {
+  const p: ObjectPreview = { kind: "unsupported", contentType: o.contentType, size: o.size, truncated: false, text: null, dataBase64: null, reason: null };
+  const ext = key.slice(key.lastIndexOf("/") + 1).toLowerCase().split(".").pop() ?? "";
+  if (needsRestore(bucket, key, o)) return { ...p, reason: "Archived: restore it to preview" };
+  // An image extension, or (with no text extension) an image content type, like the backend.
+  const imageType = !PREVIEW_TEXT_EXT.has(ext) && o.contentType.startsWith("image/");
+  if (PREVIEW_IMAGE_EXT.includes(ext) || imageType) {
+    if (o.size > PREVIEW_LIMITS.imageMaxBytes) return { ...p, reason: "Too large to preview" };
+    return { ...p, kind: "image", dataBase64: mockImage(key, PREVIEW_IMAGE_EXT.includes(ext) ? ext : o.contentType === "image/jpeg" ? "jpg" : "png") };
+  }
+  if (PREVIEW_TEXT_EXT.has(ext) || o.contentType.startsWith("text/")) {
+    return { ...p, kind: "text", text: mockText(key, ext), truncated: o.size > PREVIEW_LIMITS.textMaxBytes };
+  }
+  return { ...p, reason: "Binary file" };
+}
+
 async function mockSearch(query: SearchQuery, searchId: string): Promise<SearchResult> {
   searchCallLog.push({ query: { ...query }, searchId, at: new Date().toISOString() });
   const gen = ++searchSeq;
@@ -2229,6 +2379,70 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   },
 });
 
+// ---- folder size ---------------------------------------------------------------------------
+
+/** The newest scan per id; an older one sees it changed and stops with Cancelled. */
+const folderSizeGen = new Map<string, number>();
+let folderSizeSeq = 0;
+/** Scans holding one of the four slots, and the ones waiting for a slot. */
+let folderSizeRunning = 0;
+const folderSizeWaiting: (() => void)[] = [];
+/** Lowered from a test driver (`__s3xMock.setFolderSizeLimit`) to see truncation. */
+let folderSizeLimit = FOLDER_SIZE_SCAN_LIMIT;
+
+async function mockFolderSize(id: string, bucket: string, prefix: string): Promise<FolderSize> {
+  const gen = ++folderSizeSeq;
+  folderSizeGen.set(id, gen);
+  const epoch = searchEpoch;
+  const cancelled = () => folderSizeGen.get(id) !== gen || searchEpoch !== epoch;
+  const stop = () => fail("Cancelled", "The scan was cancelled.");
+  if (folderSizeRunning >= 4) await new Promise<void>((r) => folderSizeWaiting.push(r));
+  folderSizeRunning++;
+  try {
+    if (cancelled()) throw stop();
+    const b = requireBucket(bucket);
+    const keys = sortedKeys(b);
+    const out: FolderSize = { objects: 0, bytes: 0, scanned: 0, truncated: false };
+    // One "page" of 1000 keys per 40 ms, so Cancel and the spinner can be seen on big folders.
+    for (let i = lowerBound(keys, prefix); i < keys.length && keys[i].startsWith(prefix); i++) {
+      if (out.scanned >= folderSizeLimit) {
+        out.truncated = true;
+        break;
+      }
+      if (out.scanned % 1000 === 0) {
+        await delay(40);
+        if (cancelled()) throw stop();
+      }
+      out.scanned++;
+      if (keys[i].endsWith("/")) continue;
+      out.objects++;
+      out.bytes += b.objects.get(keys[i])?.size ?? 0;
+    }
+    await delay(150);
+    if (cancelled()) throw stop();
+    return out;
+  } finally {
+    if (folderSizeGen.get(id) === gen) folderSizeGen.delete(id);
+    folderSizeRunning--;
+    folderSizeWaiting.shift()?.();
+  }
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  setFolderSizeLimit: (n: number | null) => {
+    folderSizeLimit = n ?? FOLDER_SIZE_SCAN_LIMIT;
+  },
+  /** Add an object as a test fixture, with the content type given (else from its extension). */
+  putFixture: (bucket: string, key: string, size: number, contentType?: string, storageClass?: string) => {
+    const b = buckets.get(bucket);
+    if (!b) return false;
+    put(b, key, size, storageClass ? { storageClass } : {});
+    const o = b.objects.get(key);
+    if (o && contentType) o.contentType = contentType;
+    return true;
+  },
+});
+
 // ---- text files (keyboard bindings export / import, v0.7.0) -----------------------------------
 // The real backend writes and reads `.json` files on disk; the mock keeps them in a map keyed by
 // path (case-insensitive, like Windows). A parent folder containing "missing" does not exist.
@@ -2298,7 +2512,7 @@ export const mockBackend: Backend = {
       // Cooperative cancel of everything queued or running; the final events are emitted.
       for (const sim of batchSims.values()) if (isBatchActive(sim.b)) cancelBatchSim(sim);
       for (const s of sims.values()) {
-        if (s.t.status === "running" || s.t.status === "queued") {
+        if (simActive(s.t)) {
           s.t.status = "cancelled";
           s.t.bytesPerSec = 0;
           s.t.finishedAt = new Date().toISOString();
@@ -2487,6 +2701,14 @@ export const mockBackend: Backend = {
     if (searchGen.has(searchId)) searchGen.set(searchId, ++searchSeq);
   },
 
+  async folderSize(id, bucket, prefix) {
+    return mockFolderSize(id, bucket, prefix);
+  },
+
+  async cancelFolderSize(id) {
+    if (folderSizeGen.has(id)) folderSizeGen.set(id, ++folderSizeSeq);
+  },
+
   async openLocal(path) {
     await delay(40);
     mockOpenLocal(path);
@@ -2568,24 +2790,59 @@ export const mockBackend: Backend = {
 
   async headObject(bucket, key): Promise<ObjectMeta> {
     await latency();
+    const o = requireBucket(bucket).objects.get(key);
+    if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
+    return objectMeta(bucket, key, o);
+  },
+
+  async updateObjectMetadata(edit: MetadataEdit): Promise<ObjectMeta> {
+    await delay(250 + rand() * 250);
+    metadataCallLog.push({ edit: { ...edit, metadata: { ...edit.metadata } }, at: new Date().toISOString() });
+    const why = metadataEditError(edit);
+    if (why) throw fail("InvalidInput", why);
+    const b = requireBucket(edit.bucket);
+    const o = b.objects.get(edit.key);
+    if (!o) throw fail("NoSuchKey", `The key “${edit.key}” does not exist.`);
+    const expectedLm = Date.parse(edit.expectedLastModified);
+    if (Number.isNaN(expectedLm)) throw fail("InvalidInput", "The object's last-modified time is missing or not an ISO-8601 timestamp.");
+    // Whole seconds, like S3.
+    if (o.etag !== edit.expectedEtag.replace(/"/g, "") || Math.floor(Date.parse(o.lastModified) / 1000) !== Math.floor(expectedLm / 1000)) {
+      throw fail("Conflict", "The object changed since the dialog opened, so nothing was written. Reload to edit the current version.");
+    }
+    if (o.size > MAX_EDIT_BYTES) throw fail("InvalidInput", "The object is larger than 5 GiB, the most S3 can copy in one request, so its metadata cannot be edited here.");
+    // GLACIER / DEEP_ARCHIVE, restored or not: the copy would put the data back in the archive.
+    if (o.storageClass === "GLACIER" || o.storageClass === "DEEP_ARCHIVE") {
+      throw fail(
+        "NotSupported",
+        `The object is in ${o.storageClass}. Editing metadata copies the object, which would put it back in the archive (a restored copy would be lost), so it cannot be edited here.`,
+      );
+    }
+    if (needsRestore(edit.bucket, edit.key, o)) throw fail("InvalidInput", "The object is archived; restore it first to edit its metadata.");
+    if (b.readOnly) throw fail("AccessDenied", DENIED_WRITE.slice("AccessDenied: ".length));
+    // A copy onto itself: a new object (and version) with the same body, storage class and tags.
+    const next: MockObject = {
+      ...o,
+      // A multipart ETag becomes a single-part one; a single-part ETag (the body's MD5) stays.
+      etag: o.etag.includes("-") ? hex(32) : o.etag,
+      lastModified: new Date().toISOString(),
+      contentType: edit.contentType,
+      metadata: { ...edit.metadata },
+      tags: o.tags ? copyTags(o.tags) : undefined,
+      cacheControl: edit.cacheControl ?? undefined,
+      contentDisposition: edit.contentDisposition ?? undefined,
+    };
+    recordWrite(b, edit.key, next);
+    b.objects.set(edit.key, next);
+    b.sorted = null;
+    return objectMeta(edit.bucket, edit.key, next);
+  },
+
+  async previewObject(bucket, key): Promise<ObjectPreview> {
+    await latency();
     const b = requireBucket(bucket);
     const o = b.objects.get(key);
-    if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
-    const name = key.split("/").filter(Boolean).pop() ?? key;
-    const st = restoreStateOf(bucket, key);
-    return {
-      key,
-      name,
-      size: o.size,
-      lastModified: o.lastModified,
-      etag: o.etag,
-      storageClass: o.storageClass,
-      contentType: o.contentType,
-      metadata: { ...o.metadata },
-      versionId: versioningOf(bucket) === "Off" ? o.versionId : historyOf(bucket, key)[0]?.versionId ?? o.versionId,
-      restore: isArchiveClass(o.storageClass) && st ? { inProgress: st.inProgress, expiresAt: st.expiresAt } : null,
-      archived: needsRestore(bucket, key, o),
-    };
+    if (!o || key.endsWith("/")) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
+    return mockPreview(bucket, key, o);
   },
 
   async createFolder(bucket, prefix) {
@@ -2619,6 +2876,38 @@ export const mockBackend: Backend = {
       );
     }
     return startBatchSim(request);
+  },
+
+  async pauseBatch(id) {
+    await delay(30);
+    const sim = batchSims.get(id);
+    if (!sim) throw invalid("Unknown batch id");
+    if (!isBatchActive(sim.b)) throw invalid("The folder transfer has already finished");
+    if (sim.paused) return;
+    sim.paused = true;
+    if (sim.b.status === "queued" || sim.b.status === "running") {
+      sim.b.status = "paused";
+      sim.b.bytesPerSec = 0;
+    }
+    for (const tid of sim.active.keys()) {
+      const s = sims.get(tid);
+      if (s) pauseSim(s);
+    }
+    emitBatch(sim.b);
+  },
+
+  async resumeBatch(id) {
+    await delay(30);
+    const sim = batchSims.get(id);
+    if (!sim) throw invalid("Unknown batch id");
+    if (!sim.paused) return;
+    sim.paused = false;
+    if (sim.b.status === "paused") sim.b.status = "queued";
+    for (const tid of sim.active.keys()) {
+      const s = sims.get(tid);
+      if (s) resumeSim(s);
+    }
+    emitBatch(sim.b);
   },
 
   async cancelBatch(id) {
@@ -2762,7 +3051,7 @@ export const mockBackend: Backend = {
     await delay(30);
     const s = sims.get(id);
     if (!s) throw fail("InvalidInput", "Unknown transfer.");
-    if (s.t.status === "running" || s.t.status === "queued") {
+    if (simActive(s.t)) {
       s.t.status = "cancelled";
       s.t.bytesPerSec = 0;
       s.t.finishedAt = new Date().toISOString();
@@ -2770,10 +3059,25 @@ export const mockBackend: Backend = {
     }
   },
 
+  async pauseTransfer(id) {
+    await delay(30);
+    const s = sims.get(id);
+    if (!s) throw fail("InvalidInput", "Unknown transfer id");
+    if (!simActive(s.t)) throw fail("InvalidInput", "The transfer has already finished");
+    pauseSim(s);
+  },
+
+  async resumeTransfer(id) {
+    await delay(30);
+    const s = sims.get(id);
+    if (!s) throw fail("InvalidInput", "Unknown transfer id");
+    resumeSim(s);
+  },
+
   async removeTransfer(id) {
     await delay(20);
     const s = sims.get(id);
-    if (s && (s.t.status === "running" || s.t.status === "queued")) {
+    if (s && simActive(s.t)) {
       throw fail("InvalidInput", "Cannot remove a transfer that is still running. Cancel it first.");
     }
     sims.delete(id);
@@ -2850,12 +3154,20 @@ export const mockBackend: Backend = {
       textWeight: next.textWeight,
       accent: next.accent,
       confirmCopyMove: next.confirmCopyMove,
+      previewAutomatically: next.previewAutomatically,
       // Like the backend: trimmed, empty becomes null; the field is required.
       fileManagerCommand: typeof next.fileManagerCommand === "string" ? normalizeFileManagerCommand(next.fileManagerCommand) : next.fileManagerCommand,
       // Like the backend: a missing field is {} (a settings.json without it loads {}).
       keybindings: JSON.parse(JSON.stringify(next.keybindings ?? {})) as Record<string, string[]>,
+      downloadLimitKibps: next.downloadLimitKibps,
+      uploadLimitKibps: next.uploadLimitKibps,
     };
+    // Like the backend: both limits are required (null = unlimited).
+    for (const f of ["downloadLimitKibps", "uploadLimitKibps"] as const) {
+      if (candidate[f] === undefined) throw fail("InvalidInput", `${f}: required.`);
+    }
     if (candidate.fileManagerCommand === undefined) throw fail("InvalidInput", "fileManagerCommand: required.");
+    if (candidate.previewAutomatically === undefined) throw fail("InvalidInput", "previewAutomatically: required.");
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
     settings = candidate;
@@ -2994,7 +3306,7 @@ export const mockBackend: Backend = {
       throw fail("InvalidInput", "No installable update is known. Check for updates first.");
     }
     for (const s of sims.values()) {
-      if (s.t.status === "running" || s.t.status === "queued") {
+      if (simActive(s.t)) {
         throw fail("InvalidInput", "Transfers are still running. Wait for them to finish or cancel them, then install the update.");
       }
     }

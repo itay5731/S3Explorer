@@ -46,6 +46,16 @@ pub async fn cancel_transfer(state: State<'_, AppState>, id: String) -> AppResul
 }
 
 #[tauri::command]
+pub async fn pause_transfer(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.transfers.pause(&id)
+}
+
+#[tauri::command]
+pub async fn resume_transfer(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.transfers.resume(&id)
+}
+
+#[tauri::command]
 pub async fn remove_transfer(state: State<'_, AppState>, id: String) -> AppResult<()> {
     state.transfers.remove(&id)
 }

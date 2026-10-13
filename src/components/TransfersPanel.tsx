@@ -23,25 +23,31 @@ import {
   FolderUp,
   ClipboardCopy,
   ExternalLink,
-  LocateFixed,
+  Gauge,
+  Pause,
+  Play,
 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, Batch, BatchStatus, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
-import { isActive, selectActiveCount, useTransfers } from "../store/transfers";
+import { isActive, isMoving, selectActiveCount, setTransferPaused, useTransfers } from "../store/transfers";
 import { jobRequest, removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
-import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, useBatches } from "../store/batches";
-import { navigate, revealObject, setTransfersOpen, useApp } from "../store/app";
-import { closeSearch } from "../store/search";
+import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, setBatchPaused, useBatches } from "../store/batches";
+import { setAllPaused } from "../store/pause";
+import { setTransfersOpen, useApp } from "../store/app";
 import { copyText } from "../store/actions";
 import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
-import { toast } from "../store/toasts";
+import { copyKeyItem, copyPathItem, goFolder, goItem, goObject, openLocal, reveal, showItem, useKnownBucket, type KnownBucket } from "./activityItems";
+import { HistoryBar, HistoryList, useActivityTab, useHistoryCount } from "./ActivityHistory";
 import { basename, formatBytes, formatDuration, formatSpeed, refusedToOpen } from "../lib/format";
 import { isJobActive, jobFraction, plural } from "../lib/ops";
+import { formatLimit } from "../lib/settings";
+import { openSettings, useSettings } from "../store/settings";
 import { shortVersionId, useVersionDownloads } from "../store/versions";
 
 const STATUS_LABEL: Record<TransferStatus, string> = {
   queued: "Queued",
   running: "Running",
+  paused: "Paused",
   completed: "Done",
   failed: "Failed",
   cancelled: "Cancelled",
@@ -50,10 +56,38 @@ const STATUS_LABEL: Record<TransferStatus, string> = {
 const STATUS_ICON: Record<TransferStatus, typeof Clock | null> = {
   queued: Clock,
   running: null,
+  paused: Pause,
   completed: CheckCircle2,
   failed: XCircle,
   cancelled: Ban,
 };
+
+/** Why a folder transfer that is still being planned shows its Pause button disabled. */
+const PLANNING_NO_PAUSE = "Pause becomes available once the folder has been read";
+
+/** The Pause / Resume button of a row, next to Cancel; disabled while planning, nothing for a finished row. */
+function PauseButton({ status, onToggle, what }: { status: string; onToggle: (pause: boolean) => void; what: string }) {
+  if (status === "planning") {
+    return (
+      <button className="icon-btn" disabled title={PLANNING_NO_PAUSE} aria-label={`Pause ${what}: ${PLANNING_NO_PAUSE}`}>
+        <Pause size={14} />
+      </button>
+    );
+  }
+  if (status === "paused") {
+    return (
+      <button className="icon-btn" onClick={() => onToggle(false)} title="Resume" aria-label={`Resume ${what}`}>
+        <Play size={14} />
+      </button>
+    );
+  }
+  if (status !== "running" && status !== "queued") return null;
+  return (
+    <button className="icon-btn" onClick={() => onToggle(true)} title="Pause" aria-label={`Pause ${what}`}>
+      <Pause size={14} />
+    </button>
+  );
+}
 
 async function cancel(id: string) {
   try {
@@ -80,14 +114,6 @@ async function removeTransfers(ids: string[]) {
     }
   }
   remove(removed);
-}
-
-async function reveal(t: Pick<Transfer, "localPath">) {
-  try {
-    await api.revealInFolder(t.localPath);
-  } catch (e) {
-    toast.error("Could not show file", e as AppError);
-  }
 }
 
 const TransferRow = memo(function TransferRow({ id }: { id: string }) {
@@ -120,7 +146,7 @@ const TransferRow = memo(function TransferRow({ id }: { id: string }) {
         </div>
       </div>
       <div className="xprogress">
-        <div className={`pbar ${indeterminate ? "indeterminate" : ""} ${t.status === "queued" ? "queued" : ""}`}>
+        <div className={`pbar ${indeterminate ? "indeterminate" : ""} ${t.status === "queued" ? "queued" : ""} ${t.status === "paused" ? "paused" : ""}`}>
           {!indeterminate && <div className="pbar-fill" style={{ transform: `scaleX(${pct / 100})` }} />}
         </div>
         <div className="xbytes">
@@ -142,6 +168,7 @@ const TransferRow = memo(function TransferRow({ id }: { id: string }) {
             <FolderSearch size={14} />
           </button>
         )}
+        <PauseButton status={t.status} onToggle={(pause) => void setTransferPaused(t.id, pause)} what="transfer" />
         {isActive(t) ? (
           <button className="icon-btn" onClick={() => void cancel(t.id)} title="Cancel">
             <CircleStop size={14} />
@@ -316,16 +343,18 @@ function BatchFiles({ id }: { id: string }) {
       <div className="bsection">Transferring now</div>
       {shown.map((t) => {
         const pct = t.totalBytes > 0 ? Math.min(100, (t.transferredBytes / t.totalBytes) * 100) : 0;
-        const indeterminate = t.status === "queued" || t.transferredBytes === 0;
+        const indeterminate = t.status === "queued" || (t.status === "running" && t.transferredBytes === 0);
         return (
           <div key={t.id} className="bfile">
             <span className="bfile-name mono" title={t.kind === "upload" ? `${t.localPath} → ${t.key}` : `${t.key} → ${t.localPath}`}>
               {t.key}
             </span>
-            <span className={`pbar ${indeterminate ? "indeterminate" : ""} ${t.status === "queued" ? "queued" : ""}`}>
+            <span className={`pbar ${indeterminate ? "indeterminate" : ""} ${t.status === "queued" ? "queued" : ""} ${t.status === "paused" ? "paused" : ""}`}>
               {!indeterminate && <span className="pbar-fill" style={{ transform: `scaleX(${pct / 100})` }} />}
             </span>
-            <span className="bfile-num">{t.status === "queued" ? "Queued" : `${formatBytes(t.transferredBytes)} / ${formatBytes(t.totalBytes)}`}</span>
+            <span className="bfile-num">
+              {t.status === "queued" ? "Queued" : `${t.status === "paused" ? "Paused · " : ""}${formatBytes(t.transferredBytes)} / ${formatBytes(t.totalBytes)}`}
+            </span>
           </div>
         );
       })}
@@ -344,7 +373,7 @@ const BatchRow = memo(function BatchRow({ id }: { id: string }) {
   const indeterminate = b.status === "planning" || (b.status === "queued" && b.doneBytes === 0);
   const StatusIcon = BATCH_STATUS_ICON[b.status];
   const hasProblems = b.failedFiles > 0 || !!b.error;
-  const canExpand = b.errors.length > 0 || !!b.error || b.status === "running" || b.status === "queued";
+  const canExpand = b.errors.length > 0 || !!b.error || b.status === "running" || b.status === "queued" || b.status === "paused";
   const statusText = b.status === "running" ? `${pct.toFixed(0)}%` : BATCH_STATUS_LABEL[b.status];
   const where = batchWhere(b);
   return (
@@ -362,7 +391,7 @@ const BatchRow = memo(function BatchRow({ id }: { id: string }) {
           </div>
         </div>
         <div className="xprogress">
-          <div className={`pbar ${indeterminate ? "indeterminate" : ""} ${b.status === "queued" ? "queued" : ""}`}>
+          <div className={`pbar ${indeterminate ? "indeterminate" : ""} ${b.status === "queued" ? "queued" : ""} ${b.status === "paused" ? "paused" : ""}`}>
             {!indeterminate && <div className="pbar-fill" style={{ transform: `scaleX(${pct / 100})` }} />}
           </div>
           <div className="xbytes">{batchProgressText(b)}</div>
@@ -394,6 +423,7 @@ const BatchRow = memo(function BatchRow({ id }: { id: string }) {
               <ChevronRight size={14} className={expanded ? "rot90" : ""} />
             </button>
           )}
+          <PauseButton status={b.status} onToggle={(pause) => void setBatchPaused(b.id, pause)} what="folder transfer" />
           {active ? (
             <button className="icon-btn" onClick={() => void cancelBatch(b.id)} title="Cancel" aria-label="Cancel folder transfer">
               <CircleStop size={14} />
@@ -463,58 +493,16 @@ function folderOf(keyOrPrefix: string): string {
   return body.slice(0, body.lastIndexOf("/") + 1);
 }
 
-type KnownBucket = (bucket: string | null | undefined) => boolean;
-
-/** Is `bucket` one of the current connection's buckets (listed or added by name)? */
-function useKnownBucket(): KnownBucket {
-  const connected = useApp((s) => !!s.connection);
-  const buckets = useApp((s) => s.buckets);
-  const added = useApp((s) => s.addedBuckets);
-  return useCallback(
-    (bucket) => !!bucket && connected && (buckets.some((b) => b.name === bucket) || added.some((b) => b.name === bucket)),
-    [connected, buckets, added],
-  );
-}
-
-async function openLocal(path: string, what: string) {
-  try {
-    await api.openLocal(path);
-  } catch (e) {
-    toast.error(`Could not open ${what}`, e as AppError);
-  }
-}
-
-/** "Go to …": disabled, with the reason, when the bucket is not in this connection. */
-function goItem(label: string, bucket: string, known: boolean, go: () => void): PopupMenuItem {
-  return known
-    ? { label, icon: <LocateFixed size={14} />, action: go }
-    : {
-        label,
-        icon: <LocateFixed size={14} />,
-        action: () => {},
-        disabled: true,
-        hint: "Other connection",
-        title: `s3://${bucket} is not one of this connection's buckets`,
-      };
-}
-
-const goObject = (bucket: string, key: string) => {
-  closeSearch();
-  revealObject(bucket, key, key.slice(key.lastIndexOf("/") + 1));
-};
-const goFolder = (bucket: string, prefix: string) => {
-  closeSearch();
-  navigate(bucket, prefix);
-};
-
-const copyKeyItem = (key: string): PopupMenuItem => ({ label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(key, "Key") });
-const copyPathItem = (path: string): PopupMenuItem => ({
-  label: "Copy local path",
-  icon: <ClipboardCopy size={14} />,
-  action: () => void copyText(path, "Local path"),
-});
-const showItem = (path: string): PopupMenuItem => ({ label: "Show in folder", icon: <FolderSearch size={14} />, action: () => void reveal({ localPath: path }) });
 const cancelItem = (run: () => void): PopupMenuItem => ({ label: "Cancel", icon: <CircleStop size={14} />, action: run });
+/** Pause (queued or running) or Resume (paused); a disabled Pause with the reason while planning. */
+const pauseItems = (status: string, toggle: (pause: boolean) => void): PopupMenuItem[] =>
+  status === "paused"
+    ? [{ label: "Resume", icon: <Play size={14} />, action: () => toggle(false) }]
+    : status === "running" || status === "queued"
+      ? [{ label: "Pause", icon: <Pause size={14} />, action: () => toggle(true) }]
+      : status === "planning"
+        ? [{ label: "Pause", icon: <Pause size={14} />, action: () => {}, disabled: true, hint: "Planning", title: PLANNING_NO_PAUSE }]
+        : [];
 /**
  * "Remove from list" takes the row away: keep the keyboard focus in the panel by moving it to the
  * next row, else the previous one, else the panel's toggle.
@@ -541,8 +529,8 @@ function transferGroups(t: Transfer, known: boolean, el: HTMLElement | null): Po
   const go = goItem("Go to object", t.bucket, known, () => goObject(t.bucket, t.key));
   const remove = removeItem(el, () => removeTransfers([t.id]));
   if (isActive(t)) {
-    const stop = cancelItem(() => void cancel(t.id));
-    return t.kind === "download" ? [[stop], [go, copyKeyItem(t.key)]] : [[stop], [copyKeyItem(t.key)]];
+    const stop = [...pauseItems(t.status, (pause) => void setTransferPaused(t.id, pause)), cancelItem(() => void cancel(t.id))];
+    return t.kind === "download" ? [stop, [go, copyKeyItem(t.key)]] : [stop, [copyKeyItem(t.key)]];
   }
   if (t.kind === "download") {
     if (t.status === "completed") {
@@ -560,10 +548,10 @@ function transferGroups(t: Transfer, known: boolean, el: HTMLElement | null): Po
 function batchGroups(b: Batch, known: boolean, el: HTMLElement | null): PopupMenuItem[][] {
   const go = goItem("Go to folder", b.bucket, known, () => goFolder(b.bucket, b.prefix));
   const active = isBatchActive(b);
-  const stop = cancelItem(() => void cancelBatch(b.id));
+  const stop = [...pauseItems(b.status, (pause) => void setBatchPaused(b.id, pause)), cancelItem(() => void cancelBatch(b.id))];
   const remove = removeItem(el, () => removeBatches([b.id]));
-  if (b.kind === "upload") return [[go, showItem(b.localPath), copyPathItem(b.localPath)], [active ? stop : remove]];
-  if (active) return [[stop], [go]];
+  if (b.kind === "upload") return [[go, showItem(b.localPath), copyPathItem(b.localPath)], active ? stop : [remove]];
+  if (active) return [stop, [go]];
   if (b.doneFiles > 0) {
     const open: PopupMenuItem[] = refusedToOpen(b.localPath)
       ? []
@@ -697,11 +685,32 @@ function Summary() {
   );
 }
 
+/** "Limited to 2 MiB/s down" while a speed limit is set; opens Settings → Transfers. */
+function LimitNote() {
+  const down = useSettings((s) => s.settings?.downloadLimitKibps ?? null);
+  const up = useSettings((s) => s.settings?.uploadLimitKibps ?? null);
+  if (down === null && up === null) return null;
+  const parts = [down !== null && `${formatLimit(down)} down`, up !== null && `${formatLimit(up)} up`].filter(Boolean);
+  return (
+    <button
+      type="button"
+      className="xlimit"
+      title="Speed limits for all transfers. Change them in Settings → Transfers."
+      onClick={() => openSettings("transfers")}
+    >
+      <Gauge size={12} />
+      Limited to {parts.join(", ")}
+    </button>
+  );
+}
+
 type ActivityRow = { kind: "job" | "transfer" | "batch"; id: string };
 
 /** Bottom panel: transfers (uploads/downloads) and jobs (delete/copy/move), newest first. */
 export function ActivityPanel() {
   const open = useApp((s) => s.transfersOpen);
+  const tab = useActivityTab((s) => s.tab);
+  const historyCount = useHistoryCount();
   const transferIds = useTransfers((s) => s.ids);
   const jobIds = useJobs((s) => s.ids);
   const batchIds = useBatches((s) => s.ids);
@@ -725,6 +734,14 @@ export function ActivityPanel() {
     ];
     return all.sort((a, b) => b.at.localeCompare(a.at));
   }, [jobIds, transferIds, batchIds]);
+
+  // "Pause all" / "Resume all": single transfers and folder transfers (a batch's files follow it).
+  const pausableTransfers = useTransfers((s) => s.ids.some((id) => s.byId[id] && isMoving(s.byId[id])));
+  const pausableBatches = useBatches((s) => s.ids.some((id) => s.byId[id]?.status === "queued" || s.byId[id]?.status === "running"));
+  const pausedTransfers = useTransfers((s) => s.ids.some((id) => s.byId[id]?.status === "paused"));
+  const pausedBatches = useBatches((s) => s.ids.some((id) => s.byId[id]?.status === "paused"));
+  const canPause = pausableTransfers || pausableBatches;
+  const canResume = pausedTransfers || pausedBatches;
 
   const clearFinished = () => {
     const ts = useTransfers.getState();
@@ -751,15 +768,44 @@ export function ActivityPanel() {
           )}
           {active === 0 && total > 0 && <span className="muted small">{total} finished</span>}
         </button>
+        {open && (
+          <div className="segmented xtabs" role="tablist" aria-label="Activity view">
+            <button role="tab" aria-selected={tab === "now"} className={tab === "now" ? "active" : ""} onClick={() => useActivityTab.setState({ tab: "now" })}>
+              Now
+            </button>
+            <button
+              role="tab"
+              aria-selected={tab === "history"}
+              className={tab === "history" ? "active" : ""}
+              onClick={() => useActivityTab.setState({ tab: "history" })}
+            >
+              History
+              {historyCount > 0 && <span className="xtab-count">{historyCount}</span>}
+            </button>
+          </div>
+        )}
         <Summary />
+        <LimitNote />
         <div className="spacer" />
-        {open && finishedCount > 0 && (
+        {canPause && (
+          <button className="link-btn" onClick={() => setAllPaused(true)}>
+            Pause all
+          </button>
+        )}
+        {canResume && (
+          <button className="link-btn" onClick={() => setAllPaused(false)}>
+            Resume all
+          </button>
+        )}
+        {open && tab === "now" && finishedCount > 0 && (
           <button className="link-btn" onClick={clearFinished}>
             Clear finished
           </button>
         )}
+        {open && tab === "history" && <HistoryBar />}
       </div>
-      {open && (
+      {open && tab === "history" && <HistoryList />}
+      {open && tab === "now" && (
         <div className="transfers-body">
           {total === 0 ? (
             <div className="empty-note">Nothing here yet. Uploads, downloads and file operations show their progress here.</div>

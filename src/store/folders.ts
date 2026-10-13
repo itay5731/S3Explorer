@@ -6,7 +6,7 @@ import type { AppError, Batch, FolderEntry } from "../lib/types";
 import { basename } from "../lib/format";
 import { plural, touchesPrefix } from "../lib/ops";
 import { activePane, getPane, openModal, setTransfersOpen } from "./app";
-import { PANE_IDS, type PaneId } from "./panes";
+import { markHiddenTabsStale, PANE_IDS, type PaneId } from "./panes";
 import { uploadPaths } from "./actions";
 import { batchRequest, isBatchActive, onBatchUpdate, useBatches } from "./batches";
 import { notifyInBackground } from "./notify";
@@ -137,10 +137,9 @@ function reportFinished(b: Batch) {
   else toast.success(`${Verb}ed ${plural(b.doneFiles, "file")}`, b.label);
 }
 
-/** Does this batch write into the folder a pane shows? (Downloads never change the listing.) */
-function touchesView(b: Batch, pane: PaneId): boolean {
+/** Does this batch write into the folder at this location? (Downloads never change the listing.) */
+function touchesView(b: Batch, bucket: string | null, prefix: string): boolean {
   if (b.kind !== "upload") return false;
-  const { bucket, prefix } = getPane(pane);
   const req = batchRequest(b.id);
   const destBucket = req?.bucket ?? b.bucket;
   const destPrefix = req?.prefix ?? b.prefix;
@@ -158,8 +157,10 @@ export function installBatchEffects(): () => void {
         notifyInBackground(`${Verb} ${b.status === "failed" ? "finished with problems" : "finished"}`, b.label);
       }
     }
+    markHiddenTabsStale((bucket, prefix) => touchesView(b, bucket, prefix));
     for (const pane of PANE_IDS) {
-      if (!touchesView(b, pane)) continue;
+      const { bucket, prefix } = getPane(pane);
+      if (!touchesView(b, bucket, prefix)) continue;
       if (finished) void scheduleRefresh(true, pane);
       else if (b.status === "running" && (!prev || prev.doneFiles !== b.doneFiles)) void scheduleRefresh(false, pane);
     }

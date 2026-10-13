@@ -18,7 +18,7 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
-use super::{cancellable, plan, set_sparse, write_all_at, PartSettings, TransferEntry, MIB};
+use super::{cancellable, plan, set_sparse, write_all_at, PartSettings, Runner, TransferEntry, MIB};
 use crate::error::{AppError, AppResult, ErrorCode};
 
 /// Consecutive failed attempts without meaningful progress after which a part gives up.
@@ -115,7 +115,7 @@ fn is_checksum_mismatch(e: &(dyn std::error::Error + 'static)) -> bool {
 /// Next body chunk, bounded by [`BODY_IDLE_TIMEOUT`] so a stalled connection cannot hang forever.
 /// Transport errors are `Network` (retryable); a checksum mismatch is not (`Unknown`): retrying
 /// or keeping what was received would accept corrupt data.
-async fn next_chunk(body: &mut aws_sdk_s3::primitives::ByteStream) -> AppResult<Option<bytes::Bytes>> {
+pub(crate) async fn next_chunk(body: &mut aws_sdk_s3::primitives::ByteStream) -> AppResult<Option<bytes::Bytes>> {
     match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.try_next()).await {
         Ok(Ok(c)) => Ok(c),
         Ok(Err(e)) if is_checksum_mismatch(&e) => Err(AppError::new(
@@ -394,7 +394,7 @@ fn verbatim(p: &Path) -> OsString {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     client: &Client,
-    entry: &Arc<TransferEntry>,
+    runner: &Runner<'_>,
     cfg: PartSettings,
     id: &str,
     src: Source<'_>,
@@ -416,11 +416,17 @@ pub(super) async fn run(
     if no_replace && tokio::fs::symlink_metadata(dest).await.is_ok() {
         return Err(exists_error(dest));
     }
-    // Child token: cancelled by the user (parent) or when a sibling part fails.
-    let token = entry.cancel.child_token();
-
-    let head = client.head_object().bucket(src.bucket).key(src.key).set_version_id(src.version_id.map(str::to_string));
-    let head = match cancellable(&token, head.send()).await? {
+    let entry = runner.entry;
+    // A pause before HeadObject answers asks again on resume.
+    let head = loop {
+        let head = client.head_object().bucket(src.bucket).key(src.key).set_version_id(src.version_id.map(str::to_string));
+        match cancellable(&runner.token(), head.send()).await {
+            Ok(r) => break r,
+            Err(e) if entry.interrupted(&e) => runner.pause_point().await?,
+            Err(e) => return Err(e),
+        }
+    };
+    let head = match head {
         Ok(h) => h,
         Err(e) => {
             let e = AppError::from(e);
@@ -433,6 +439,7 @@ pub(super) async fn run(
     };
     let size = head.content_length().unwrap_or(0).max(0) as u64;
     let etag = head.e_tag().map(str::to_string);
+    let modified = head.last_modified().copied();
 
     if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
         tokio::fs::create_dir_all(parent).await?;
@@ -450,13 +457,48 @@ pub(super) async fn run(
 
     let p = plan::plan_download(size, cfg.part_size_mib);
     entry.set_totals(size, p.parts_total());
-    let result = if !p.multipart {
-        let _in_flight = entry.part_started();
-        let span = Span { start: 0, len: size, whole: true };
-        fetch_part(client, entry, src, etag.as_deref(), file.clone(), span, &token).await
-    } else {
-        ranged(client, entry, src, etag, size, p.part_size, p.parts, cfg.max_parts, file.clone(), &token).await
-    };
+    let result = async {
+        if p.multipart {
+            let (f, part_size) = (file.clone(), p.part_size);
+            tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                // Large parts stream far ahead of each other; see `set_sparse` (best effort). Small
+                // parts fill the file nearly in order, where sparse allocation only costs time.
+                if part_size > WHOLE_PART_MAX {
+                    let _ = set_sparse(&f);
+                }
+                f.set_len(size)
+            })
+            .await??;
+        }
+        // Parts finished so far: a resume after a pause fetches only the others.
+        let mut done = vec![false; p.parts as usize];
+        let mut resumed = false;
+        loop {
+            let token = runner.token();
+            let r = async {
+                if resumed {
+                    still_the_same(client, src, etag.as_deref(), size, modified.as_ref(), dest, within, &token).await?;
+                }
+                if !p.multipart {
+                    let _in_flight = entry.part_started();
+                    let span = Span { start: 0, len: size, whole: true };
+                    fetch_part(client, entry, src, etag.as_deref(), file.clone(), span, &token).await
+                } else {
+                    let parts = Parts { size, part_size: p.part_size, max: cfg.max_parts };
+                    ranged(client, entry, src, etag.as_deref(), parts, &mut done, file.clone(), &token).await
+                }
+            }
+            .await;
+            match r {
+                Err(e) if entry.interrupted(&e) => {
+                    runner.pause_point().await?;
+                    resumed = true;
+                }
+                r => return r,
+            }
+        }
+    }
+    .await;
     // Both paths: every byte reaches the disk before the file gets its final name, so a crash
     // right after "completed" never leaves a short or zero-filled file under that name.
     let result = match result {
@@ -503,46 +545,81 @@ pub(super) async fn run(
     }
 }
 
+/// Before a resumed download fetches more: a folder download's destination still has no link on
+/// the way, and, when the server gave no ETag to pin the GETs with, the object still has the size
+/// and Last-Modified seen at the start.
+#[allow(clippy::too_many_arguments)]
+async fn still_the_same(
+    client: &Client,
+    src: Source<'_>,
+    etag: Option<&str>,
+    size: u64,
+    modified: Option<&aws_sdk_s3::primitives::DateTime>,
+    dest: &Path,
+    within: Option<&Path>,
+    token: &CancellationToken,
+) -> AppResult<()> {
+    if let Some(root) = within {
+        let (r, d) = (root.to_path_buf(), dest.to_path_buf());
+        tokio::task::spawn_blocking(move || refuse_links(&r, &d)).await??;
+    }
+    if etag.is_some() {
+        return Ok(()); // every GET carries If-Match
+    }
+    let head = client.head_object().bucket(src.bucket).key(src.key).set_version_id(src.version_id.map(str::to_string));
+    let head = cancellable(token, head.send()).await??;
+    if head.content_length().unwrap_or(0).max(0) as u64 != size || head.last_modified() != modified {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+/// How a ranged download is split.
+#[derive(Debug, Clone, Copy)]
+struct Parts {
+    size: u64,
+    part_size: u64,
+    /// Parts in flight at most.
+    max: usize,
+}
+
+/// Fetches every part not marked in `done` (and marks each one that finishes), at most
+/// `parts.max` at a time.
 #[allow(clippy::too_many_arguments)]
 async fn ranged(
     client: &Client,
     entry: &Arc<TransferEntry>,
     src: Source<'_>,
-    etag: Option<String>,
-    size: u64,
-    part_size: u64,
-    parts: u64,
-    max_parts: usize,
+    etag: Option<&str>,
+    parts: Parts,
+    done: &mut [bool],
     file: Arc<std::fs::File>,
-    token: &CancellationToken,
+    run: &CancellationToken,
 ) -> AppResult<()> {
-    let f = file.clone();
-    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        // Large parts stream far ahead of each other; see `set_sparse` (best effort). Small
-        // parts fill the file nearly in order, where sparse allocation only costs time.
-        if part_size > WHOLE_PART_MAX {
-            let _ = set_sparse(&f);
-        }
-        f.set_len(size)
-    })
-    .await??;
-    let sem = Arc::new(Semaphore::new(max_parts.max(1)));
-    let mut set: JoinSet<AppResult<()>> = JoinSet::new();
+    // Child token: cancelled by the run's (a cancel or a pause) or when a sibling part fails.
+    let token = &run.child_token();
+    let sem = Arc::new(Semaphore::new(parts.max.max(1)));
+    let mut set: JoinSet<AppResult<usize>> = JoinSet::new();
     let mut first_err: Option<AppError> = None;
 
-    let note = |r: Result<AppResult<()>, tokio::task::JoinError>, first_err: &mut Option<AppError>| {
-        let r = r.map_err(AppError::from).and_then(|x| x);
-        if let Err(e) = r {
-            token.cancel();
-            if first_err.is_none() || first_err.as_ref().is_some_and(|f| f.is_cancelled() && !e.is_cancelled()) {
-                *first_err = Some(e);
+    let note = |r: Result<AppResult<usize>, tokio::task::JoinError>, done: &mut [bool], first_err: &mut Option<AppError>| {
+        match r.map_err(AppError::from).and_then(|x| x) {
+            Ok(i) => done[i] = true,
+            Err(e) => {
+                token.cancel();
+                if first_err.is_none() || first_err.as_ref().is_some_and(|f| f.is_cancelled() && !e.is_cancelled()) {
+                    *first_err = Some(e);
+                }
             }
         }
     };
 
-    for i in 0..parts {
+    for i in 0..done.len() {
+        if done[i] {
+            continue;
+        }
         while let Some(r) = set.try_join_next() {
-            note(r, &mut first_err);
+            note(r, done, &mut first_err);
         }
         if first_err.is_some() || token.is_cancelled() {
             break;
@@ -551,10 +628,10 @@ async fn ranged(
             Ok(Ok(p)) => p,
             _ => break,
         };
-        let start = i * part_size;
-        let span = Span { start, len: part_size.min(size - start), whole: false };
+        let start = i as u64 * parts.part_size;
+        let span = Span { start, len: parts.part_size.min(parts.size - start), whole: false };
         let (client, entry, file, token) = (client.clone(), entry.clone(), file.clone(), token.clone());
-        let (bucket, key, etag) = (src.bucket.to_string(), src.key.to_string(), etag.clone());
+        let (bucket, key, etag) = (src.bucket.to_string(), src.key.to_string(), etag.map(str::to_string));
         let version_id = src.version_id.map(str::to_string);
         set.spawn(async move {
             let _permit = permit;
@@ -562,11 +639,11 @@ async fn ranged(
             let src = Source { bucket: &bucket, key: &key, version_id: version_id.as_deref() };
             fetch_part(&client, &entry, src, etag.as_deref(), file, span, &token).await?;
             entry.part_done();
-            Ok(())
+            Ok(i)
         });
     }
     while let Some(r) = set.join_next().await {
-        note(r, &mut first_err);
+        note(r, done, &mut first_err);
     }
 
     if let Some(e) = first_err {
@@ -583,7 +660,8 @@ async fn ranged(
 /// never goes backwards). An error that arrives after every byte of the span was received (a
 /// connection reset or idle timeout after the final byte) completes the part instead of asking
 /// for an empty range; a checksum mismatch is never such an error (it is not `Network`).
-/// Returns once every byte of the span has been handed to the OS.
+/// Returns once every byte of the span has been handed to the OS. A part that is cancelled (or
+/// stopped by a pause) no longer counts its bytes: a resume fetches it again from its start.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_part(
     client: &Client,
@@ -595,11 +673,28 @@ async fn fetch_part(
     token: &CancellationToken,
 ) -> AppResult<()> {
     let mut w = PartWriter::new(file, span.start, span.write_batch());
+    let r = fetch_into(client, entry, src, etag, span, &mut w, token).await;
+    if r.as_ref().is_err_and(AppError::is_cancelled) {
+        entry.sub_bytes(w.next - span.start);
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_into(
+    client: &Client,
+    entry: &TransferEntry,
+    src: Source<'_>,
+    etag: Option<&str>,
+    span: Span,
+    w: &mut PartWriter,
+    token: &CancellationToken,
+) -> AppResult<()> {
     let mut policy = RetryPolicy::new(span.len);
     let end = span.start + span.len;
     loop {
         let before = w.next;
-        let e = match attempt(client, entry, src, etag, span, &mut w, token).await {
+        let e = match attempt(client, entry, src, etag, span, w, token).await {
             Ok(()) => return w.flush().await,
             Err(e) => e,
         };
@@ -614,8 +709,9 @@ async fn fetch_part(
             RetryDecision::GiveUp
         };
         let RetryDecision::Retry(pause) = decision else {
-            // Cancelled or fatal: the temp file is about to be deleted, so only let the write
-            // in flight finish (never leave one running against it) instead of flushing.
+            // Cancelled, paused or fatal: the temp file is about to be deleted (or the part
+            // starts over on resume), so only let the write in flight finish (never leave one
+            // running against it) instead of flushing.
             let _ = w.wait().await;
             return Err(e);
         };
@@ -674,6 +770,8 @@ async fn attempt(
         if w.next + chunk.len() as u64 > end {
             return Err(span.overrun());
         }
+        // Outside `next_chunk`'s idle timeout: holding bytes back is not a stall.
+        cancellable(token, entry.limit.take(chunk.len() as u64)).await?;
         w.push(&chunk).await?;
         entry.add_bytes(chunk.len() as u64);
     }

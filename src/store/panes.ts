@@ -90,6 +90,11 @@ export interface PaneState {
 
   /** Back / Forward (cleared with the pane: disconnect, a new connection). */
   history: PaneHistory;
+
+  /** The tab this state belongs to (see "Tabs" in docs/CONTRACT.md). */
+  tab: number;
+  /** When the listing was last fetched (ms); 0 = never. */
+  listedAt: number;
 }
 
 export const emptyListing: Listing = {
@@ -116,6 +121,10 @@ export const emptySearch: PaneSearch = {
 
 export const SORT_KEY = "s3x.sort";
 
+let tabSeq = 0;
+/** A tab id, unique for the session. */
+export const newTabId = () => ++tabSeq;
+
 /** A pane with nothing open. The sort order is the saved one (shared by both panes as a default). */
 export function freshPane(sort: SortState = readPref<SortState>(SORT_KEY, { key: "name", dir: 1 })): PaneState {
   return {
@@ -131,12 +140,68 @@ export function freshPane(sort: SortState = readPref<SortState>(SORT_KEY, { key:
     scrollTo: null,
     search: emptySearch,
     history: emptyHistory,
+    tab: newTabId(),
+    listedAt: 0,
   };
 }
 
 export type PanesState = Record<PaneId, PaneState>;
 
 export const usePanes = create<PanesState>(() => ({ a: freshPane(), b: freshPane() }));
+
+// ---- tabs ----------------------------------------------------------------------------------
+// A pane's shown tab lives in `usePanes` (so everything that reads a pane reads its shown tab); the
+// others wait here with their whole state until they are shown again (see store/tabs.ts).
+
+export interface TabEntry {
+  id: number;
+  /** The tab's state while it is hidden; null for the shown tab (its state is the pane's). */
+  saved: PaneState | null;
+  /** Something changed the tab's folder while it was hidden: refresh it when it is shown. */
+  stale: boolean;
+  /** A move or delete may have taken the tab's folder away: check when it is shown. */
+  vanished: boolean;
+  /** The table's scroll position when the tab was hidden. */
+  scrollTop: number;
+}
+
+export const tabEntry = (id: number, saved: PaneState | null = null): TabEntry => ({ id, saved, stale: false, vanished: false, scrollTop: 0 });
+
+export type PaneTabs = Record<PaneId, TabEntry[]>;
+
+export const usePaneTabs = create<PaneTabs>(() => ({
+  a: [tabEntry(usePanes.getState().a.tab)],
+  b: [tabEntry(usePanes.getState().b.tab)],
+}));
+
+/** A hidden tab, with its saved state. */
+export type HiddenTab = TabEntry & { saved: PaneState };
+
+/**
+ * Patch hidden tabs: `fn` returns the changes for a tab, or null to leave it. Used by the effects of
+ * jobs, uploads and new folders, which refresh shown panes directly.
+ */
+export function updateHiddenTabs(fn: (t: HiddenTab, pane: PaneId) => Partial<TabEntry> | null) {
+  const cur = usePaneTabs.getState();
+  let changed = false;
+  const next = { ...cur };
+  for (const pane of PANE_IDS) {
+    const list = cur[pane].map((t) => {
+      if (!t.saved) return t;
+      const patch = fn(t as HiddenTab, pane);
+      if (!patch || Object.entries(patch).every(([k, v]) => t[k as keyof TabEntry] === v)) return t;
+      changed = true;
+      return { ...t, ...patch };
+    });
+    next[pane] = list;
+  }
+  if (changed) usePaneTabs.setState(next);
+}
+
+/** Mark hidden tabs whose location passes `test` for a refresh when they are shown. */
+export function markHiddenTabsStale(test: (bucket: string, prefix: string) => boolean) {
+  updateHiddenTabs((t) => (t.saved.bucket !== null && test(t.saved.bucket, t.saved.prefix) ? { stale: true } : null));
+}
 
 /** The pane a component is rendered in; null outside a pane (it then follows the active pane). */
 export const PaneContext = createContext<PaneId | null>(null);

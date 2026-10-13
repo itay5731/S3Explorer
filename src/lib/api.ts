@@ -27,14 +27,17 @@ import {
   type ConnectionConfig,
   type ConnectionInfo,
   type ErrorCode,
+  type FolderSize,
   type Job,
   type JobPreview,
   type JobRequest,
   type LifecycleConfiguration,
   type LifecycleIssue,
   type ListPage,
+  type MetadataEdit,
   type ObjectEntry,
   type ObjectMeta,
+  type ObjectPreview,
   type ProfileInfo,
   type RecentListing,
   type RestoreRequest,
@@ -79,6 +82,8 @@ export interface Backend {
   listObjects(bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number): Promise<ListPage>;
   listRecent(bucket: string, prefix: string): Promise<RecentListing>;
   headObject(bucket: string, key: string): Promise<ObjectMeta>;
+  /** What is inside a file, read into memory without a download (see "Object preview" in the contract). */
+  previewObject(bucket: string, key: string): Promise<ObjectPreview>;
   createFolder(bucket: string, prefix: string): Promise<void>;
   // Shared buckets (added by name)
   listAddedBuckets(): Promise<AddedBucket[]>;
@@ -89,6 +94,8 @@ export interface Backend {
   putBucketTags(bucket: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
   getObjectTags(bucket: string, key: string): Promise<Tag[]>;
   putObjectTags(bucket: string, key: string, tags: Tag[], expected: Tag[]): Promise<Tag[]>;
+  /** Copy the object onto itself with new headers (conditional on `edit.expectedEtag`); the object as read back. */
+  updateObjectMetadata(edit: MetadataEdit): Promise<ObjectMeta>;
   // Lifecycle configuration
   getLifecycle(bucket: string): Promise<LifecycleConfiguration | null>;
   validateLifecycle(config: LifecycleConfiguration): Promise<LifecycleIssue[]>;
@@ -99,6 +106,11 @@ export interface Backend {
   searchObjects(query: SearchQuery, searchId: string): Promise<SearchResult>;
   /** Stop the running search with this id (it rejects `Cancelled`); no-op when none runs. */
   cancelSearch(searchId: string): Promise<void>;
+  // Folder size
+  /** Objects and bytes under `prefix`; a newer call with the same `id` cancels the older one. */
+  folderSize(id: string, bucket: string, prefix: string): Promise<FolderSize>;
+  /** Stop the scan with this id (it rejects `Cancelled`); no-op for an unknown id. */
+  cancelFolderSize(id: string): Promise<void>;
   /** Open a finished download (file or folder) with the OS. */
   openLocal(path: string): Promise<void>;
   // Object operations (jobs)
@@ -113,6 +125,8 @@ export interface Backend {
   previewBatch(request: BatchPlanRequest, previewId?: string): Promise<BatchPreview>;
   startBatch(request: BatchPlanRequest): Promise<string>;
   cancelBatch(id: string): Promise<void>;
+  pauseBatch(id: string): Promise<void>;
+  resumeBatch(id: string): Promise<void>;
   removeBatch(id: string): Promise<void>;
   listBatches(): Promise<Batch[]>;
   onBatchProgress(cb: (b: Batch) => void): Promise<Unlisten>;
@@ -126,6 +140,8 @@ export interface Backend {
   startDownload(bucket: string, key: string, destPath: string): Promise<string>;
   startUpload(bucket: string, key: string, srcPath: string): Promise<string>;
   cancelTransfer(id: string): Promise<void>;
+  pauseTransfer(id: string): Promise<void>;
+  resumeTransfer(id: string): Promise<void>;
   removeTransfer(id: string): Promise<void>;
   listTransfers(): Promise<Transfer[]>;
   onTransferProgress(cb: (t: Transfer) => void): Promise<Unlisten>;
@@ -219,6 +235,7 @@ const tauriBackend: Backend = {
     }),
   listRecent: (bucket, prefix) => invoke<RecentListing>("list_recent", { bucket, prefix }),
   headObject: (bucket, key) => invoke<ObjectMeta>("head_object", { bucket, key }),
+  previewObject: (bucket, key) => invoke<ObjectPreview>("preview_object", { bucket, key }),
   createFolder: (bucket, prefix) => invoke<void>("create_folder", { bucket, prefix }),
   listAddedBuckets: () => invoke<AddedBucket[]>("list_added_buckets"),
   addBucket: (input) => invoke<AddedBucket>("add_bucket", { input }),
@@ -227,12 +244,15 @@ const tauriBackend: Backend = {
   putBucketTags: (bucket, tags, expected) => invoke<Tag[]>("put_bucket_tags", { bucket, tags, expected }),
   getObjectTags: (bucket, key) => invoke<Tag[]>("get_object_tags", { bucket, key }),
   putObjectTags: (bucket, key, tags, expected) => invoke<Tag[]>("put_object_tags", { bucket, key, tags, expected }),
+  updateObjectMetadata: (edit) => invoke<ObjectMeta>("update_object_metadata", { edit }),
   getLifecycle: (bucket) => invoke<LifecycleConfiguration | null>("get_lifecycle", { bucket }),
   validateLifecycle: (config) => invoke<LifecycleIssue[]>("validate_lifecycle", { config }),
   putLifecycle: (bucket, config, expected) => invoke<LifecycleConfiguration | null>("put_lifecycle", { bucket, config, expected }),
   getBucketVersioning: (bucket) => invoke<BucketVersioning>("get_bucket_versioning", { bucket }),
   searchObjects: (query, searchId) => invoke<SearchResult>("search_objects", { query, searchId }),
   cancelSearch: (searchId) => invoke<void>("cancel_search", { searchId }),
+  folderSize: (id, bucket, prefix) => invoke<FolderSize>("folder_size", { id, bucket, prefix }),
+  cancelFolderSize: (id) => invoke<void>("cancel_folder_size", { id }),
   openLocal: (path) => invoke<void>("open_local", { path }),
   previewJob: (request) => invoke<JobPreview>("preview_job", { request }),
   startJob: (request) => invoke<string>("start_job", { request }),
@@ -243,6 +263,8 @@ const tauriBackend: Backend = {
   previewBatch: (request, previewId) => invoke<BatchPreview>("preview_batch", { request, previewId: previewId ?? null }),
   startBatch: (request) => invoke<string>("start_batch", { request }),
   cancelBatch: (id) => invoke<void>("cancel_batch", { id }),
+  pauseBatch: (id) => invoke<void>("pause_batch", { id }),
+  resumeBatch: (id) => invoke<void>("resume_batch", { id }),
   removeBatch: (id) => invoke<void>("remove_batch", { id }),
   listBatches: () => invoke<Batch[]>("list_batches"),
   onBatchProgress: (cb) => listen<Batch>(BATCH_PROGRESS_EVENT, (e) => cb(e.payload)),
@@ -255,6 +277,8 @@ const tauriBackend: Backend = {
   startDownload: (bucket, key, destPath) => invoke<string>("start_download", { bucket, key, destPath }),
   startUpload: (bucket, key, srcPath) => invoke<string>("start_upload", { bucket, key, srcPath }),
   cancelTransfer: (id) => invoke<void>("cancel_transfer", { id }),
+  pauseTransfer: (id) => invoke<void>("pause_transfer", { id }),
+  resumeTransfer: (id) => invoke<void>("resume_transfer", { id }),
   removeTransfer: (id) => invoke<void>("remove_transfer", { id }),
   listTransfers: () => invoke<Transfer[]>("list_transfers"),
   onTransferProgress: (cb) => listen<Transfer>(TRANSFER_PROGRESS_EVENT, (e) => cb(e.payload)),
@@ -389,6 +413,7 @@ export const listObjects = (bucket: string, prefix: string, continuationToken?: 
   call("listObjects", bucket, prefix, continuationToken, pageSize);
 export const listRecent = (bucket: string, prefix: string) => call("listRecent", bucket, prefix);
 export const headObject = (bucket: string, key: string) => call("headObject", bucket, key);
+export const previewObject = (bucket: string, key: string) => call("previewObject", bucket, key);
 export const createFolder = (bucket: string, prefix: string) => call("createFolder", bucket, prefix);
 export const listAddedBuckets = () => call("listAddedBuckets");
 /** `input` is a bucket name, an `s3://` URI or an ARN, as typed (trimmed). */
@@ -402,6 +427,7 @@ export const getObjectTags = (bucket: string, key: string) => call("getObjectTag
 /** Replace the object's tag set; fails with `Conflict` when the current set differs from `expected`. */
 export const putObjectTags = (bucket: string, key: string, tags: Tag[], expected: Tag[]) =>
   call("putObjectTags", bucket, key, tags, expected);
+export const updateObjectMetadata = (edit: MetadataEdit) => call("updateObjectMetadata", edit);
 /** `null` when the bucket has no lifecycle configuration; `NotSupported` when the server has no lifecycle. */
 export const getLifecycle = (bucket: string) => call("getLifecycle", bucket);
 /** Every problem with `config`, placed by rule index and field; `[]` = valid. Local, no network. */
@@ -421,6 +447,12 @@ export const searchObjects = (query: SearchQuery, searchId: string) => call("sea
 /** Stop the running search with this id; it then rejects with `Cancelled`. No-op when none runs. */
 export const cancelSearch = (searchId: string) => call("cancelSearch", searchId);
 /**
+ * Count the objects and bytes under `prefix` (verbatim) by a bounded scan (see "Folder size" in
+ * docs/CONTRACT.md). At most four run at once; `cancelFolderSize(id)` makes this reject `Cancelled`.
+ */
+export const folderSize = (id: string, bucket: string, prefix: string) => call("folderSize", id, bucket, prefix);
+export const cancelFolderSize = (id: string) => call("cancelFolderSize", id);
+/**
  * Open a finished download with the OS default application (a file) or the file manager (a
  * folder). The backend accepts only the local path of a completed download or finished folder
  * download; it refuses files that could run as a program (`NotSupported`).
@@ -437,6 +469,9 @@ export const previewBatch = (request: BatchPlanRequest, previewId?: string) => c
 /** Plan again and start the folder transfer; returns the batch id. */
 export const startBatch = (request: BatchPlanRequest) => call("startBatch", request);
 export const cancelBatch = (id: string) => call("cancelBatch", id);
+/** Pause every queued or running file of the folder transfer; files it starts later start paused. */
+export const pauseBatch = (id: string) => call("pauseBatch", id);
+export const resumeBatch = (id: string) => call("resumeBatch", id);
 export const removeBatch = (id: string) => call("removeBatch", id);
 export const listBatches = () => call("listBatches");
 export const onBatchProgress = (cb: (b: Batch) => void) => call("onBatchProgress", cb);
@@ -475,6 +510,10 @@ export const startDownload = (bucket: string, key: string, destPath: string) =>
   call("startDownload", bucket, key, destPath);
 export const startUpload = (bucket: string, key: string, srcPath: string) => call("startUpload", bucket, key, srcPath);
 export const cancelTransfer = (id: string) => call("cancelTransfer", id);
+/** Stop moving data but keep the finished parts; `paused` gives the run slot back. */
+export const pauseTransfer = (id: string) => call("pauseTransfer", id);
+/** Back to the queue at its place; continues with the missing parts. */
+export const resumeTransfer = (id: string) => call("resumeTransfer", id);
 export const removeTransfer = (id: string) => call("removeTransfer", id);
 export const listTransfers = () => call("listTransfers");
 export const onTransferProgress = (cb: (t: Transfer) => void) => call("onTransferProgress", cb);

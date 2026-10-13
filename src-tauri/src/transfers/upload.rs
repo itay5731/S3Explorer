@@ -1,34 +1,56 @@
 //! Upload: `PutObject` for small files, concurrent multipart upload for large ones.
 
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::task::{ready, Context, Poll};
+use std::time::{Duration, SystemTime};
 
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use aws_sdk_s3::Client;
+use aws_smithy_types::body::SdkBody;
+use bytes::Bytes;
+use http_body::{Body, Frame, SizeHint};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{cancellable, plan, AbortOnDrop, PartSettings, TransferEntry};
+use super::limit::Limiter;
+use super::{cancellable, plan, AbortOnDrop, PartSettings, Runner, TransferEntry};
 use crate::error::{AppError, AppResult, ErrorCode};
 
-/// Slowest uplink assumed healthy: 32 KiB/s (256 kbit/s) in total, shared evenly by every
-/// body-carrying request the app may have in flight at once.
+/// Slowest uplink assumed healthy without a limit: 32 KiB/s (256 kbit/s) in total, shared evenly
+/// by every body-carrying request the app may have in flight at once.
 pub(crate) const UPLOAD_MIN_RATE: u64 = 32 * 1024;
+/// Parts per transfer x transfers at once, both at their setting maximum: the most requests the
+/// upload limiter may split the limit over, whatever the settings are changed to mid-transfer.
+pub(crate) const LIMITED_LINK_SHARE: u64 =
+    crate::models::MAX_CONCURRENT_PARTS_MAX as u64 * crate::models::MAX_CONCURRENT_TRANSFERS_MAX as u64;
 /// Fixed allowance per attempt (connection setup, the server committing the data, latency).
 const UPLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(60);
+/// Cap of the unlimited bound only (see [`upload_attempt_timeout`]).
 const UPLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Per-attempt bound for a request carrying `body_len` bytes when up to `share` such requests
-/// may run at once: `60 s + body_len * share / 32 KiB/s`, at most 6 h. A healthy link at or above
-/// the assumed rate always sends the body and gets the answer within it; a server that takes the
-/// whole body and then never answers is cut off instead of waiting forever.
+/// may run at once and no limit is set: `60 s + body_len * share / 32 KiB/s`, at most 6 h. A healthy
+/// link at or above the assumed rate always sends the body and gets the answer within it; a server
+/// that takes the whole body and then never answers is cut off instead of waiting forever.
 pub(crate) fn upload_attempt_timeout(body_len: u64, share: u64) -> Duration {
     let secs = body_len.saturating_mul(share.max(1)).div_ceil(UPLOAD_MIN_RATE);
     UPLOAD_TIMEOUT_BASE.saturating_add(Duration::from_secs(secs)).min(UPLOAD_TIMEOUT_MAX)
+}
+
+/// Per-attempt bound while the upload limit is `limit` bytes per second:
+/// `60 s + body_len * share / limit`, with no cap. The limiter never lets a request send faster
+/// than its share of the limit, so this is exactly the longest a healthy limited link can take, and
+/// a 6-hour cap would time out every attempt of a large part at a low limit (64 MiB x 320 at
+/// 64 KiB/s is ~91 h) and resend it until the attempts run out.
+fn limited_upload_attempt_timeout(body_len: u64, share: u64, limit: u64) -> Duration {
+    let secs = body_len.saturating_mul(share.max(1)).div_ceil(limit.max(1));
+    UPLOAD_TIMEOUT_BASE.saturating_add(Duration::from_secs(secs))
 }
 
 /// Config override for requests that carry a body (PutObject, UploadPart).
@@ -37,28 +59,145 @@ pub(crate) fn upload_attempt_timeout(body_len: u64, share: u64) -> Duration {
 /// response headers arrive, so it also covers *sending* the body. On a slow uplink a part can
 /// legitimately take minutes to send (100 MiB at 190 KiB/s is ~9 min), and every attempt would
 /// time out and start the part over. These requests replace it with an `operation_attempt_timeout`
-/// scaled to the body size ([`upload_attempt_timeout`]). The SDK still retries a timed-out
-/// attempt (the body is re-read from disk); the connect timeout is inherited from the client.
-fn body_upload_config(cfg: &PartSettings, body_len: u64) -> aws_sdk_s3::config::Builder {
-    let t = cfg.upload_attempt_timeout.unwrap_or_else(|| upload_attempt_timeout(body_len, cfg.link_share));
+/// scaled to the body size. The SDK still retries a timed-out attempt (the body is re-read from
+/// disk); the connect timeout is inherited from the client.
+///
+/// `limit` is the upload limit in bytes per second, read for every request, so a limit switched on
+/// (or changed) mid-transfer counts for the parts sent from then on; a part already in flight keeps
+/// the bound it was sent with. While it is set the bound comes from the limit itself with the share
+/// [`LIMITED_LINK_SHARE`] ([`limited_upload_attempt_timeout`]); otherwise it assumes
+/// [`UPLOAD_MIN_RATE`] shared by this transfer's requests ([`upload_attempt_timeout`]).
+fn body_upload_config(cfg: &PartSettings, body_len: u64, limit: Option<u64>) -> aws_sdk_s3::config::Builder {
+    let t = cfg.upload_attempt_timeout.unwrap_or_else(|| attempt_bound(cfg, body_len, limit));
     aws_sdk_s3::config::Builder::default()
         .timeout_config(TimeoutConfig::builder().disable_read_timeout().operation_attempt_timeout(t).build())
 }
 
+/// The per-attempt bound for a request of this transfer under upload limit `limit` (bytes/s).
+fn attempt_bound(cfg: &PartSettings, body_len: u64, limit: Option<u64>) -> Duration {
+    match limit {
+        Some(limit) => limited_upload_attempt_timeout(body_len, LIMITED_LINK_SHARE.max(cfg.link_share), limit),
+        None => upload_attempt_timeout(body_len, cfg.link_share),
+    }
+}
+
+/// A request body that takes tokens from the upload limiter for each chunk before handing it to
+/// the HTTP client. Rebuilt with the body for every SDK retry, so a retried part is throttled too.
+struct Throttled {
+    inner: Pin<Box<SdkBody>>,
+    limiter: Arc<Limiter>,
+    /// A chunk read from disk with its limiter ticket, held until the limiter lets it go.
+    held: Option<(f64, Frame<Bytes>)>,
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl Drop for Throttled {
+    /// The HTTP client dropped the body while a chunk waited for the limiter (cancel, pause, an
+    /// attempt timeout): its bytes were never sent, so give them back.
+    fn drop(&mut self) {
+        if let Some((ticket, frame)) = &self.held {
+            self.limiter.refund(*ticket, frame.data_ref().map_or(0, |d| d.len() as u64));
+        }
+    }
+}
+
+impl Body for Throttled {
+    type Data = Bytes;
+    type Error = aws_smithy_types::body::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let this = self.get_mut();
+        loop {
+            if let Some((ticket, _)) = &this.held {
+                if let Some(sleep) = &mut this.sleep {
+                    ready!(sleep.as_mut().poll(cx));
+                    this.sleep = None;
+                }
+                match this.limiter.delay(*ticket) {
+                    Some(d) => this.sleep = Some(Box::pin(tokio::time::sleep(d))),
+                    None => return Poll::Ready(this.held.take().map(|(_, frame)| Ok(frame))),
+                }
+                continue;
+            }
+            let frame = match ready!(this.inner.as_mut().poll_frame(cx)) {
+                Some(Ok(frame)) => frame,
+                other => return Poll::Ready(other),
+            };
+            let n = frame.data_ref().map_or(0, |d| d.len() as u64);
+            match (n > 0).then(|| this.limiter.reserve(n)).flatten() {
+                Some(ticket) => this.held = Some((ticket, frame)),
+                None => return Poll::Ready(Some(Ok(frame))),
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.held.is_none() && self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let inner = Body::size_hint(self.inner.as_ref().get_ref());
+        let held = self.held.as_ref().and_then(|(_, f)| f.data_ref()).map_or(0, |d| d.len() as u64);
+        let mut hint = SizeHint::new();
+        hint.set_lower(inner.lower() + held);
+        if let Some(upper) = inner.upper() {
+            hint.set_upper(upper + held);
+        }
+        hint
+    }
+}
+
+/// `body` paced by `limiter` (still replayable when `body` is).
+fn throttled(body: ByteStream, limiter: &Arc<Limiter>) -> ByteStream {
+    let limiter = limiter.clone();
+    body.map(move |inner| {
+        SdkBody::from_body_1_x(Throttled { inner: Box::pin(inner), limiter: limiter.clone(), held: None, sleep: None })
+    })
+}
+
+/// The local file as it was when the upload started (see [`Source::check`]).
+struct Source<'a> {
+    path: &'a Path,
+    size: u64,
+    modified: Option<SystemTime>,
+    /// A folder upload's file: a link swapped in after planning is not followed.
+    planned: bool,
+}
+
+impl Source<'_> {
+    /// Before a resumed upload sends more: the file must still be the one whose first parts went
+    /// up (same size and modified time, and not a link where a folder upload planned a file).
+    async fn check(&self) -> AppResult<()> {
+        if self.planned && tokio::fs::symlink_metadata(self.path).await?.file_type().is_symlink() {
+            return Err(AppError::invalid(format!("Not uploaded: {} is now a link to another location", self.path.display())));
+        }
+        let meta = tokio::fs::metadata(self.path).await?;
+        if meta.len() != self.size || meta.modified().ok() != self.modified {
+            return Err(AppError::new(
+                ErrorCode::Unknown,
+                format!("{} changed while the upload was paused; it was not uploaded", self.path.display()),
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub(super) async fn run(
     client: &Client,
-    entry: &Arc<TransferEntry>,
+    runner: &Runner<'_>,
     cfg: PartSettings,
     bucket: &str,
     key: &str,
     src: &Path,
 ) -> AppResult<()> {
+    let entry = runner.entry;
     if key.is_empty() {
         return Err(AppError::invalid("Object key is required"));
     }
     // A folder upload planned a regular file; a link swapped in since then is not followed.
     // (A file the user picked on its own may be a link: that keeps working.)
-    if entry.lock().batch_id.is_some() && tokio::fs::symlink_metadata(src).await?.file_type().is_symlink() {
+    let planned = entry.lock().batch_id.is_some();
+    if planned && tokio::fs::symlink_metadata(src).await?.file_type().is_symlink() {
         return Err(AppError::invalid(format!("Not uploaded: {} is now a link to another location", src.display())));
     }
     let meta = tokio::fs::metadata(src).await?;
@@ -66,28 +205,39 @@ pub(super) async fn run(
         return Err(AppError::invalid(format!("Not a file: {}", src.display())));
     }
     let size = meta.len();
+    let source = Source { path: src, size, modified: meta.modified().ok(), planned };
     let content_type = mime_guess::from_path(src).first_or_octet_stream().essence_str().to_string();
-    let token = entry.cancel.child_token();
 
     let p = plan::plan_upload(size, cfg.part_size_mib);
     entry.set_totals(size, p.parts_total());
     if !p.multipart {
-        let _in_flight = entry.part_started();
-        let body = ByteStream::from_path(src).await?;
-        cancellable(
-            &token,
-            client
+        // A pause stops the request; resuming sends the whole file again.
+        loop {
+            let in_flight = entry.part_started();
+            let body = throttled(ByteStream::from_path(src).await?, &entry.limit);
+            let put = client
                 .put_object()
                 .bucket(bucket)
                 .key(key)
-                .content_type(content_type)
+                .content_type(&content_type)
                 .content_length(size as i64)
                 .body(body)
                 .customize()
-                .config_override(body_upload_config(&cfg, size))
-                .send(),
-        )
-        .await??;
+                .config_override(body_upload_config(&cfg, size, entry.limit.bytes_per_sec()))
+                .send();
+            match cancellable(&runner.token(), put).await {
+                Ok(r) => {
+                    r?;
+                    break;
+                }
+                Err(e) if entry.interrupted(&e) => {
+                    drop(in_flight);
+                    runner.pause_point().await?;
+                    source.check().await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         entry.add_bytes(size);
         entry.part_done();
         return Ok(());
@@ -95,11 +245,11 @@ pub(super) async fn run(
 
     let (part_size, parts) = (p.part_size, p.parts);
 
-    if token.is_cancelled() {
+    if entry.cancel.is_cancelled() {
         return Err(AppError::cancelled());
     }
     // Not cancellable: dropping it mid-flight could leave an upload id we never learn about
-    // (and so can never abort). Cancellation is checked right after instead.
+    // (and so can never abort). Cancellation (or a pause) is checked right after instead.
     let created = client.create_multipart_upload().bucket(bucket).key(key).content_type(content_type).send().await?;
     let upload_id = created
         .upload_id()
@@ -109,10 +259,28 @@ pub(super) async fn run(
     let mut guard = AbortOnDrop::new(client, bucket, key, &upload_id);
 
     let result = async {
-        if token.is_cancelled() {
-            return Err(AppError::cancelled());
+        // ETags of the parts sent so far: a pause keeps them (and the upload id), and a resume
+        // sends only the others, after checking the file did not change meanwhile.
+        let mut etags: Vec<Option<String>> = vec![None; parts as usize];
+        loop {
+            let token = runner.token();
+            match upload_parts(client, entry, cfg, bucket, key, &upload_id, src, size, part_size, &mut etags, &token).await {
+                Ok(()) => break,
+                Err(e) if entry.interrupted(&e) => {
+                    runner.pause_point().await?;
+                    source.check().await?;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        let completed = upload_parts(client, entry, cfg, bucket, key, &upload_id, src, size, part_size, parts, &token).await?;
+        let completed = etags
+            .into_iter()
+            .enumerate()
+            .map(|(i, etag)| {
+                let etag = etag.ok_or_else(|| AppError::new(ErrorCode::Unknown, format!("Part {} missing", i + 1)))?;
+                Ok(CompletedPart::builder().part_number((i + 1) as i32).e_tag(etag).build())
+            })
+            .collect::<AppResult<Vec<_>>>()?;
         // Not cancellable either: once all parts are up, let Complete finish so the reported
         // status always matches whether the object was actually committed.
         client
@@ -136,6 +304,7 @@ pub(super) async fn run(
     Ok(())
 }
 
+/// Sends every part whose slot in `etags` is empty (and fills it), at most `cfg.max_parts` at a time.
 #[allow(clippy::too_many_arguments)]
 async fn upload_parts(
     client: &Client,
@@ -147,16 +316,17 @@ async fn upload_parts(
     src: &Path,
     size: u64,
     part_size: u64,
-    parts: u64,
-    token: &CancellationToken,
-) -> AppResult<Vec<CompletedPart>> {
+    etags: &mut [Option<String>],
+    run: &CancellationToken,
+) -> AppResult<()> {
+    // Child token: cancelled by the run's (a cancel or a pause) or when a sibling part fails.
+    let token = &run.child_token();
     let sem = Arc::new(Semaphore::new(cfg.max_parts.max(1)));
     let mut set: JoinSet<AppResult<(i32, String)>> = JoinSet::new();
-    let mut etags: Vec<Option<String>> = vec![None; parts as usize];
     let mut first_err: Option<AppError> = None;
 
     let note = |r: Result<AppResult<(i32, String)>, tokio::task::JoinError>,
-                etags: &mut Vec<Option<String>>,
+                etags: &mut [Option<String>],
                 first_err: &mut Option<AppError>| {
         match r.map_err(AppError::from).and_then(|x| x) {
             Ok((n, etag)) => {
@@ -173,9 +343,12 @@ async fn upload_parts(
         }
     };
 
-    for i in 0..parts {
+    for i in 0..etags.len() {
+        if etags[i].is_some() {
+            continue;
+        }
         while let Some(r) = set.try_join_next() {
-            note(r, &mut etags, &mut first_err);
+            note(r, etags, &mut first_err);
         }
         if first_err.is_some() || token.is_cancelled() {
             break;
@@ -184,7 +357,7 @@ async fn upload_parts(
             Ok(Ok(p)) => p,
             _ => break,
         };
-        let offset = i * part_size;
+        let offset = i as u64 * part_size;
         let len = part_size.min(size - offset);
         let part_number = (i + 1) as i32;
         let (client, entry, token) = (client.clone(), entry.clone(), token.clone());
@@ -201,6 +374,7 @@ async fn upload_parts(
                 .build()
                 .await
                 .map_err(|e| AppError::new(ErrorCode::Io, format!("Could not read {}: {e}", src.display())))?;
+            let body = throttled(body, &entry.limit);
             let resp = cancellable(
                 &token,
                 client
@@ -212,7 +386,7 @@ async fn upload_parts(
                     .content_length(len as i64)
                     .body(body)
                     .customize()
-                    .config_override(body_upload_config(&cfg, len))
+                    .config_override(body_upload_config(&cfg, len, entry.limit.bytes_per_sec()))
                     .send(),
             )
             .await??;
@@ -226,7 +400,7 @@ async fn upload_parts(
         });
     }
     while let Some(r) = set.join_next().await {
-        note(r, &mut etags, &mut first_err);
+        note(r, etags, &mut first_err);
     }
 
     if let Some(e) = first_err {
@@ -235,20 +409,61 @@ async fn upload_parts(
     if token.is_cancelled() {
         return Err(AppError::cancelled());
     }
-    etags
-        .into_iter()
-        .enumerate()
-        .map(|(i, etag)| {
-            let etag = etag.ok_or_else(|| AppError::new(ErrorCode::Unknown, format!("Part {} missing", i + 1)))?;
-            Ok(CompletedPart::builder().part_number((i + 1) as i32).e_tag(etag).build())
-        })
-        .collect()
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transfers::MIB;
+
+    #[test]
+    fn a_limited_upload_sizes_its_timeout_from_the_limit_without_a_cap() {
+        let cfg = PartSettings { part_size_mib: Some(8), max_parts: 1, link_share: 1, upload_attempt_timeout: None };
+        assert_eq!(LIMITED_LINK_SHARE, 320);
+        // At the lowest limit split over every request the settings allow, a part still makes it,
+        // even when its real send time is far past the 6 h cap of the unlimited bound.
+        let min_limit = u64::from(crate::models::BANDWIDTH_LIMIT_KIBPS_MIN) * 1024;
+        assert_eq!(min_limit, 64 * 1024);
+        for len in [5 * MIB, 8 * MIB, 64 * MIB] {
+            let send = Duration::from_secs(len * LIMITED_LINK_SHARE / min_limit);
+            let bound = attempt_bound(&cfg, len, Some(min_limit));
+            assert!(bound > send, "{len}: {bound:?} vs {send:?}");
+        }
+        let send_64 = Duration::from_secs(64 * MIB * LIMITED_LINK_SHARE / min_limit);
+        assert!(send_64 > UPLOAD_TIMEOUT_MAX, "the case the cap broke: {send_64:?}");
+        assert_eq!(attempt_bound(&cfg, 64 * MIB, Some(min_limit)), UPLOAD_TIMEOUT_BASE + send_64);
+        // A transfer sharing wider than the settings maximum still gets its own share.
+        let wide = PartSettings { link_share: 640, ..cfg };
+        assert!(attempt_bound(&wide, 8 * MIB, Some(min_limit)) > attempt_bound(&cfg, 8 * MIB, Some(min_limit)));
+        // No overflow.
+        assert!(attempt_bound(&cfg, u64::MAX, Some(1)) > UPLOAD_TIMEOUT_MAX);
+        assert_eq!(limited_upload_attempt_timeout(MIB, 1, 0), limited_upload_attempt_timeout(MIB, 1, 1));
+        // Unlimited: the old behaviour, 32 KiB/s per this transfer's share, capped at 6 h.
+        assert_eq!(attempt_bound(&cfg, 8 * MIB, None), upload_attempt_timeout(8 * MIB, 1));
+        let busy = PartSettings { link_share: 320, ..cfg };
+        assert_eq!(attempt_bound(&busy, 64 * MIB, None), UPLOAD_TIMEOUT_MAX);
+    }
+
+    /// A throttled body dropped while its chunk waits refunds the chunk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_throttled_body_refunds_its_held_chunk() {
+        let limiter = Arc::new(Limiter::new(Some(64)));
+        limiter.take(super::super::limit::BURST).await;
+        let body = throttled(ByteStream::from(vec![0u8; 4 * 1024 * 1024]), &limiter);
+        let mut inner = body.into_inner();
+        // Poll once: the 4 MiB chunk reserves ~64 s of tickets and is held.
+        let polled = tokio::time::timeout(
+            Duration::from_millis(100),
+            std::future::poll_fn(|cx| Pin::new(&mut inner).poll_frame(cx)),
+        )
+        .await;
+        assert!(polled.is_err(), "the chunk waits for the limiter");
+        drop(inner);
+        let t = tokio::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(2), limiter.take(16 * 1024)).await.expect("no phantom delay");
+        assert!(t.elapsed() < Duration::from_millis(600), "{:?}", t.elapsed());
+    }
 
     #[test]
     fn attempt_timeout_scales_with_body_and_sharing() {

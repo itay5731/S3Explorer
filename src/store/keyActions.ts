@@ -32,9 +32,15 @@ import { getSelected } from "./view";
 import { rerunSearch, scheduleSearch, setSearchScope, useSearch } from "./search";
 import { openSettings, useSettings } from "./settings";
 import { toast } from "./toasts";
-import { currentKeys, focusBuckets, focusPaneList, listKeys, searchInput, setCheatOpen, useKeys, type MoveTarget } from "./keyboard";
+import { currentKeys, focusBuckets, focusPaneList, focusPaneListSoon, listKeys, searchInput, setCheatOpen, useKeys, type MoveTarget } from "./keyboard";
 import { requestVersionsOpen, useVersioning, hasVersions } from "./versions";
+import { closeTab, cycleTab, openTab, reopenClosedTab } from "./tabs";
 import { useRowDragView } from "../components/RowDrag";
+import { toggleBookmark } from "./bookmarks";
+import { calculateFolderSizes } from "./folderSizes";
+import { MAX_EDIT_BYTES } from "../lib/metadata";
+import { canPauseAll, canResumeAll, setAllPaused } from "./pause";
+import { useActivityTab } from "../components/ActivityHistory";
 
 /** What a handler did: nothing to do here (`false`: the key keeps its usual meaning), or why it can't. */
 type Outcome = void | boolean | { unavailable: string };
@@ -102,7 +108,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     const { bucket, search } = getPane();
     if (!bucket) return;
     if (search.open) rerunSearch();
-    else refresh();
+    else void refresh();
   },
   "nav.focusFiles": () => {
     focusPaneList(activePane());
@@ -121,6 +127,11 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     setSearchScope(next);
     toast.info(next === "bucket" ? "Search: the whole bucket" : "Search: this folder");
   },
+  "nav.bookmark": () => {
+    const { bucket, prefix } = getPane();
+    if (!bucket) return no(OPEN_BUCKET);
+    toggleBookmark(bucket, prefix);
+  },
   "nav.nextPane": () => {
     const other = shownOtherPane();
     if (!other) return false;
@@ -133,12 +144,40 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     setActivePane(other);
     focusPaneList(other);
   },
+  "tab.new": () => {
+    if (!getPane().bucket) return no(OPEN_BUCKET);
+    afterTabSwitch(() => openTab(activePane(), null, true));
+  },
+  // Always used, even with nothing to do: the key must never reach the webview.
+  "tab.close": () => {
+    afterTabSwitch(() => closeTab(activePane()));
+  },
+  "tab.next": () => {
+    afterTabSwitch(() => cycleTab(activePane(), 1));
+  },
+  "tab.prev": () => {
+    afterTabSwitch(() => cycleTab(activePane(), -1));
+  },
+  "tab.reopen": () => {
+    if (!reopenClosedTab()) return no("No closed tab to reopen");
+    focusPaneListSoon(activePane());
+  },
   "view.single": () => setSplit(false),
   "view.split": () => setSplit(true),
   "view.details": () => {
+    if (!getPane().bucket) return no(OPEN_BUCKET);
     setDetailsOpen(!useApp.getState().detailsOpen);
   },
   "view.activity": () => setTransfersOpen(!useApp.getState().transfersOpen),
+  // Opens Activity on its History tab; pressed again while it shows History, closes the panel.
+  "view.history": () => {
+    const open = useApp.getState().transfersOpen;
+    if (open && useActivityTab.getState().tab === "history") setTransfersOpen(false);
+    else {
+      useActivityTab.setState({ tab: "history" });
+      setTransfersOpen(true);
+    }
+  },
   "view.settings": () => openSettings(),
   "help.shortcuts": () => setCheatOpen(!useKeys.getState().cheatOpen),
 
@@ -249,8 +288,46 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     if (!folders.length && !objects.some((o) => isArchiveClass(o.storageClass))) return no("None of the selected objects is archived");
     requestRestoreArchived();
   },
+  "act.preview": () => {
+    const { folders, objects } = selection();
+    if (!getPane().bucket) return no(OPEN_BUCKET);
+    if (folders.length || objects.length !== 1) return no("Select one file to preview it");
+    openModal({ kind: "quickLook" });
+  },
+  "act.editMetadata": () => {
+    const { bucket } = getPane();
+    const { folders, objects } = selection();
+    if (!bucket) return no(OPEN_BUCKET);
+    if (folders.length || objects.length !== 1) return no("Select one file to edit its metadata");
+    if (isArchiveClass(objects[0].storageClass)) return no("Objects in Glacier or Deep Archive can’t be edited");
+    if (blockedSingle()) return no(ARCHIVED_REASON);
+    if (objects[0].size > MAX_EDIT_BYTES) return no("Objects over 5 GiB can’t be edited");
+    openModal({ kind: "editMetadata", bucket, key: objects[0].key });
+  },
+  "act.folderSize": () => {
+    const { bucket } = getPane();
+    const { folders } = selection();
+    if (!bucket) return no(OPEN_BUCKET);
+    if (!folders.length) return no("Select a folder to calculate its size");
+    calculateFolderSizes(bucket, folders.map((f) => f.prefix));
+  },
+  "act.pauseAll": () => {
+    if (!canPauseAll()) return no("Nothing to pause");
+    setAllPaused(true);
+  },
+  "act.resumeAll": () => {
+    if (!canResumeAll()) return no("Nothing to resume");
+    setAllPaused(false);
+  },
   "act.disconnect": () => requestDisconnect(),
 };
+
+/** Switch tabs from the keyboard: the shown tab's list keeps the keyboard if the pane had it. */
+function afterTabSwitch(fn: () => boolean) {
+  const pane = activePane();
+  const inPane = !!document.activeElement?.closest(`[data-pane="${pane}"]`);
+  if (fn() && inPane) focusPaneListSoon(pane);
+}
 
 function selectedKeys(): string[] {
   const { folders, objects } = selection();

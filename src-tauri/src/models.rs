@@ -176,6 +176,27 @@ pub struct ObjectMeta {
     pub restore: Option<RestoreStatus>,
     /// v0.5.0: true when the object must be restored before it can be read.
     pub archived: bool,
+    /// Edit metadata (after v0.7.0): shown as "before" in the edit dialog.
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+}
+
+/// One object's headers to write by copying it onto itself (`MetadataEdit` in `types.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MetadataEdit {
+    pub bucket: String,
+    /// Verbatim.
+    pub key: String,
+    /// The ETag the dialog showed; the copy is conditional on it.
+    pub expected_etag: String,
+    /// The LastModified the dialog showed (ISO-8601); the copy is conditional on it too.
+    pub expected_last_modified: String,
+    pub content_type: String,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    /// User metadata; replaces the old set entirely.
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +211,8 @@ pub enum TransferKind {
 pub enum TransferStatus {
     Queued,
     Running,
+    /// Stopped by the user; keeps its finished parts and no run slot (see `pause_transfer`).
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -197,7 +220,7 @@ pub enum TransferStatus {
 
 impl TransferStatus {
     pub fn is_active(self) -> bool {
-        matches!(self, TransferStatus::Queued | TransferStatus::Running)
+        matches!(self, TransferStatus::Queued | TransferStatus::Running | TransferStatus::Paused)
     }
 }
 
@@ -295,7 +318,8 @@ pub struct AppSettings {
     pub max_concurrent_transfers: u32,
     #[serde(default)]
     pub theme: ThemeMode,
-    #[serde(default)]
+    /// v0.8.0: on by default (a file without it loads `true`, like `Default`).
+    #[serde(default = "default_true")]
     pub check_updates_on_startup: bool,
     #[serde(default = "default_notify_on_finish")]
     pub notify_on_finish: bool,
@@ -318,7 +342,20 @@ pub struct AppSettings {
     /// actions whose chords differ from the frontend defaults; unknown ids are kept.
     #[serde(default)]
     pub keybindings: BTreeMap<String, Vec<String>>,
+    /// Bandwidth limits in KiB/s, each shared by all transfers in that direction; `None` =
+    /// unlimited (see `transfers::limit`).
+    #[serde(default)]
+    pub download_limit_kibps: Option<u32>,
+    #[serde(default)]
+    pub upload_limit_kibps: Option<u32>,
+    /// v0.8.0: the details panel previews the selected file on its own; off = a "Preview" button.
+    #[serde(default = "default_true")]
+    pub preview_automatically: bool,
 }
+
+/// Inclusive range of the bandwidth limits (mirror `BANDWIDTH_LIMITS` in `types.ts`).
+pub const BANDWIDTH_LIMIT_KIBPS_MIN: u32 = 64;
+pub const BANDWIDTH_LIMIT_KIBPS_MAX: u32 = 1_048_576;
 
 /// Limits on `keybindings` (mirror `KEYBINDING_LIMITS` in `types.ts`).
 pub const KEYBINDINGS_MAX_ACTIONS: usize = 200;
@@ -347,6 +384,10 @@ fn default_max_concurrent_transfers() -> u32 {
     DEFAULT_MAX_CONCURRENT_TRANSFERS
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_notify_on_finish() -> bool {
     true
 }
@@ -370,7 +411,7 @@ impl Default for AppSettings {
             max_concurrent_parts: DEFAULT_MAX_CONCURRENT_PARTS,
             max_concurrent_transfers: DEFAULT_MAX_CONCURRENT_TRANSFERS,
             theme: ThemeMode::System,
-            check_updates_on_startup: false,
+            check_updates_on_startup: default_true(),
             notify_on_finish: default_notify_on_finish(),
             text_size: DEFAULT_TEXT_SIZE,
             text_weight: DEFAULT_TEXT_WEIGHT,
@@ -378,6 +419,9 @@ impl Default for AppSettings {
             confirm_copy_move: default_confirm_copy_move(),
             file_manager_command: None,
             keybindings: BTreeMap::new(),
+            download_limit_kibps: None,
+            upload_limit_kibps: None,
+            preview_automatically: default_true(),
         }
     }
 }
@@ -406,6 +450,10 @@ fn theme_error() -> crate::error::AppError {
 
 fn check_updates_error() -> crate::error::AppError {
     crate::error::AppError::invalid("checkUpdatesOnStartup must be true or false")
+}
+
+fn preview_automatically_error() -> crate::error::AppError {
+    crate::error::AppError::invalid("previewAutomatically must be true or false")
 }
 
 fn notify_error() -> crate::error::AppError {
@@ -497,6 +545,25 @@ fn keybindings_from_json(v: Option<&serde_json::Value>) -> crate::error::AppResu
     Ok(map)
 }
 
+fn bandwidth_error(field: &str) -> crate::error::AppError {
+    crate::error::AppError::invalid(format!(
+        "{field} must be an integer from {BANDWIDTH_LIMIT_KIBPS_MIN} to {BANDWIDTH_LIMIT_KIBPS_MAX}, or null for unlimited"
+    ))
+}
+
+fn bandwidth_ok(v: Option<u32>) -> bool {
+    v.is_none_or(|v| (BANDWIDTH_LIMIT_KIBPS_MIN..=BANDWIDTH_LIMIT_KIBPS_MAX).contains(&v))
+}
+
+/// Strict parse of a bandwidth field: present, and `null` or an in-range integer.
+fn bandwidth_from_json(obj: &serde_json::Map<String, serde_json::Value>, field: &str) -> crate::error::AppResult<Option<u32>> {
+    match obj.get(field) {
+        Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => json_u32(v).filter(|n| bandwidth_ok(Some(*n))).map(Some).ok_or_else(|| bandwidth_error(field)),
+        None => Err(bandwidth_error(field)),
+    }
+}
+
 fn accent_error() -> crate::error::AppError {
     crate::error::AppError::invalid(r#"accent must be "yellow", "green", "blue" or "red""#)
 }
@@ -528,7 +595,8 @@ fn json_u32(v: &serde_json::Value) -> Option<u32> {
 
 impl AppSettings {
     /// Rejects (`InvalidInput`, naming the field and its range) the first out-of-range field.
-    /// `theme`, `checkUpdatesOnStartup` and `notifyOnFinish` are valid by construction.
+    /// `theme`, `checkUpdatesOnStartup`, `notifyOnFinish` and `previewAutomatically` are valid by
+    /// construction.
     pub fn validate(&self) -> crate::error::AppResult<()> {
         if !part_size_ok(self.part_size_mib) {
             return Err(part_size_error());
@@ -549,6 +617,12 @@ impl AppSettings {
             return Err(file_manager_error());
         }
         validate_keybindings(&self.keybindings)?;
+        if !bandwidth_ok(self.download_limit_kibps) {
+            return Err(bandwidth_error("downloadLimitKibps"));
+        }
+        if !bandwidth_ok(self.upload_limit_kibps) {
+            return Err(bandwidth_error("uploadLimitKibps"));
+        }
         Ok(())
     }
 
@@ -571,6 +645,8 @@ impl AppSettings {
             text_weight: if text_weight_ok(self.text_weight) { self.text_weight } else { d.text_weight },
             file_manager_command: normalize_file_manager_command(self.file_manager_command.as_deref()).unwrap_or(None),
             keybindings: if validate_keybindings(&self.keybindings).is_ok() { self.keybindings } else { d.keybindings },
+            download_limit_kibps: self.download_limit_kibps.filter(|n| bandwidth_ok(Some(*n))),
+            upload_limit_kibps: self.upload_limit_kibps.filter(|n| bandwidth_ok(Some(*n))),
             ..self
         }
     }
@@ -629,15 +705,23 @@ impl AppSettings {
                 .and_then(|c| normalize_file_manager_command(Some(c)).ok().flatten()),
             // Missing or malformed (any rule broken) -> no overrides.
             keybindings: keybindings_from_json(obj.get("keybindings")).unwrap_or_default(),
+            // Missing, null or invalid -> unlimited.
+            download_limit_kibps: bandwidth_from_json(obj, "downloadLimitKibps").unwrap_or(None),
+            upload_limit_kibps: bandwidth_from_json(obj, "uploadLimitKibps").unwrap_or(None),
+            preview_automatically: obj
+                .get("previewAutomatically")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(d.preview_automatically),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all twelve fields must be present
+    /// Strict parse of the `update_settings` argument: all fifteen fields must be present
     /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`; `keybindings` an
-    /// object of chord arrays within [`validate_keybindings`]'s limits). Transfer
+    /// object of chord arrays within [`validate_keybindings`]'s limits; `downloadLimitKibps` and
+    /// `uploadLimitKibps` `null` or an integer within the bandwidth range). Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
-    /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup` and
-    /// `notifyOnFinish` and `confirmCopyMove` booleans. Anything else is
+    /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup`,
+    /// `notifyOnFinish`, `confirmCopyMove` and `previewAutomatically` booleans. Anything else is
     /// `InvalidInput` naming the field.
     /// Unknown fields are ignored.
     pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
@@ -686,6 +770,12 @@ impl AppSettings {
                 _ => return Err(file_manager_error()),
             },
             keybindings: keybindings_from_json(obj.get("keybindings"))?,
+            download_limit_kibps: bandwidth_from_json(obj, "downloadLimitKibps")?,
+            upload_limit_kibps: bandwidth_from_json(obj, "uploadLimitKibps")?,
+            preview_automatically: obj
+                .get("previewAutomatically")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(preview_automatically_error)?,
         };
         s.validate()?;
         Ok(s)
@@ -1048,6 +1138,7 @@ pub enum BatchStatus {
     Planning,
     Queued,
     Running,
+    Paused,
     Completed,
     Failed,
     Cancelled,
@@ -1055,7 +1146,7 @@ pub enum BatchStatus {
 
 impl BatchStatus {
     pub fn is_active(self) -> bool {
-        matches!(self, BatchStatus::Planning | BatchStatus::Queued | BatchStatus::Running)
+        matches!(self, BatchStatus::Planning | BatchStatus::Queued | BatchStatus::Running | BatchStatus::Paused)
     }
 }
 
@@ -1285,6 +1376,52 @@ pub struct SearchResult {
     pub truncated: bool,
     pub reason: Option<String>,
     pub parsed: ParsedSearch,
+}
+
+// ---- Folder size (added after v0.7.0) -------------------------------------------------------
+
+/// `folder_size` lists at most this many keys (folder markers included).
+pub const FOLDER_SIZE_SCAN_LIMIT: u64 = 200_000;
+/// `folder_size` lists at most this many pages (a server paging in tiny or empty pages).
+pub const FOLDER_SIZE_MAX_PAGES: u64 = 2_000;
+/// `folder_size` scans running at once; more wait for a slot.
+pub const FOLDER_SIZE_PARALLEL_SCANS: usize = 4;
+
+/// `FolderSize` in `types.ts`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderSize {
+    /// Objects counted; folder markers (keys ending in `/`) are not.
+    pub objects: u64,
+    pub bytes: u64,
+    /// Keys listed, markers included.
+    pub scanned: u64,
+    /// A bound stopped the scan with more keys left: the numbers are a lower bound.
+    pub truncated: bool,
+}
+
+/// What `preview_object` found ("Object preview" in docs/CONTRACT.md).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewKind {
+    Text,
+    Image,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectPreview {
+    pub kind: PreviewKind,
+    /// As stored in S3.
+    pub content_type: Option<String>,
+    /// The object's full size.
+    pub size: u64,
+    /// Text only: just the first `PREVIEW_TEXT_MAX` bytes were read.
+    pub truncated: bool,
+    pub text: Option<String>,
+    pub data_base64: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]

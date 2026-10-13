@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ClipboardPaste, Copy, CopyPlus, Download, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, Tags, Trash2, Upload } from "lucide-react";
+import { ArchiveRestore, Bookmark, BookmarkX, Calculator, ClipboardPaste, Copy, CopyPlus, Download, Eye, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, SquarePlus, Tags, Trash2, Upload } from "lucide-react";
 import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane } from "../store/app";
 import { usePaneSearch } from "../store/search";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
@@ -12,6 +12,9 @@ import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlock
 import { s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 import { useKeyHint } from "../store/keyboard";
+import { calculateFolderSizes } from "../store/folderSizes";
+import { addBookmarks, isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
+import { openFolderInNewTab } from "../store/tabs";
 
 interface Item {
   label: string;
@@ -39,6 +42,7 @@ export function ContextMenu() {
   const singleInfo = useArchive((s) => (bucket && single ? s.byId[archiveId(bucket, single.key)] : undefined));
   // Split view: the other pane's folder is a destination for the selection.
   const dest = useOtherPaneDest();
+  const bookmarks = useBookmarks((s) => s.items);
   const k = {
     open: useKeyHint("nav.open"),
     copy: useKeyHint("act.copy"),
@@ -51,6 +55,7 @@ export function ContextMenu() {
     copyKey: useKeyHint("act.copyKey"),
     copyUri: useKeyHint("act.copyUri"),
     tags: useKeyHint("act.tags"),
+    preview: useKeyHint("act.preview"),
     newFolder: useKeyHint("act.newFolder"),
     refresh: useKeyHint("nav.refresh"),
     upload: useKeyHint("act.upload"),
@@ -144,6 +149,19 @@ export function ContextMenu() {
     ];
   };
   const restoreItem = (label: string): Item => ({ label, icon: <ArchiveRestore size={14} />, action: () => requestRestoreArchived() });
+  // Folder prefixes are passed exactly as listed (server-provided).
+  const bookmarkItem = (fs: typeof folders): Item => {
+    if (fs.length === 1 && isBookmarked(bookmarks, bucket, fs[0].prefix)) {
+      return { label: "Remove bookmark", icon: <BookmarkX size={14} />, action: () => toggleBookmark(bucket, fs[0].prefix) };
+    }
+    const missing = fs.filter((f) => !isBookmarked(bookmarks, bucket, f.prefix));
+    return {
+      label: fs.length === 1 ? "Bookmark folder" : `Bookmark ${plural(fs.length, "folder")}`,
+      icon: <Bookmark size={14} />,
+      action: () => addBookmarks(bucket, missing.map((f) => f.prefix)),
+      ...(missing.length ? {} : { disabled: true, title: "Already bookmarked" }),
+    };
+  };
   const deleteItem = (n: number, folder: boolean): Item => ({
     label: n > 1 ? `Delete ${n} items…` : folder ? "Delete folder…" : "Delete…",
     icon: <Trash2 size={14} />,
@@ -164,7 +182,10 @@ export function ContextMenu() {
     const f = folders[0];
     groups.push([
       { label: inResults ? "Open folder" : "Open", icon: <FolderOpen size={14} />, action: () => navigate(bucket, f.prefix), hint: k.open },
+      { label: "Open in new tab", icon: <SquarePlus size={14} />, action: () => openFolderInNewTab(bucket, f.prefix) },
       { label: "Download folder…", icon: <FolderDown size={14} />, action: () => void requestDownloadFolders([f]) },
+      { label: "Calculate size", icon: <Calculator size={14} />, action: () => calculateFolderSizes(bucket, [f.prefix]) },
+      bookmarkItem([f]),
     ]);
     groups.push([
       { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(f.prefix, "Key"), hint: k.copyKey },
@@ -191,6 +212,7 @@ export function ContextMenu() {
       groups.push([{ label: "Go to object", icon: <LocateFixed size={14} />, action: () => revealObject(bucket, o.key, o.name), hint: k.open }]);
     }
     groups.push([
+      { label: "Quick look", icon: <Eye size={14} />, action: () => openModal({ kind: "quickLook" }), hint: k.preview },
       {
         label: "Download…",
         icon: <Download size={14} />,
@@ -233,8 +255,14 @@ export function ContextMenu() {
         icon: <FolderDown size={14} />,
         action: () => void requestDownloadFolders(folders),
       });
+      downloads.push({
+        label: `Calculate size of ${plural(folders.length, "folder")}`,
+        icon: <Calculator size={14} />,
+        action: () => calculateFolderSizes(bucket, folders.map((f) => f.prefix)),
+      });
     }
     if (downloads.length) groups.push(downloads);
+    if (folders.length) groups.push([bookmarkItem(folders)]);
     groups.push([
       { label: `Copy ${keys.length} keys`, icon: <Copy size={14} />, action: () => void copyText(keys.join("\n"), "Keys") },
       {

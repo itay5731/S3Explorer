@@ -235,7 +235,7 @@ interface AppSettings {
   maxConcurrentParts: number;
   maxConcurrentTransfers: number;
   theme: ThemeMode;                 // default "system"
-  checkUpdatesOnStartup: boolean;   // default false
+  checkUpdatesOnStartup: boolean;   // default false until v0.7.0, true from v0.8.0 (see "Update popup")
 }
 ```
 
@@ -1425,7 +1425,7 @@ action). Contexts decide where a chord fires:
 
 | Context | Fires when |
 |---|---|
-| `global` | anywhere in the explorer except inside a text field, unless the chord has `Mod`, `Alt` or is an F-key; never while a dialog, context menu or Settings is open (except `settings.open`, `help.shortcuts` and `escape`) |
+| `global` | anywhere in the explorer except inside a text field, unless the chord has `Mod`, `Alt` or is an F-key; never while a dialog, context menu or Settings is open (except `view.settings`, `help.shortcuts` and `sel.none`) |
 | `files` | focus is in a pane's table or results list (the active pane) |
 | `search` | focus is in the toolbar search box |
 
@@ -1442,6 +1442,7 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `nav.focusBuckets` | Focus the bucket list | global | `Mod+B` |
 | `nav.focusSearch` | Search | global | `Mod+F`, `/` |
 | `nav.searchScope` | Toggle search scope (this folder / whole bucket) | global | `Mod+Shift+F` |
+| `nav.bookmark` | Bookmark this folder (see "Bookmarks") | global | `Mod+Shift+D` |
 | `nav.nextPane` / `nav.prevPane` | Next / previous pane | files | `Tab` / `Shift+Tab` |
 | `view.single` / `view.split` | Single view / Split view | global | `Mod+1` / `Mod+2` |
 | `view.details` | Toggle details panel | global | `Mod+I` |
@@ -1469,7 +1470,14 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `act.tags` | Tags | files | `Mod+T` |
 | `act.versions` | Show versions (details panel, Versions section) | files | `Mod+Shift+V` |
 | `act.restore` | Restore archived | files | (none) |
+| `act.preview` | Quick look (added with "Object preview") | files | `F3` |
 | `act.disconnect` | Disconnect | global | `Mod+Shift+Q` |
+| **v0.8.0** `tab.new` / `tab.close` / `tab.reopen` | New tab / Close tab / Reopen closed tab | global | `Mod+N` / `Mod+W` (macOS `Mod+Shift+W`) / `Mod+Shift+T` |
+| `tab.next` / `tab.prev` | Next / previous tab | global | `Mod+Tab`, `Mod+PageDown` / `Mod+Shift+Tab`, `Mod+PageUp` |
+| `view.history` | Show the history (Activity) | global | `Mod+H` (macOS `Mod+Shift+H`) |
+| `act.editMetadata` | Edit content type and metadata | files | `Mod+M` (macOS unbound) |
+| `act.folderSize` | Calculate folder size | files | (none) |
+| `act.pauseAll` / `act.resumeAll` | Pause all / Resume all transfers | global | (none) |
 
 `Shift` held with `sel.up/down/pageUp/pageDown/first/last` extends the selection (a fixed rule, not a
 separate binding). **`F5` and `F6` are no longer Copy/Move to other pane**; `F5` refreshes the active pane
@@ -1554,3 +1562,552 @@ A profile whose only credential key is `login_session` (written by `aws login`, 
 #### IAM permissions added in this version
 
 None.
+
+## v0.8.0 additions
+
+### Folder size (added on request after v0.7.0)
+
+How much is in a folder, on demand. S3 keeps no folder totals, so the size is a bounded, cancellable
+scan of every key under the prefix.
+
+```ts
+interface FolderSize {
+  objects: number;     // objects counted (folder markers, keys ending in "/", are not counted)
+  bytes: number;       // sum of the counted objects' sizes
+  scanned: number;     // keys listed, folder markers included
+  truncated: boolean;  // stopped at FOLDER_SIZE_SCAN_LIMIT: the numbers are a lower bound
+}
+export const FOLDER_SIZE_SCAN_LIMIT = 200_000;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `folder_size` | `{ id, bucket, prefix }` | `FolderSize`. A flat `ListObjectsV2` (no delimiter) under `prefix`, verbatim, page by page, stopping at the limit. `id` is chosen by the frontend; a newer call with the same `id` cancels the older one (`Cancelled`). |
+| `cancel_folder_size` | `{ id }` | `void`. The running scan stops at its next page and the call above rejects with `Cancelled`. Unknown id: no-op. |
+
+Backend rules:
+
+- A listing is complete only when there is no continuation token; paging follows the same rules as
+  every other listing (a repeated token, or "truncated" without a token, is an error, never a silent
+  stop). The scan lists at most `FOLDER_SIZE_SCAN_LIMIT` keys (pages are requested no larger than what
+  is left) and at most 2,000 pages; stopping at either bound with more pages left is `truncated: true`.
+- At most 4 scans run at once; more wait for a slot (cancellable while waiting). Disconnecting or
+  connecting elsewhere cancels every scan.
+- `prefix` is sent exactly as given (no normalization); `""` is the whole bucket.
+
+Frontend:
+
+- Right-click a folder: **Calculate size**. Details panel with one folder selected: a **Size** row with a
+  **Calculate** button. While scanning: a spinner and **Cancel**. Result: "1,234 objects · 5.6 GiB",
+  prefixed "At least" when truncated, with the time it was calculated (and a Recalculate button).
+- Results are cached per bucket + prefix for the session (cleared on disconnect) and dropped when
+  anything under that prefix is uploaded, deleted, moved, copied, renamed or restored as a version (the
+  `transfer:progress`, `batch:progress` and `job:progress` events, and the app's own version actions,
+  tell the frontend): a cached size is cleared by changes made in this app. Changes made elsewhere
+  (another client, a lifecycle rule) are not seen until the folder is recalculated.
+- The file table's Size column shows the cached size for folders that have one (muted, "≥" when
+  truncated), "—" otherwise.
+- Details with several folders selected (and nothing else): one button calculates all of them (each its
+  own scan, at most 4 at once), shown summed, "At least" when any is truncated.
+
+IAM: none new (`s3:ListBucket` is already required).
+
+### Bookmarks (added on request after v0.7.0)
+
+Folders you go back to often, one click away. Frontend only: no new command, type or event.
+
+```ts
+/** A bookmarked folder. Frontend-only (localStorage), never sent to the backend. */
+export interface Bookmark {
+  bucket: string;
+  prefix: string;   // verbatim from the server (as the pane had it), "" for a bucket root
+  label: string;    // defaults to the folder name, or the bucket name at a root
+}
+export const BOOKMARKS_MAX = 100;   // per connection
+```
+
+- **Storage.** Per connection in `localStorage` under `s3x.bookmarks.<connection key>`, as a JSON array in
+  the user's order. The key is the saved connection's id when connected through a saved connection;
+  otherwise `<label>|<region>|<endpoint or "">` from `ConnectionInfo` (the label is `profile:<name>` or
+  `static:<first 8 characters of the access key id>`; never a secret). After a window reload the app is
+  reconnected without a saved id, so the saved id in use is also kept in `sessionStorage` and reused when the
+  reconnected `ConnectionInfo` matches it. At most 100 per connection; a bookmark is identified by
+  `bucket` + `prefix` (no duplicates). Reads and writes never throw; an unreadable or malformed entry is
+  ignored. Deleting a saved connection also removes its bookmarks (`s3x.bookmarks.saved:<id>`); the key is `connectionKey()` (see "Integration decisions").
+- **Prefixes are used verbatim** (see "Data safety"): the stored prefix is exactly the pane's prefix, and
+  opening a bookmark navigates to exactly that prefix.
+- **Path bar.** A star button at the end of the path bar toggles a bookmark for that pane's current folder
+  (filled when bookmarked). Key action `nav.bookmark` "Bookmark this folder" (group Navigate, context
+  `global`, default `Mod+Shift+D`) does the same for the active pane.
+- **Bookmarks bar.** A slim row (30 px) directly under the toolbar, across the explorer (both panes),
+  shown only when there is at least one bookmark. Each bookmark is a chip (bookmark icon + label, at most
+  200 px wide, the full `s3://bucket/prefix` as tooltip), in the stored order. Click (or Enter) opens it in
+  the active pane; middle-click or `Mod`+click opens it in the other pane while two panes are shown (in the
+  active pane otherwise). Chips reorder by dragging within the bar. Right-click (or the context-menu key):
+  Open, Open in other pane (only while two panes are shown), Rename bookmark (inline; an empty name restores
+  the default label; `F2` on a chip too), Remove bookmark. The chip of the active pane's folder is marked.
+- **Overflow.** Chips that do not fit go, in order, into a "»" button at the right end of the bar; it opens
+  a menu listing them (click / middle-click / `Mod`+click and the same right-click menu as a chip; arrow
+  keys move, Escape closes). Which chips fit is measured from their rendered widths whenever the bar or the
+  labels change size, so every bookmark is always either a chip or in that menu.
+- **Several windows.** Every change re-reads the list from storage before writing it, and a window follows
+  the `storage` event for its connection's key, so two windows on one connection never drop each other's
+  bookmarks.
+- **Right-click menus.** A folder row in the file table, or a folder hit in search results: "Bookmark
+  folder", or "Remove bookmark" when it already is one. With several items selected that include folders:
+  "Bookmark N folders" adds every selected folder not yet bookmarked (disabled when all are), up to the
+  cap (the toast says how many were added when the cap stops it). A bucket in the sidebar: "Bookmark
+  bucket" / "Remove bookmark" for its root (`prefix: ""`). Every prefix is the listed one, verbatim.
+- A bookmark whose bucket is gone or inaccessible shows the usual listing error when opened and stays in
+  the list.
+
+#### IAM permissions added in this version
+
+None.
+
+### Tabs (added on request after v0.7.0)
+
+Several locations open at once in each pane. Frontend only; no new command, type or event.
+
+- Each pane (see "Split view" and "State shape" in the v0.7.0 section) holds a list of **tabs** and an
+  active tab. A tab owns what a pane owned in v0.7.0: bucket, prefix, listing, sort, selection, filter (the
+  search box text), search results, history. Switching tabs restores all of it at once, with the table's
+  scroll position, without a refetch, unless the cached listing is older than 60 s or something changed
+  that folder while the tab was hidden; it is then refreshed in place in the background. A search or a
+  listing still running when its tab is hidden stops (the search says it was cancelled; the listing loads
+  again when the tab is shown).
+- The **tab strip** sits above each pane's path bar and appears only when the pane has 2 or more tabs. Each
+  tab: a folder icon, the folder name (the bucket name at a bucket root), a close button shown on hover and
+  on the active tab; the full `s3://` path as tooltip. Middle-click closes. Tabs reorder by dragging within
+  their pane (pointer events, like the saved-connection tiles). At most **20 tabs per pane**; asking for a
+  21st shows a toast and opens nothing.
+- **Dropping rows onto a tab** (either pane): rows dragged from a table highlight a tab they are over and,
+  released there, go into that tab's folder exactly as a drop on a folder row or path-bar crumb does
+  ("Drag and drop to move or copy"): `Ctrl` / `Option` copies, the same refusals, preview, confirmation
+  setting and job, with the items captured when the drag started. The tab the rows were dragged from is no
+  target (no highlight, nothing happens). Hovering a tab for **600 ms** during the drag shows it, so its
+  file list (empty area or object rows) becomes a target too, including in the pane the drag started in;
+  the drag keeps its captured items (and their storage classes, for the archived-object check).
+- **Moving a tab to the other pane:** only while two panes are on screen. A tab dragged and released over
+  the other pane's tab strip (at the position under the pointer) or, when that pane has one tab, its path
+  bar (after its shown tab) moves there with its whole state (listing, selection, filter, search results,
+  history, scroll) and is shown; the target is highlighted during the drag. Released on its own strip it
+  only reorders. The last tab of a pane can't be dragged (its strip is hidden); a pane already at 20 tabs
+  refuses with a toast. A search or listing running in the tab stops as when it is hidden.
+- Key actions (in `src/lib/keys.ts`, group Navigate, context `global`; none of these defaults was taken):
+
+  | Action id | Label | Defaults |
+  |---|---|---|
+  | `tab.new` | New tab (duplicates the current location) | `Mod+N` |
+  | `tab.close` | Close tab | `Mod+W` (macOS `Mod+Shift+W`: Cmd+W closes the window) |
+  | `tab.next` | Next tab | `Mod+Tab`, `Mod+PageDown` |
+  | `tab.prev` | Previous tab | `Mod+Shift+Tab`, `Mod+PageUp` |
+  | `tab.reopen` | Reopen closed tab | `Mod+Shift+T` |
+
+  On macOS `Cmd+Tab` / `Cmd+Shift+Tab` belong to the system; `Cmd+PageDown` / `Cmd+PageUp` work there.
+  Closing the last tab of a pane does nothing: the pane stays on its location (never an empty pane).
+  A new tab opens right after the current one. "New tab" copies the location and its loaded listing, with
+  no selection, filter, results or history behind it. "Reopen closed tab" brings back the last closed tabs
+  (up to 20, this connection only) at their location, in the pane they were closed in when it is shown
+  (else the active pane).
+- Folder rows: the context menu of a single folder has **Open in new tab** (the new tab becomes the shown
+  one); **middle-click** on a folder row opens it in a new tab in the background. Both use the folder's
+  prefix verbatim. The same for buckets in the sidebar: middle-click opens the bucket's root in a new
+  background tab of the active pane, and the bucket's menu has **Open in new tab** (shown at once). The
+  20-tab cap applies (same toast). A pane with nothing open just opens the place instead of adding a tab.
+- Open tabs are remembered **per connection** in `localStorage` (`s3x.tabs`: per connection, per pane, the
+  tabs' bucket and prefix and which one is active; nothing else), and restored on reconnect (the second pane
+  only when the split is on). The connection is identified by `connectionKey()` (the saved-connection id, else kind + profile or access key id + endpoint + region; see "Integration decisions"), never by its label alone,
+  endpoint and region. Reads and writes never throw; malformed data is ignored.
+- Everything that acts on "the active pane" acts on the active pane's shown tab. Transfers, jobs and their
+  events keep working whichever tab is shown. A job, upload or new folder that changes a folder refreshes
+  the shown tabs showing it at once and marks hidden tabs showing it for a refresh when they are shown (a
+  hidden tab whose folder a move or delete took away goes to the nearest existing ancestor then, as a shown
+  pane does). Search hits removed by a finished delete or move leave hidden tabs' results too. "Remove from
+  list" of an added bucket closes the hidden tabs showing it.
+- Closing the split drops the other pane's tabs; disconnecting resets every pane to one empty tab and forgets
+  the closed-tab list (the remembered tabs stay in `localStorage`).
+
+### Edit content type and metadata (added on request after v0.7.0)
+
+S3 cannot change an object's headers in place; the app copies the object onto itself with the new headers.
+
+```ts
+interface MetadataEdit {
+  bucket: string;
+  key: string;                       // verbatim
+  expectedEtag: string;              // the ETag the dialog showed; the copy is conditional on it
+  expectedLastModified: string;      // the LastModified the dialog showed (ISO-8601, as in ObjectMeta); also a condition
+  contentType: string;               // 1..=255 printable ASCII
+  cacheControl: string | null;       // null = no Cache-Control header
+  contentDisposition: string | null; // null = no Content-Disposition header
+  metadata: Record<string, string>;  // user metadata, replaces the old set entirely
+}
+export const METADATA_LIMITS = { maxTotalBytes: 2048, maxKeyChars: 128 } as const;
+
+// ObjectMeta gains (read by head_object, shown as "before" in the dialog):
+cacheControl: string | null;
+contentDisposition: string | null;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `update_object_metadata` | `{ edit: MetadataEdit }` | `ObjectMeta` (fresh, after the copy). |
+
+Rules:
+- `HeadObject` first; its ETag must equal `expectedEtag` (compared without quotes) and its LastModified must equal
+  `expectedLastModified` (to the second), otherwise `Conflict`. An unparsable `expectedLastModified` is `InvalidInput`.
+- One `CopyObject` with the object as both source and destination (current version, copy source
+  percent-encoded like the jobs), `MetadataDirective=REPLACE`, `CopySourceIfMatch=expectedEtag`,
+  `CopySourceIfUnmodifiedSince=expectedLastModified`,
+  `TaggingDirective=COPY`, keeping the storage class and the server-side encryption settings
+  (`ServerSideEncryption`, `SSEKMSKeyId`, `BucketKeyEnabled`) read by that `HeadObject`. Headers the dialog
+  does not edit but `REPLACE` would drop are carried over unchanged: `Content-Encoding`, `Content-Language`,
+  `Expires`, `x-amz-website-redirect-location`. The copy is not cancellable and its timeout scales with the
+  size like job copies. A response without a `CopyObjectResult` ETag is not a success.
+- Afterwards `HeadObject` verifies the result; "no error" is not confirmation. Content type, Cache-Control,
+  Content-Disposition and the user metadata must equal what was sent, the size and storage class must be
+  unchanged, the ETag must equal the copy's, and the tag count must be unchanged when the server reports it.
+  A mismatch is `Unknown` naming the field ("the edit was written but ..."); a failed read-back is
+  `saved_but_unread` (keeps the code). The frontend then reloads the details and never says nothing changed.
+- Refused with `InvalidInput` and a clear message, before anything is written: objects over 5 GiB
+  (single-request copy limit), objects in GLACIER or DEEP_ARCHIVE whether restored or not (`NotSupported`: the
+  copy would re-archive the data), Intelligent-Tiering archive tiers that are not restored, objects encrypted with a customer key
+  (SSE-C), an `Expires` header that cannot be parsed back, metadata keys that are not lowercase HTTP token
+  characters (regex ``^[a-z0-9!#$%&'*+.^_`|~-]+$``) or longer than 128 chars, empty metadata keys
+  (empty values are allowed), values that are not printable ASCII
+  (control characters, and non-ASCII, which S3 would store RFC 2047-encoded so the read-back could not match),
+  values or header fields with leading or trailing spaces (HTTP trims them), more than 2 KiB of user metadata in
+  total (keys + values in UTF-8 bytes, as S3 counts it), an empty content type, an empty string for
+  Cache-Control or Content-Disposition (send `null`), and header fields that are not printable ASCII.
+- If the object changed (the `HeadObject` check, or a 412 from either copy condition), the error is `Conflict`:
+  the object changed since the dialog opened and nothing was written.
+  Why both conditions: a single-part object's ETag is the MD5 of its body, so another client's metadata-only edit
+  keeps the ETag and only LastModified reveals it. Limits, stated plainly rather than claimed airtight:
+  - S3 compares LastModified at one-second resolution, so a change within the same second as the dialog's read
+    can still slip through.
+  - AWS evaluates the pair per RFC 7232: when `CopySourceIfMatch` holds, `CopySourceIfUnmodifiedSince` is ignored
+    and the copy proceeds. On AWS the LastModified guard is therefore the backend's `HeadObject` check, which leaves
+    the milliseconds between that `HeadObject` and the `CopyObject` unguarded for metadata-only changes. Body changes
+    are always caught by `CopySourceIfMatch`.
+- On a versioned bucket this creates a new version (the old one remains); the dialog says so. A restored
+  archived object is written back to its archive storage class, so the new copy needs a new restore to be read;
+  the dialog says so too. Object ACLs, Object Lock retention and legal holds are not carried over (ACL editing
+  and object lock are out of scope).
+
+Frontend: in the details panel's "More details", an **Edit** button next to the metadata opens a dialog:
+Content type (text field with a datalist of common types), Cache-Control, Content-Disposition, and a
+key/value list of user metadata (add, edit, remove rows), with inline validation mirroring the rules above
+and a live byte counter (`n of 2,048 bytes`). Save shows a confirmation summarising what changes
+(before → after for each changed field, byte-for-byte what will be sent), then runs; success refreshes the
+details. Errors show in the dialog; `Conflict` offers to reload the current values.
+
+IAM: `s3:GetObject` and `s3:PutObject` on the object, plus `s3:GetObjectTagging` and `s3:PutObjectTagging`
+for `TaggingDirective=COPY`; with SSE-KMS, `kms:Decrypt` and `kms:GenerateDataKey` on the key.
+
+### Object preview (added on request after v0.7.0)
+
+See what is inside a file without downloading it.
+
+```ts
+type PreviewKind = "text" | "image" | "unsupported";
+interface ObjectPreview {
+  kind: PreviewKind;
+  contentType: string | null;  // as stored in S3
+  size: number;                // the object's full size
+  truncated: boolean;          // text only: just the first PREVIEW_LIMITS.textMaxBytes were read
+  text: string | null;         // kind "text": UTF-8, invalid sequences replaced
+  dataBase64: string | null;   // kind "image": the whole object
+  reason: string | null;       // kind "unsupported": a short user-facing reason
+}
+export const PREVIEW_LIMITS = { textMaxBytes: 262_144, imageMaxBytes: 10_485_760, imageAutoBytes: 2_097_152 } as const;
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `preview_object` | `{ bucket, key }` | `ObjectPreview`. HeadObject, then at most two ranged GetObject calls pinned to the ETag with `If-Match`. The key is sent verbatim. |
+
+#### Backend
+
+- **Kind**, from the key's extension (case-insensitive; the whole name for `Dockerfile`) and the content
+  type (parameters ignored):
+  - Images: extensions `png jpg jpeg gif webp bmp ico avif svg`, or the matching `image/*` content
+    types. SVG is shown only through `<img>`, where scripts never run.
+  - Text: content types `text/*`, `application/json`, `application/xml`, `application/x-yaml`, or
+    extensions `txt md markdown json jsonl csv tsv log xml yaml yml toml ini conf cfg env sql sh bat ps1 py
+    js mjs ts tsx jsx css scss html htm rs go java kt c h cpp cs rb php swift tf hcl properties gitignore
+    dockerfile`. An image extension wins over a text content type and vice versa.
+  - Anything else: the first 8 KiB are read; valid UTF-8 (a multi-byte character cut at the end of the
+    sample is allowed) without NUL bytes is text, otherwise `unsupported` with reason "Binary file".
+- **Text** reads a single ranged GET of the first `min(size, textMaxBytes)` bytes; `truncated` when the
+  object is bigger. A character cut by the limit is dropped, not replaced. An empty object is text `""`
+  without a GET.
+- **Images** larger than `imageMaxBytes` are `unsupported` ("Too large to preview"); otherwise the
+  whole object is read and returned base64-encoded.
+- **Archived** objects (GLACIER / DEEP_ARCHIVE / Intelligent-Tiering archive tiers not restored, or a
+  GET answered `InvalidObjectState`) are `unsupported` ("Archived: restore it to preview").
+- A ranged response whose length or `Content-Range` does not match the request is an error, never a
+  silently short preview. A body that stalls for 30 s is a `Network` error, and the whole read is bounded
+  by the same size-scaled limit as a transfer request (60 s + 1 s per 32 KiB). An object that changed
+  between HeadObject and GetObject (`PreconditionFailed`) is a `Conflict` error ("changed while it was
+  read").
+
+#### Frontend
+
+- **Details panel**, one object selected: a "Preview" section at the top. Text and images up to
+  `imageAutoBytes` load automatically; bigger images (up to `imageMaxBytes`) show "Load preview (n MiB)".
+  A response for an object that is no longer selected is ignored. Errors show inline with Retry.
+- **Rendering:** images fit the panel width, shown with `<img>` from a `blob:` URL created from the
+  bytes and revoked when it changes (the CSP already allows `img-src blob:`; it is not loosened). JSON is
+  pretty-printed when it parses. CSV/TSV render as a small table of the first 200 rows. Everything else
+  is monospace text with soft wrap. "Showing the first 256 KiB" when `truncated`.
+- **Quick look:** key action `act.preview`, label "Quick look", group Act, context `files`, default `F3`
+  (F3 is in the always-prevented list, so the webview's find never opens). Opens a large modal with the
+  same preview; `Escape` closes; `ArrowUp`/`ArrowDown` while it is open move the selection and the
+  preview follows. Also in the object context menu. Not available for folders or several selected
+  items. No PDF, video or audio in this version.
+
+#### IAM permissions added in this version
+
+None (`s3:GetObject` is already required).
+
+### History (added on request after v0.7.0)
+
+Finished transfers, folder transfers and file operations (jobs) are remembered across restarts.
+Frontend only; no new commands.
+
+```ts
+type HistoryTransferKind = "download" | "upload" | "folderDownload" | "folderUpload";
+type HistoryJobKind = "copy" | "move" | "rename" | "delete" | "tag" | "restore";
+
+interface HistoryJob {
+  srcBucket: string;
+  srcPrefix: string;           // folder holding the chosen items (verbatim); "" = bucket root
+  destBucket: string | null;   // copy / move / rename only
+  destPrefix: string | null;   // folder the items went to (verbatim)
+  items: number;               // items the user chose (keys or prefixes)
+  first: string;               // the first chosen key or prefix (verbatim)
+  firstTo: string | null;      // where it went (verbatim)
+  objects: number;             // objects covered once folders were expanded (Job.totalItems)
+  done: number; skipped: number; failed: number;
+  firstError: string | null;   // "key: message" of the first per-object failure
+  label: string;               // the backend's Job.label (shown when the request is not known)
+}
+
+interface HistoryEntry {
+  connectionKey: string;       // connectionKey() of the connection it was recorded on; "" for older entries
+  id: string;                  // the transfer, batch or job id
+  kind: HistoryTransferKind | HistoryJobKind;
+  status: "completed" | "failed" | "cancelled";
+  bucket: string;              // a job's source bucket
+  key: string;                 // object key, the prefix for folder transfers, a job's srcPrefix (verbatim)
+  localPath: string;           // file or folder on this computer; "" for jobs
+  bytes: number;               // bytes transferred / copied; 0 for delete, tag, restore (not meaningful)
+  files: number;               // 1 for single transfers; done files / objects otherwise
+  connection: string;          // display label of the connection it ran on
+  finishedAt: string;          // ISO-8601
+  error: string | null;        // the transfer's or job's error, else a job's firstError
+  versionId?: string | null;   // set when a download fetched an older version of the object
+  job?: HistoryJob | null;     // set exactly for the job kinds
+}
+```
+
+- Recorded when a transfer, folder transfer or job reaches a final status (from the existing stores and
+  events: `onTransferFinished` for single transfers, `onBatchUpdate` for batches, `onJobUpdate` for
+  jobs; the per-file transfers of a batch are not recorded on their own). An entry with the same `id`
+  replaces the older one. `bytes` is the transferred bytes (a batch's `doneBytes`, a copy or move job's
+  `doneBytes`), `files` is a batch's `doneFiles` or a job's `doneItems`.
+- A job's items come from the request it was started with (`jobRequest`, known for every job started in
+  this session). A `move` of exactly one item whose destination is in the same bucket and the same
+  folder as the source is recorded as `rename`. Every key and prefix is stored verbatim.
+- Stored in `localStorage` `s3x.transferHistory` as one JSON array (transfers and jobs together),
+  newest first, capped at 400 transfers and 100 jobs (separately, so a large multi-download cannot evict the jobs); reads and writes never throw (a corrupt or unavailable
+  store reads as empty, malformed entries are dropped). No secrets, no file contents.
+- `versionId` keeps "Download again" of a version download fetching that version, not the current object.
+
+Frontend:
+- The Activity panel gets two tabs: **Now** (what it showed before) and **History**. History lists
+  entries newest first, virtualized, with: icon by kind, name, bucket path muted, size or count, when
+  (relative, exact on hover), status. Filter chips **All**, **Transfers**, **File operations** and a
+  search box (name, key, bucket, local path or a job's source / destination, case-insensitive) narrow it.
+- Job rows read as a sentence per kind: "Moved 12 items to reports/2026/", "Copied a.txt to
+  other-bucket/x/", "Deleted 3 items from images/", "Renamed a.txt to b.txt", "Tagged 4 items in docs/",
+  "Requested restore of b.iso in archive/" (a job that failed or was cancelled uses the imperative:
+  "Move 12 items to …"). The second line is the source → destination, or the error. The size column
+  shows bytes for copy / move / rename, else the objects done, with failed or skipped counts below. The
+  tooltip lists source, destination, counts, the first failure and the connection.
+- Transfer row actions (buttons on hover and the right-click menu / menu key):
+  - **Open file** / **Open folder** and **Show in folder** for completed downloads. Open goes through
+    `open_local`, which only accepts finished downloads the backend still knows (this session); any
+    refusal or a missing file is a calm info toast pointing at Show in folder. Open is hidden for the
+    `OPEN_LOCAL_REFUSED_EXTENSIONS`. Show in folder uses `reveal_local`; failure is a calm toast.
+  - **Go to object** (single transfers, uploads too: navigates to its folder and selects it) /
+    **Go to folder** (folder transfers: opens the prefix). Disabled with "Other connection" when the
+    bucket is not one of the current connection's buckets, as in the Now tab.
+  - **Download again** / **Upload again** re-run the transfer through the existing commands with the
+    usual confirmations: a single download asks for the save path (`start_download`, or
+    `download_object_version` for a version), a single upload starts `start_upload` to the same key
+    from the same local file (as a normal upload does), a folder download opens the folder-download
+    confirmation into the original parent folder, a folder upload opens the folder-upload confirmation
+    with the original local folder. Needs the bucket to be in the current connection.
+  - **Copy key** (single transfers) / **Copy prefix** (folders), **Copy local path**, **Remove from history**.
+- Job row actions: **Go to destination** (copy, move, rename: selects the object for a single object,
+  else opens the destination folder), **Go to folder** (delete: the source folder) or **Go to object** /
+  **Go to folder** (tag, restore: the source), disabled with "Other connection" as above;
+  **Copy source path**, **Copy destination path** (copy, move, rename), **Copy first failure** (when
+  there is one), **Remove from history**. Jobs are never offered again: a stale repeat of a delete or
+  move is unsafe.
+- **Clear history** in the panel bar asks for confirmation, then empties the store.
+- Desktop notifications and the Now tab are unchanged.
+
+### Bandwidth limit (added on request after v0.7.0)
+
+Keeps transfers from filling the connection.
+
+```ts
+// AppSettings gains:
+downloadLimitKibps: number | null;  // null = unlimited (default); else an integer 64..=1_048_576 KiB/s
+uploadLimitKibps: number | null;    // same
+export const BANDWIDTH_LIMITS = { minKibps: 64, maxKibps: 1_048_576 } as const;
+```
+
+- `update_settings` validates both fields strictly: each must be present, `null` or an integer in range;
+  anything else is `InvalidInput` with a message starting with the field name. A `settings.json` without
+  them (or with an invalid value) loads `null` for that field alone, like every other settings field.
+- **One shared limiter per direction** across all transfers and folder transfers: a token bucket refilled
+  continuously at the limit, with a burst of 256 KiB. Downloads take tokens for the bytes read from S3 (each
+  body chunk as it arrives); uploads for the bytes sent (the request body is throttled as the HTTP client
+  reads it, so an SDK retry of a part is throttled again). Waiters are served in arrival order, so parallel
+  parts and transfers share the limit evenly. Server-side copies (jobs) are not limited.
+- **Live:** changing either field applies to running transfers within a second, without restarting them.
+  Setting `null` releases every waiter at once.
+- **Never a hang:** waiting on the limiter is not a stall. The download body idle timeout (30 s) covers only
+  the wait for the next chunk from the network, never the wait for tokens. While an upload limit is set, the
+  upload attempt timeout is computed from the limit itself: base + part length × (the most requests the
+  settings allow, 32 parts × 10 transfers) ÷ the limit in bytes per second, with no 6-hour cap in that case,
+  so a limited healthy link never hits it at any part size; without a limit it assumes 32 KiB/s shared by the
+  current parts × transfers, capped at 6 hours. A part already in flight when a limit is switched on keeps the timeout it was
+  sent with. A waiter dropped before its bytes were allowed (cancel, pause, attempt timeout) refunds them,
+  capped at one burst, so other transfers never pay for abandoned tickets.
+- Live speed and ETA in Activity reflect the limited speed naturally (they are measured, not computed
+  from the limit).
+- **UI:** Settings → Transfers gets "Download speed limit" and "Upload speed limit", each an "Unlimited"
+  switch plus a number field with a unit select (KiB/s, MiB/s), validated against the range; the impact
+  summary mentions an active limit. The Activity bar shows a small "Limited to x MiB/s" note while a limit
+  is active.
+
+#### IAM permissions added in this version
+
+None.
+
+### Pause and resume transfers (added on request after v0.7.0)
+
+- `TransferStatus` gains `"paused"`. `BatchStatus` gains `"paused"` too (a folder transfer paused as a whole).
+- `paused` counts as active everywhere "active" is used: `remove_transfer` / `remove_batch` refuse it, the
+  updater refuses to install while one exists, and `disconnect` with `cancelActive` cancels it.
+
+| Command | Args | Returns |
+|---|---|---|
+| `pause_transfer` | `{ id }` | `void`. A running or queued download or upload stops moving data and becomes `paused`. `InvalidInput` for an unknown id or a finished transfer; no-op if already paused. |
+| `resume_transfer` | `{ id }` | `void`. A paused transfer goes back to the queue (`queued`), keeping its place behind transfers that were queued before it was paused. No-op unless paused (`InvalidInput` for an unknown id). |
+| `pause_batch` | `{ id }` | `void`. Pauses every queued or running file of the folder transfer and stops starting new ones (files it starts from now on start `paused`); the batch becomes `paused` (one still `planning` keeps planning and becomes `paused` when it would become `queued`). `InvalidInput` for an unknown id or a finished batch; no-op if already paused. |
+| `resume_batch` | `{ id }` | `void`. Resumes the batch's paused files and goes back to `queued` (then `running` as soon as one of its files runs again). No-op unless paused. |
+
+Behaviour:
+- Pausing cancels the in-flight part requests. Parts already written stay: downloads keep the temp file and the
+  record of finished parts (in memory); uploads keep the multipart upload id and the finished parts. Progress
+  shown (`transferredBytes`, `partsDone`) stays at the bytes of finished parts; `bytesPerSec` is 0 while paused.
+  A transfer in a step that cannot be interrupted (CreateMultipartUpload, CompleteMultipartUpload, the final
+  flush and rename) finishes that step first; if it was the last step the transfer simply completes.
+- Resuming a download continues with the missing parts only, with `If-Match` on the ETag captured at start: if
+  the object changed meanwhile, the transfer fails with the usual message and the temp file is removed. (A server
+  that returned no ETag gets a HeadObject on resume instead; a different size or Last-Modified fails it the same
+  way.) A folder download re-checks its destination for links on resume. A small file fetched with one GET starts
+  over.
+- Resuming an upload continues the same multipart upload with the missing parts; the local file's size and
+  modified time are re-checked first and a change fails the transfer (and aborts the multipart upload). A small
+  file sent with one PutObject is sent again.
+- A paused transfer does not count toward the simultaneous-transfers limit (it gives its run slot back).
+- Cancel works on a paused transfer or batch (download: temp file removed; upload: multipart upload aborted).
+  The destination of a paused download stays reserved (no second download to the same file).
+- Paused state lives in memory only. On app exit, every active transfer, folder transfer and job (running, queued
+  or paused) is cancelled like a cancel (uploads aborted, downloads' temp files removed), waiting at most 10 s. Resume across restarts is out of scope.
+- Events: `transfer:progress` / `batch:progress` carry the new status; payloads are otherwise unchanged.
+
+Frontend: a Pause / Resume button next to Cancel on each transfer row and folder-transfer row in Activity, also
+in its right-click menu; "Paused" status with the progress bar dimmed; a "Pause all" / "Resume all" button in the
+Activity bar when relevant (it applies to single transfers and folder transfers, not to a batch's own files
+individually). Keyboard: none new.
+
+#### IAM permissions added in this version
+
+None (pausing and resuming use the same calls as a transfer).
+
+
+### Update popup
+
+Users did not notice new versions: the startup check was off by default and, when on, only raised a
+toast. From v0.8.0:
+
+- `checkUpdatesOnStartup` **defaults to true** for new installs (backend default and
+  `DEFAULT_APP_SETTINGS`). A `settings.json` that lacks the field loads `true`; one that says `false`
+  is respected, so existing settings keep their value. The
+  Updates tab's switch is unchanged.
+- At launch everything about versions goes into **one dialog** (`.version-modal`, `UpdateDialog.tsx`).
+  When the silent startup check finds a newer version it holds the **update offer**: the running version, the new version, its release notes (the
+  `notes` markdown from `UpdateInfo`, rendered by the same safe `Markdown`), and the same card as
+  Settings → Updates, with **Later** and **Install and restart** (or **Open download page** when
+  `canInstall` is false; the running-transfers warning stays in the card).
+  - Later closes it and remembers that version (`localStorage` `s3x.updateLaterVersion`): the popup
+    opens again only for a newer version. While the popup is dismissed a pill in the title bar
+    (explorer and start screen) reads "vX.Y.Z available" and reopens it.
+  - Esc and the backdrop close it, except while an install is in progress.
+- **What's new after an update.** `CHANGELOG.md` is bundled into the frontend at build time
+  (`import ... from "../../CHANGELOG.md?raw"`, `src/lib/changelog.ts`). At every launch the frontend
+  compares the running version (`app_version`) with `localStorage` `s3x.seenVersion`: a fresh install
+  (no `s3x.*` preference at all) only records it; a launch without it but with other `s3x.*`
+  preferences (an upgrade from a version that did not record it), or on a different version, records it and opens **What's new in vX**
+  with that version's `## [X.Y.Z]` section. No section, no dialog. If the startup check then finds an
+  update, the dialog shows the update offer instead (a newer version's notes matter more than the
+  running one's); the two are never shown together.
+- Nothing is ever installed without the user clicking Install; the backend commands are unchanged.
+
+Consequence for releases: the `## [X.Y.Z]` section of `CHANGELOG.md` is what users read in the app,
+before and after updating. Every tag must come with one that explains each change (see
+`.claude/rules/versioning.md`).
+
+### Search row
+
+The search box leaves the toolbar's right group and gets its **own row** between the toolbar and the
+panes' path bars (`SearchRow` in `Toolbar.tsx`, `.search-row`), full width, with the scope control
+("This folder" / "Whole bucket") at its right. In split view the row spans both panes and, as before,
+acts on the active pane. The toolbar's right group keeps the clipboard chip, the split toggle and the
+details toggle.
+
+The placeholder names the scope ("Search this folder · as you type, Enter searches now"). While the
+box has text and the focus, a dismissable hint under it says what is being searched: this folder only
+(and that **Whole bucket** on the right searches everything) or the whole bucket, that results come
+half a second after typing stops, and that Enter searches right away. Dismissing it is remembered
+(`localStorage` `s3x.searchTypingHintDismissed`), like the syntax hint shown while the box is empty.
+Search behaviour itself is unchanged.
+
+#### IAM permissions added in this version
+
+None.
+
+### Integration decisions (orchestrator, after review of the ten PRs)
+
+- `AppSettings` gains `previewAutomatically: boolean` (default `true`; `update_settings` requires it; a
+  `settings.json` without it loads `true`). When `false`, selecting a file shows a **Preview** button in the
+  details panel instead of fetching; Quick look (`F3`) always fetches. Settings → Behavior holds the toggle
+  "Preview files automatically" with the note that each preview is a HEAD plus a bounded GET.
+- The hidden game from PR #4 has no developer keys in any build; a cheat code typed during the game
+  (`iddqd`, letters in sequence within 2 s) toggles god mode with an on-screen notice, and a run with god
+  mode on never records a best score.
+- Persisted per-connection state (tabs, bookmarks, history) is keyed by one `connectionKey()`: the saved
+  connection id, else kind + profile or access key id + endpoint + region; never the display label alone.
+  Deleting a saved connection forgets all three.
+- Every action the PRs add is registered in the keyboard registry (bound or unbound) so it appears in
+  Settings → Keyboard and the cheat sheet; the defaults table is extended with the final rows.
+- "Later" on the update popup is remembered per version; the details panel stays hidden until a bucket
+  is open; folder sizes are "cleared by changes made in this app", not "never stale".

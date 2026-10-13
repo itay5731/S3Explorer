@@ -1,20 +1,24 @@
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
 import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNarrow, useApp, writePref } from "../store/app";
 import { PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
 import { onExplorerKeyDown, onExplorerMouseDown } from "../store/keyActions";
 import { ShortcutsDialog } from "./ShortcutsDialog";
+import { UpdatePill } from "./UpdateDialog";
 import { installTransferEffects } from "../store/actions";
 import { handleOsDrop, installBatchEffects } from "../store/folders";
 import { installJobEffects } from "../store/ops";
 import { installTagEffects } from "../store/tags";
+import { installFolderSizeEffects } from "../store/folderSizes";
 import { installArchiveEffects } from "../store/archive";
 import { DragBadge } from "./RowDrag";
 import { Sidebar } from "./Sidebar";
-import { Breadcrumbs, Toolbar } from "./Toolbar";
+import { Breadcrumbs, SearchRow, Toolbar } from "./Toolbar";
+import { BookmarksBar } from "./BookmarksBar";
 import { ObjectTable } from "./ObjectTable";
 import { SearchResults } from "./SearchResults";
+import { TabStrip } from "./TabStrip";
 import { toast } from "../store/toasts";
 import { DetailsPanel } from "./DetailsPanel";
 import { ActivityPanel } from "./TransfersPanel";
@@ -160,7 +164,7 @@ function useKeyDispatcher() {
   }, []);
 }
 
-/** One explorer pane: its path bar and its table (or search results), and the OS-drop overlay. */
+/** One explorer pane: its tab strip, its path bar and its table (or search results), and the OS-drop overlay. */
 function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
   const bucket = usePanes((s) => s[id].bucket);
   const prefix = usePanes((s) => s[id].prefix);
@@ -178,6 +182,7 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
         onPointerDownCapture={() => setActivePane(id)}
         onFocusCapture={() => setActivePane(id)}
       >
+        <TabStrip pane={id} />
         {bucket && <Breadcrumbs />}
         <div className="table-wrap">
           {searchOpen ? <SearchResults /> : <ObjectTable />}
@@ -240,12 +245,28 @@ function useSidebarResize() {
   return { workspace, style, onPointerDown, reset: () => save(null) };
 }
 
+/**
+ * The toolbar's rendered height as `--toolbar-h` on the app, so the sidebar's bucket head lines up
+ * with it at every text size (the toolbar's height follows its buttons, not a fixed number).
+ */
+function useToolbarHeightVar(main: RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const bar = main.current?.querySelector<HTMLElement>(":scope > .toolbar");
+    const app = main.current?.closest<HTMLElement>(".app");
+    if (!bar || !app) return;
+    const apply = () => app.style.setProperty("--toolbar-h", `${bar.getBoundingClientRect().height}px`);
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, [main]);
+}
+
 export function Explorer() {
   const active = useApp((s) => s.activePane);
-  const split = useApp((s) => s.split);
   const shown = useApp((s) => s.split && !s.narrow);
+  // The details panel waits for an open bucket (the toolbar and search row are there from the start).
   const bucket = usePanes((s) => s[active].bucket);
-  // Details describe an item inside a bucket, so the panel stays closed until one is open.
   const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
   const dropTarget = useFileDrop();
   const sidebar = useSidebarResize();
@@ -259,6 +280,8 @@ export function Explorer() {
   useEffect(() => installBatchEffects(), []);
   useEffect(() => installTagEffects(), []);
   useEffect(() => installArchiveEffects(), []);
+  useEffect(() => installFolderSizeEffects(), []);
+  useToolbarHeightVar(main);
 
   return (
     <div className="app">
@@ -268,6 +291,7 @@ export function Explorer() {
           <span>S3 Explorer</span>
         </button>
         <div className="spacer" />
+        <UpdatePill />
         <ConnectionChip />
         <ThemeToggle />
         <SettingsButton />
@@ -284,8 +308,11 @@ export function Explorer() {
           onDoubleClick={sidebar.reset}
         />
         <main className="browser" ref={main}>
-          {/* The toolbar acts on the active pane; in split view it stays (the Split button lives there). */}
-          {(bucket || split) && <Toolbar />}
+          {/* The toolbar and the search row are always there (disabled until a bucket is open), so the
+              workspace looks the same before and after picking one; the toolbar acts on the active pane. */}
+          <Toolbar />
+          <SearchRow />
+          <BookmarksBar />
           <div className={`panes ${shown ? "split" : ""}`}>
             {panes.map((id, i) => (
               <Fragment key={id}>

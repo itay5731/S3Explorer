@@ -169,17 +169,21 @@ function FileManagerField({
 /** Settings → Behavior: how much the app asks before it changes data, and which file manager it opens. */
 export function BehaviorTab({
   confirmCopyMove,
+  previewAutomatically,
   fileManager,
   fileManagerError,
   disabled,
   onConfirmCopyMoveChange,
+  onPreviewAutomaticallyChange,
   onFileManagerChange,
 }: {
   confirmCopyMove: boolean;
+  previewAutomatically: boolean;
   fileManager: FileManagerDraft;
   fileManagerError: string | null;
   disabled: boolean;
   onConfirmCopyMoveChange(v: boolean): void;
+  onPreviewAutomaticallyChange(v: boolean): void;
   onFileManagerChange(v: FileManagerDraft): void;
 }) {
   const id = useId();
@@ -217,6 +221,29 @@ export function BehaviorTab({
           Even with this off, you are always asked when something at the destination would be overwritten, so you
           can choose to skip or replace it. Deleting always asks for confirmation.
         </span>
+      </div>
+      <div className="set-field">
+        <label className="toggle-row" htmlFor={`${id}-preview`}>
+          <span className="set-field-head">
+            <span className="set-label">Preview files automatically</span>
+            <span className="set-desc">
+              Show what is inside a file in the details panel as soon as it is selected. Each preview is a HEAD request plus
+              one bounded GET (at most the first 256 KiB of text, or an image up to 2 MiB).
+            </span>
+          </span>
+          <input
+            id={`${id}-preview`}
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={previewAutomatically}
+            disabled={disabled}
+            onChange={(e) => onPreviewAutomaticallyChange(e.target.checked)}
+          />
+        </label>
+        {!previewAutomatically && (
+          <p className="set-hint">The details panel shows a Preview button instead. Quick look still previews right away.</p>
+        )}
       </div>
       <FileManagerField value={fileManager} error={fileManagerError} disabled={disabled} onChange={onFileManagerChange} />
     </div>

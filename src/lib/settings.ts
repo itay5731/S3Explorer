@@ -5,6 +5,7 @@ import {
   AUTO_PART_SIZE_MIB,
   MIN_UPLOAD_PART_MIB,
   ACCENT_COLORS,
+  BANDWIDTH_LIMITS,
   TEXT_SETTINGS_LIMITS,
   TRANSFER_SETTINGS_LIMITS,
   FILE_MANAGER_COMMAND_MAX,
@@ -90,6 +91,9 @@ export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
   a.textWeight === b.textWeight &&
   a.accent === b.accent &&
   a.confirmCopyMove === b.confirmCopyMove &&
+  a.previewAutomatically === b.previewAutomatically &&
+  (a.downloadLimitKibps ?? null) === (b.downloadLimitKibps ?? null) &&
+  (a.uploadLimitKibps ?? null) === (b.uploadLimitKibps ?? null) &&
   (a.fileManagerCommand ?? null) === (b.fileManagerCommand ?? null) &&
   sameOverrides(a.keybindings, b.keybindings);
 
@@ -127,9 +131,29 @@ export function validateAppSettings(s: AppSettings): { field: keyof AppSettings;
   }
   if (!ACCENT_COLORS.includes(s.accent)) return { field: "accent", message: `Must be one of ${ACCENT_COLORS.join(", ")}.` };
   if (typeof s.confirmCopyMove !== "boolean") return { field: "confirmCopyMove", message: "Must be true or false." };
+  if (typeof s.previewAutomatically !== "boolean") return { field: "previewAutomatically", message: "Must be true or false." };
   const fm = validateFileManagerCommand(s.fileManagerCommand ?? null);
   if (fm) return { field: "fileManagerCommand", message: fm };
   const kb = validateKeybindings(s.keybindings);
   if (kb) return { field: "keybindings", message: kb };
+  for (const field of ["downloadLimitKibps", "uploadLimitKibps"] as const) {
+    const err = validateBandwidthKibps(s[field]);
+    if (err) return { field, message: err };
+  }
   return null;
+}
+
+/** Validation message for a bandwidth limit in KiB/s (null = unlimited), or null when it is valid. */
+export function validateBandwidthKibps(v: unknown): string | null {
+  if (v === null) return null;
+  if (typeof v !== "number" || !Number.isInteger(v)) return "Must be a whole number of KiB/s, or null.";
+  if (v < BANDWIDTH_LIMITS.minKibps) return `Minimum is ${formatLimit(BANDWIDTH_LIMITS.minKibps)}.`;
+  if (v > BANDWIDTH_LIMITS.maxKibps) return `Maximum is ${formatLimit(BANDWIDTH_LIMITS.maxKibps)}.`;
+  return null;
+}
+
+/** A limit for display: "512 KiB/s", "1.5 MiB/s", "1,024 MiB/s". */
+export function formatLimit(kibps: number): string {
+  if (kibps < 1024) return `${kibps} KiB/s`;
+  return `${(kibps / 1024).toLocaleString("en-US", { maximumFractionDigits: 2 })} MiB/s`;
 }

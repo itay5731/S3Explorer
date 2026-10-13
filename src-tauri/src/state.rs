@@ -15,6 +15,7 @@ use crate::error::{is_access_denied, raw_status_and_region, AppError, AppResult}
 use crate::batches::{BatchManager, BatchSink};
 use crate::jobs::{JobManager, JobSink};
 use crate::models::{AppSettings, ConnectionConfig, ConnectionInfo};
+use crate::folder_size::FolderSizeScans;
 use crate::search::SearchRegistry;
 use crate::settings::SettingsStore;
 use crate::transfers::{ProgressSink, TransferManager};
@@ -218,6 +219,8 @@ pub struct AppState {
     pub batches: Arc<BatchManager>,
     /// Running `search_objects` calls by `searchId`.
     pub searches: SearchRegistry,
+    /// Running `folder_size` scans by id.
+    pub folder_sizes: FolderSizeScans,
     pub settings: SettingsStore,
 }
 
@@ -237,6 +240,7 @@ impl AppState {
             jobs: JobManager::new(job_sink),
             batches,
             searches: SearchRegistry::new(),
+            folder_sizes: FolderSizeScans::new(),
             settings,
         }
     }
@@ -273,12 +277,15 @@ impl AppState {
         unfinished
     }
 
-    /// Replacing or dropping the connection cancels running searches (they belong to the old one).
+    /// Replacing or dropping the connection cancels running searches and folder size scans (they
+    /// belong to the old one).
     pub async fn set_connection(&self, conn: Option<Arc<Connection>>) {
         self.searches.cancel_all();
+        self.folder_sizes.cancel_all();
         *self.connection.write().await = conn;
         // Again once the lock is released: a search that started while the write waited holds the old client.
         self.searches.cancel_all();
+        self.folder_sizes.cancel_all();
     }
 
     pub async fn connection(&self) -> AppResult<Arc<Connection>> {

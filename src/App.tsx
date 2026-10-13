@@ -5,12 +5,14 @@ import { setConnected, useApp } from "./store/app";
 import { startTransferSync } from "./store/transfers";
 import { startJobSync } from "./store/jobs";
 import { startBatchSync } from "./store/batches";
+import { installHistory } from "./store/history";
 import { ConnectScreen } from "./components/ConnectScreen";
 import { Explorer } from "./components/Explorer";
 import { Toasts } from "./components/Toasts";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { UpdateDialog } from "./components/UpdateDialog";
 import { loadSettings, useSettings } from "./store/settings";
-import { scheduleStartupCheck } from "./store/updates";
+import { checkWhatsNew, scheduleStartupCheck } from "./store/updates";
 
 export default function App() {
   const connected = useApp((s) => s.connection !== null);
@@ -23,10 +25,15 @@ export default function App() {
     let stopBatches: (() => void) | null = null;
     let cancelUpdateCheck: (() => void) | null = null;
     let disposed = false;
+    // Before the syncs start, so no finish event is missed; also while disconnected.
+    const stopHistory = installHistory();
     // Settings work while disconnected, so load them independently of the connection.
     void loadSettings().then(() => {
+      if (disposed) return;
+      // The first launch after an update shows what changed.
+      void checkWhatsNew();
       // Optional silent update check a few seconds after launch; never installs anything.
-      if (!disposed && useSettings.getState().settings?.checkUpdatesOnStartup) cancelUpdateCheck = scheduleStartupCheck();
+      if (useSettings.getState().settings?.checkUpdatesOnStartup) cancelUpdateCheck = scheduleStartupCheck();
     });
     startTransferSync()
       .then((s) => (disposed ? s() : (stop = s)))
@@ -50,6 +57,7 @@ export default function App() {
       stopJobs?.();
       stopBatches?.();
       cancelUpdateCheck?.();
+      stopHistory();
     };
   }, []);
 
@@ -80,6 +88,7 @@ export default function App() {
         <ConnectScreen />
       )}
       <SettingsDialog />
+      <UpdateDialog />
       <Toasts />
     </>
   );

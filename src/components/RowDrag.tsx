@@ -1,7 +1,8 @@
 // Drag rows of the object table onto a folder row, a path-bar segment or a bucket in the sidebar to
 // move them there; hold Ctrl (Option on macOS) to copy instead (see "Drag and drop to move or copy" in
 // docs/CONTRACT.md). In split view (v0.7.0) the other pane's table is a target too: its folder rows
-// and crumbs as usual, and its empty area or object rows for the folder that pane shows. Built on pointer events, like useTileReorder: inside the Tauri webview the OS
+// and crumbs as usual, and its empty area or object rows for the folder that pane shows. A tab is a
+// target for its folder, and hovering one switches to it (see "Tabs"). Built on pointer events, like useTileReorder: inside the Tauri webview the OS
 // file-drop handling (uploads) swallows HTML5 drag and drop. The two never share a handler: OS file
 // drops arrive through api.onFileDrop, row drags only through the listeners below.
 
@@ -13,11 +14,14 @@ import { plural } from "../lib/ops";
 import { getPane, type PaneId, type PaneState } from "../store/app";
 import type { ClipItem } from "../store/clipboard";
 import { buildTransferRequest, confirmOrStart, tooMany, withoutArchived } from "../store/ops";
+import { showTab } from "../store/tabs";
 import { toast } from "../store/toasts";
 import { getViewRows, type Row } from "../store/view";
 
 /** The pointer must move this far (px) before a press becomes a drag, so clicks still work. */
 const DRAG_THRESHOLD = 6;
+/** Hovering a tab this long (ms) while dragging shows it, so its file list becomes a target too. */
+const TAB_HOVER_MS = 600;
 /** Distance (px) from the table's top or bottom edge where dragging scrolls it. */
 const SCROLL_EDGE = 40;
 /** Fastest auto-scroll, in px per frame, reached at the very edge. */
@@ -48,10 +52,14 @@ export const useRowDragView = create<DragView>(() => ({ ids: NONE, count: 0, cop
 /** What is dragged, frozen when the drag starts; a drop sends exactly these items. */
 interface Source {
   readonly pane: PaneId;
+  /** The tab the rows were dragged from (its folder is no target, even after hovering another tab). */
+  readonly tab: number;
   readonly bucket: string;
   readonly prefix: string;
   readonly items: readonly ClipItem[];
   readonly ids: ReadonlySet<string>;
+  /** The dragged objects' storage classes as listed when the drag started. */
+  readonly classes: ReadonlyMap<string, string | null>;
 }
 
 interface Hit {
@@ -106,6 +114,8 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
     let pointer = { x: e.clientX, y: e.clientY };
     let hit: Hit | null = null;
     let frame = 0;
+    /** A tab hovered while dragging, and the timer that will show it. */
+    let hover: { el: HTMLElement; timer: ReturnType<typeof setTimeout> } | null = null;
 
     const mark = (h: Hit | null) => {
       if (hit && hit.el !== h?.el) delete hit.el.dataset.dropTarget;
@@ -121,6 +131,8 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
       if (!src) return null;
       const under = document.elementFromPoint(pointer.x, pointer.y);
       const el = under?.closest<HTMLElement>("[data-drop-prefix]") ?? null;
+      // The tab the rows come from: dropping there changes nothing, so it is no target at all.
+      if (el && el.dataset.tabPane === src.pane && Number(el.dataset.tabId) === src.tab) return null;
       if (el) {
         const bucket = el.dataset.dropBucket ?? src.bucket;
         const prefix = el.dataset.dropPrefix ?? "";
@@ -130,10 +142,31 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
       // pane the drag started in is not a target this way (its own folder is a no-op).
       const body = under?.closest<HTMLElement>("[data-pane-drop]") ?? null;
       const other = body?.dataset.paneDrop as PaneId | undefined;
-      if (!body || !other || other === src.pane) return null;
+      if (!body || !other) return null;
+      // The source pane's table only once another tab is shown there (hovering a tab switches it).
+      if (other === src.pane && getPane(other).tab === src.tab) return null;
       const { bucket, prefix, search } = getPane(other);
       if (!bucket || search.open) return null;
       return { el: body, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
+    };
+
+    /** Hovering a tab: show it after a moment (once per hover), then hit-test again. */
+    const hoverTab = (el: HTMLElement | null) => {
+      if (hover?.el === el) return;
+      if (hover) clearTimeout(hover.timer);
+      hover = null;
+      const tabPane = el?.dataset.tabPane as PaneId | undefined;
+      const id = Number(el?.dataset.tabId);
+      if (!el || !tabPane || !id) return;
+      hover = {
+        el,
+        timer: setTimeout(() => {
+          if (!src) return;
+          showTab(tabPane, id);
+          // Once React has drawn the shown tab's list.
+          requestAnimationFrame(update);
+        }, TAB_HOVER_MS),
+      };
     };
 
     /** Hit-test what is under the pointer and update the highlight and the badge. */
@@ -141,6 +174,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
       if (!src) return;
       const next = hitTest();
       mark(next);
+      hoverTab(next?.el.dataset.tabId ? next.el : null);
       useRowDragView.setState({
         copy,
         x: pointer.x,
@@ -171,7 +205,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
     };
 
     const begin = (): boolean => {
-      const { bucket, prefix } = getPane(pane);
+      const { bucket, prefix, tab } = getPane(pane);
       if (!bucket || bucket !== pressed.bucket || prefix !== pressed.prefix) return false;
       const rows = getViewRows(pane);
       // Resolve the pressed row by its id. Gone (the listing changed under the pointer): no drag.
@@ -189,7 +223,8 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
         tooMany(items.length, "move");
         return false;
       }
-      src = Object.freeze({ pane, bucket, prefix, items, ids: new Set(items.map((i) => i.key)) });
+      const classes = new Map(picked.flatMap((r) => (r.kind === "object" ? [[r.object.key, r.object.storageClass] as const] : [])));
+      src = Object.freeze({ pane, tab, bucket, prefix, items, ids: new Set(items.map((i) => i.key)), classes });
       document.body.classList.add("row-dragging");
       window.getSelection()?.removeAllRanges();
       useRowDragView.setState({ ids: src.ids, count: items.length, copy, x: pointer.x, y: pointer.y, target: null });
@@ -205,6 +240,8 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
       window.removeEventListener("blur", onCancel);
       if (frame) cancelAnimationFrame(frame);
       frame = 0;
+      if (hover) clearTimeout(hover.timer);
+      hover = null;
       mark(null);
       document.body.classList.remove("row-dragging", "drag-copy", "drag-refused");
       if (src) useRowDragView.setState({ ids: NONE, count: 0, target: null });
@@ -296,7 +333,7 @@ const pick = (s: PaneState) => ({ bucket: s.bucket, prefix: s.prefix, selection:
 /** A drop: the same request as paste, then the confirmation setting decides whether to ask. */
 async function drop(src: Source, bucket: string, prefix: string, copy: boolean) {
   // Archived objects that aren't restored can't be copied or moved: left out, with a toast.
-  const items = await withoutArchived(src.bucket, [...src.items], copy ? "copy" : "move", src.pane);
+  const items = await withoutArchived(src.bucket, [...src.items], copy ? "copy" : "move", src.pane, src.classes);
   if (!items) return;
   const built = buildTransferRequest({ mode: copy ? "copy" : "cut", bucket: src.bucket, prefix: src.prefix, items }, { bucket, prefix });
   if (!built.ok) {

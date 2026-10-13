@@ -50,10 +50,13 @@ export interface ObjectMeta extends ObjectEntry {
   restore: { inProgress: boolean; expiresAt: string | null } | null;
   /** v0.5.0: true when the object must be restored before it can be read. */
   archived: boolean;
+  /** Edit metadata (after v0.7.0): the Cache-Control and Content-Disposition headers. */
+  cacheControl: string | null;
+  contentDisposition: string | null;
 }
 
 export type TransferKind = "download" | "upload";
-export type TransferStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type TransferStatus = "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
 
 export interface Transfer {
   id: string;
@@ -144,7 +147,18 @@ export interface AppSettings extends TransferSettings {
    * from the defaults (see "Keyboard" in docs/CONTRACT.md). Default {}.
    */
   keybindings: Record<string, string[]>;
+  /**
+   * Bandwidth limits in KiB/s shared by all transfers (see "Bandwidth limit" in docs/CONTRACT.md);
+   * null = unlimited. Integers within `BANDWIDTH_LIMITS` otherwise.
+   */
+  downloadLimitKibps: number | null;
+  uploadLimitKibps: number | null;
+  /** v0.8.0: load a preview (HEAD + bounded GET) as soon as a single file is selected. Default true. */
+  previewAutomatically: boolean;
 }
+
+/** Range of `downloadLimitKibps` / `uploadLimitKibps` (the backend enforces the same). */
+export const BANDWIDTH_LIMITS = { minKibps: 64, maxKibps: 1_048_576 } as const;
 
 /** Ranges and slider steps for the text settings (the backend enforces the same ranges). */
 export const TEXT_SETTINGS_LIMITS = {
@@ -155,7 +169,7 @@ export const TEXT_SETTINGS_LIMITS = {
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   ...DEFAULT_TRANSFER_SETTINGS,
   theme: "system",
-  checkUpdatesOnStartup: false,
+  checkUpdatesOnStartup: true,
   notifyOnFinish: true,
   textSize: 100,
   textWeight: 400,
@@ -163,6 +177,9 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   confirmCopyMove: true,
   fileManagerCommand: null,
   keybindings: {},
+  downloadLimitKibps: null,
+  uploadLimitKibps: null,
+  previewAutomatically: true,
 };
 
 // Saved connections
@@ -353,7 +370,7 @@ export type BucketVersioning = "Enabled" | "Suspended" | "Off";
 
 // Folder transfers (batches)
 export type BatchKind = "upload" | "download";
-export type BatchStatus = "planning" | "queued" | "running" | "completed" | "failed" | "cancelled";
+export type BatchStatus = "planning" | "queued" | "running" | "paused" | "completed" | "failed" | "cancelled";
 
 export interface BatchPlanRequest {
   kind: BatchKind;
@@ -497,3 +514,137 @@ export const OPEN_LOCAL_REFUSED_EXTENSIONS = [
   "settingcontent-ms", "diagcab", "library-ms", "search-ms", "py", "pyw", "sh", "command", "app", "terminal",
   "fileloc", "inetloc", "desktop", "reg", "lnk", "url",
 ] as const;
+
+// ---- Folder size (see "Folder size" in docs/CONTRACT.md) ----
+
+/** Result of `folder_size`. */
+export interface FolderSize {
+  /** Objects counted (folder markers, keys ending in "/", are not counted). */
+  objects: number;
+  bytes: number;
+  /** Keys listed, folder markers included. */
+  scanned: number;
+  /** Stopped at FOLDER_SIZE_SCAN_LIMIT: the numbers are a lower bound. */
+  truncated: boolean;
+}
+
+/** `folder_size` lists at most this many keys. */
+export const FOLDER_SIZE_SCAN_LIMIT = 200_000;
+
+// ---- Bookmarks (added on request after v0.7.0; frontend only, see "Bookmarks" in docs/CONTRACT.md) ----
+
+/** A bookmarked folder, stored per connection in localStorage. */
+export interface Bookmark {
+  bucket: string;
+  /** Verbatim from the server, "" for a bucket root. */
+  prefix: string;
+  /** Defaults to the folder name, or the bucket name at a root. */
+  label: string;
+}
+
+export const BOOKMARKS_MAX = 100;
+
+// Edit content type and metadata (added on request after v0.7.0)
+/** One object's headers to write by copying it onto itself (`update_object_metadata`). */
+export interface MetadataEdit {
+  bucket: string;
+  /** Verbatim. */
+  key: string;
+  /** The ETag the dialog showed; the copy is conditional on it. */
+  expectedEtag: string;
+  /** The LastModified the dialog showed (ISO-8601, as in ObjectMeta); the copy is conditional on it too. */
+  expectedLastModified: string;
+  /** 1..=255 printable ASCII. */
+  contentType: string;
+  /** null = no header. */
+  cacheControl: string | null;
+  /** null = no header. */
+  contentDisposition: string | null;
+  /** User metadata; replaces the old set entirely. */
+  metadata: Record<string, string>;
+}
+
+export const METADATA_LIMITS = { maxTotalBytes: 2048, maxKeyChars: 128 } as const;
+
+// ---- Object preview (see "Object preview" in docs/CONTRACT.md) ----
+
+export type PreviewKind = "text" | "image" | "unsupported";
+
+export interface ObjectPreview {
+  kind: PreviewKind;
+  /** As stored in S3. */
+  contentType: string | null;
+  /** The object's full size. */
+  size: number;
+  /** Text only: just the first `PREVIEW_LIMITS.textMaxBytes` were read. */
+  truncated: boolean;
+  /** Kind "text": UTF-8, invalid sequences replaced. */
+  text: string | null;
+  /** Kind "image": the whole object. */
+  dataBase64: string | null;
+  /** Kind "unsupported": a short user-facing reason. */
+  reason: string | null;
+}
+
+export const PREVIEW_LIMITS = { textMaxBytes: 262_144, imageMaxBytes: 10_485_760, imageAutoBytes: 2_097_152 } as const;
+
+// ---- History (added after v0.7.0; frontend only, see "History" in docs/CONTRACT.md) ----
+
+export type HistoryTransferKind = "download" | "upload" | "folderDownload" | "folderUpload";
+/** File operations (jobs); a move of one item within its folder is recorded as "rename". */
+export type HistoryJobKind = "copy" | "move" | "rename" | "delete" | "tag" | "restore";
+export type HistoryKind = HistoryTransferKind | HistoryJobKind;
+
+/** What a finished job did (set exactly when the entry's kind is a `HistoryJobKind`). */
+export interface HistoryJob {
+  srcBucket: string;
+  /** The folder holding the chosen items (verbatim); "" for the bucket root. */
+  srcPrefix: string;
+  destBucket: string | null;
+  /** The folder the items went to (verbatim); null for delete / tag / restore. */
+  destPrefix: string | null;
+  /** Items the user chose (keys or prefixes). */
+  items: number;
+  /** The first chosen key or prefix, and where it went (verbatim). */
+  first: string;
+  firstTo: string | null;
+  /** Objects the job covered once folders were expanded, and how they ended. */
+  objects: number;
+  done: number;
+  skipped: number;
+  failed: number;
+  firstError: string | null;
+  /** The backend's label for the job, shown when the request is not known. */
+  label: string;
+}
+
+export interface HistoryEntry {
+  /** `connectionKey()` of the connection the entry was recorded on; "" in entries from before the field existed. */
+  connectionKey: string;
+  /** The transfer, batch or job id. */
+  id: string;
+  kind: HistoryKind;
+  status: "completed" | "failed" | "cancelled";
+  /** The bucket (a job's source bucket). */
+  bucket: string;
+  /** Object key, or the prefix for folder transfers; a job's source folder (verbatim). */
+  key: string;
+  /** File or folder on this computer; "" for jobs. */
+  localPath: string;
+  /** Bytes transferred or copied; 0 when not known (deletes, tags, restores). */
+  bytes: number;
+  /** Files transferred (1 for single transfers); objects done for jobs. */
+  files: number;
+  /** Display label of the connection it ran on. */
+  connection: string;
+  /** ISO-8601. */
+  finishedAt: string;
+  error: string | null;
+  /** Set when a download fetched an older version of the object. */
+  versionId?: string | null;
+  /** Set for file operations. */
+  job?: HistoryJob | null;
+}
+
+export const HISTORY_STORAGE_KEY = "s3x.transferHistory";
+export const HISTORY_MAX_ENTRIES = 500;

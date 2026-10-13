@@ -10,12 +10,15 @@ pub mod buckets;
 pub mod commands;
 pub mod error;
 pub mod file_manager;
+pub mod folder_size;
 pub mod jobs;
 pub mod keychain;
 pub mod lifecycle;
 pub mod local_open;
+pub mod metadata;
 pub mod models;
 pub mod ops;
+pub mod preview;
 pub mod profiles;
 pub mod saved;
 pub mod search;
@@ -118,15 +121,20 @@ pub fn run() {
             commands::browse::list_objects,
             commands::browse::list_recent,
             commands::browse::head_object,
+            commands::browse::preview_object,
             commands::folders::create_folder,
             commands::transfers::start_download,
             commands::transfers::start_upload,
             commands::transfers::cancel_transfer,
+            commands::transfers::pause_transfer,
+            commands::transfers::resume_transfer,
             commands::transfers::remove_transfer,
             commands::transfers::list_transfers,
             commands::batches::preview_batch,
             commands::batches::start_batch,
             commands::batches::cancel_batch,
+            commands::batches::pause_batch,
+            commands::batches::resume_batch,
             commands::batches::remove_batch,
             commands::batches::list_batches,
             commands::jobs::preview_job,
@@ -149,6 +157,7 @@ pub fn run() {
             commands::tags::put_bucket_tags,
             commands::tags::get_object_tags,
             commands::tags::put_object_tags,
+            commands::metadata::update_object_metadata,
             commands::lifecycle::get_lifecycle,
             commands::lifecycle::validate_lifecycle,
             commands::lifecycle::put_lifecycle,
@@ -160,12 +169,27 @@ pub fn run() {
             commands::versions::restore_object,
             commands::search::search_objects,
             commands::search::cancel_search,
+            commands::folder_size::folder_size,
+            commands::folder_size::cancel_folder_size,
             commands::transfers::open_local,
             commands::transfers::reveal_local,
             commands::transfers::try_file_manager,
             commands::files::write_text_file,
             commands::files::read_text_file,
         ])
-        .run(context)
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Nothing survives a restart: cancel every running, queued or paused transfer, folder
+            // transfer and job, so no multipart upload or temp file is left behind (abort what you
+            // start). Bounded by EXIT_WAIT.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    tauri::async_runtime::block_on(state.cancel_active_and_wait(EXIT_WAIT));
+                }
+            }
+        });
 }
+
+/// How long app exit waits for active transfers and jobs to clean up.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
