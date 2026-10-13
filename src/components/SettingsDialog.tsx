@@ -6,6 +6,7 @@ import {
   Bell,
   Cpu,
   FileStack,
+  Gauge,
   Info,
   Keyboard,
   Loader2,
@@ -20,6 +21,7 @@ import {
 } from "lucide-react";
 import {
   AUTO_PART_SIZE_MIB,
+  BANDWIDTH_LIMITS,
   MIN_UPLOAD_PART_MIB,
   DEFAULT_APP_SETTINGS,
   TRANSFER_SETTINGS_LIMITS,
@@ -31,6 +33,7 @@ import {
 import {
   GIB,
   MIB,
+  formatLimit,
   planParts,
   normalizeFileManagerCommand,
   sameAppSettings,
@@ -62,12 +65,23 @@ import { ACTIONS_BY_ID, chordProblem, effectiveBindings, findConflicts, normaliz
 
 type PartMode = "auto" | "custom";
 
+type LimitUnit = "KiB" | "MiB";
+
+/** One bandwidth limit as edited: the switch, the number as typed and its unit. */
+interface LimitDraft {
+  unlimited: boolean;
+  value: string;
+  unit: LimitUnit;
+}
+
 /** Form state. Numbers are kept as the raw input strings so invalid input can be shown. */
 interface TransferDraft {
   partMode: PartMode;
   partSize: string;
   parts: string;
   transfers: string;
+  downLimit: LimitDraft;
+  upLimit: LimitDraft;
 }
 
 /** One slice per tab. Every tab edits its own fields; the dialog has one Save for all of them. */
@@ -85,7 +99,34 @@ interface Draft {
   keybindings: Bindings;
 }
 
-type TransferErrors = Record<"partSize" | "parts" | "transfers", string | null>;
+type TransferErrors = Record<"partSize" | "parts" | "transfers" | "downLimit" | "upLimit", string | null>;
+
+/** A stored limit as a draft: whole MiB/s in MiB, anything else in KiB. Unlimited starts from 10 MiB/s. */
+function toLimitDraft(kibps: number | null): LimitDraft {
+  if (kibps === null) return { unlimited: true, value: "10", unit: "MiB" };
+  return kibps % 1024 === 0
+    ? { unlimited: false, value: String(kibps / 1024), unit: "MiB" }
+    : { unlimited: false, value: String(kibps), unit: "KiB" };
+}
+
+/** The limit a draft describes in KiB/s (MiB may have decimals), or NaN when it is not a number. */
+function limitKibps(d: LimitDraft): number {
+  if (d.value.trim() === "") return NaN;
+  const n = Number(d.value);
+  return d.unit === "MiB" ? Math.round(n * 1024) : n;
+}
+
+function limitError(d: LimitDraft): string | null {
+  if (d.unlimited) return null;
+  if (d.value.trim() === "") return "Enter a value.";
+  const n = Number(d.value);
+  if (!Number.isFinite(n)) return "Enter a number.";
+  if (d.unit === "KiB" && !Number.isInteger(n)) return "Must be a whole number.";
+  const kib = limitKibps(d);
+  if (kib < BANDWIDTH_LIMITS.minKibps) return `Minimum is ${formatLimit(BANDWIDTH_LIMITS.minKibps)}.`;
+  if (kib > BANDWIDTH_LIMITS.maxKibps) return `Maximum is ${formatLimit(BANDWIDTH_LIMITS.maxKibps)}.`;
+  return null;
+}
 
 const toDraft = (s: AppSettings): Draft => ({
   transfers: {
@@ -93,6 +134,8 @@ const toDraft = (s: AppSettings): Draft => ({
     partSize: String(s.partSizeMib ?? AUTO_PART_SIZE_MIB.standard),
     parts: String(s.maxConcurrentParts),
     transfers: String(s.maxConcurrentTransfers),
+    downLimit: toLimitDraft(s.downloadLimitKibps ?? null),
+    upLimit: toLimitDraft(s.uploadLimitKibps ?? null),
   },
   theme: s.theme,
   checkUpdatesOnStartup: s.checkUpdatesOnStartup,
@@ -128,6 +171,8 @@ function transferErrors(d: TransferDraft): TransferErrors {
     partSize: d.partMode === "custom" ? validateInteger("partSizeMib", d.partSize) : null,
     parts: validateInteger("maxConcurrentParts", d.parts),
     transfers: validateInteger("maxConcurrentTransfers", d.transfers),
+    downLimit: limitError(d.downLimit),
+    upLimit: limitError(d.upLimit),
   };
 }
 
@@ -135,7 +180,7 @@ function transferErrors(d: TransferDraft): TransferErrors {
 function toSettings(d: Draft): AppSettings | null {
   const t = d.transfers;
   const errs = transferErrors(t);
-  if (errs.partSize || errs.parts || errs.transfers) return null;
+  if (errs.partSize || errs.parts || errs.transfers || errs.downLimit || errs.upLimit) return null;
   if (fileManagerError(d.fileManager)) return null;
   if (keybindingsError(d.keybindings)) return null;
   return {
@@ -151,6 +196,8 @@ function toSettings(d: Draft): AppSettings | null {
     confirmCopyMove: d.confirmCopyMove,
     fileManagerCommand: d.fileManager.mode === "system" ? null : normalizeFileManagerCommand(d.fileManager.command),
     keybindings: normalizeOverrides(d.keybindings),
+    downloadLimitKibps: t.downLimit.unlimited ? null : limitKibps(t.downLimit),
+    uploadLimitKibps: t.upLimit.unlimited ? null : limitKibps(t.upLimit),
   };
 }
 
@@ -480,6 +527,91 @@ function PartSizeField({
   );
 }
 
+function LimitField({
+  label,
+  description,
+  value,
+  error,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  value: LimitDraft;
+  error: string | null;
+  disabled: boolean;
+  onChange(next: LimitDraft): void;
+}) {
+  const id = useId();
+  const set = (p: Partial<LimitDraft>) => onChange({ ...value, ...p });
+  // Switching units keeps the speed: 2048 KiB/s becomes 2 MiB/s, not 2048 MiB/s.
+  const setUnit = (unit: LimitUnit) => {
+    const kib = limitKibps(value);
+    if (unit === value.unit || !Number.isFinite(kib)) return set({ unit });
+    set({ unit, value: String(unit === "MiB" ? Math.round((kib / 1024) * 100) / 100 : kib) });
+  };
+  return (
+    <div className="set-field">
+      <div className="toggle-row">
+        <span className="set-field-head">
+          <span className="set-label" id={`${id}-label`}>
+            {label}
+          </span>
+          <span className="set-desc" id={`${id}-desc`}>
+            {description}
+          </span>
+        </span>
+        <label className="limit-switch" htmlFor={`${id}-off`}>
+          <span className="set-desc">Unlimited</span>
+          <input
+            id={`${id}-off`}
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={value.unlimited}
+            disabled={disabled}
+            aria-describedby={`${id}-label`}
+            onChange={(e) => set({ unlimited: e.target.checked })}
+          />
+        </label>
+      </div>
+      {!value.unlimited && (
+        <>
+          <div className="limit-row">
+            <input
+              type="number"
+              className="num-input limit-num"
+              inputMode="decimal"
+              min={0}
+              step={value.unit === "MiB" ? "any" : 1}
+              value={value.value}
+              disabled={disabled}
+              aria-label={`${label} value`}
+              aria-invalid={!!error}
+              aria-describedby={`${id}-desc ${id}-err`}
+              onChange={(e) => set({ value: e.target.value })}
+            />
+            <select
+              className="limit-unit"
+              value={value.unit}
+              disabled={disabled}
+              aria-label={`${label} unit`}
+              onChange={(e) => setUnit(e.target.value as LimitUnit)}
+            >
+              <option value="KiB">KiB/s</option>
+              <option value="MiB">MiB/s</option>
+            </select>
+          </div>
+          <p id={`${id}-err`} className={`set-hint ${error ? "err-text" : ""}`}>
+            {error ??
+              `${formatLimit(BANDWIDTH_LIMITS.minKibps)} to ${formatLimit(BANDWIDTH_LIMITS.maxKibps)}, shared by every running transfer.`}
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ---- impact summary ---------------------------------------------------------------------
 
 function ImpactSummary({ value, errors }: { value: TransferDraft; errors: TransferErrors }) {
@@ -497,6 +629,10 @@ function ImpactSummary({ value, errors }: { value: TransferDraft; errors: Transf
   const ul = partValid ? planParts("upload", partMib, GIB) : null;
   const big = partValid && partMib === null ? planParts("download", null, 4 * GIB) : null;
   const dash = "—";
+  const limitOf = (d: LimitDraft, err: string | null) => (d.unlimited || err ? null : limitKibps(d));
+  const down = limitOf(value.downLimit, errors.downLimit);
+  const up = limitOf(value.upLimit, errors.upLimit);
+  const limits = [down !== null && `${formatLimit(down)} down`, up !== null && `${formatLimit(up)} up`].filter(Boolean);
 
   return (
     <section className="impact" aria-labelledby="impact-title">
@@ -535,6 +671,12 @@ function ImpactSummary({ value, errors }: { value: TransferDraft; errors: Transf
           </div>
         </div>
       </div>
+      {limits.length > 0 && (
+        <p className="impact-limit">
+          <Gauge size={13} />
+          <span>Speed limited to {limits.join(" and ")}, shared by all transfers together.</span>
+        </p>
+      )}
       {level !== "ok" && memory !== null && (
         <div className={`callout ${level}`} role="note">
           <AlertTriangle size={15} />
@@ -588,12 +730,29 @@ function TransfersTab({
         disabled={disabled}
         onChange={(v) => set({ transfers: v })}
       />
+      <LimitField
+        label="Download speed limit"
+        description="Caps how fast all downloads together read from S3, so they leave room on your connection."
+        value={value.downLimit}
+        error={errors.downLimit}
+        disabled={disabled}
+        onChange={(downLimit) => set({ downLimit })}
+      />
+      <LimitField
+        label="Upload speed limit"
+        description="Caps how fast all uploads together send to S3."
+        value={value.upLimit}
+        error={errors.upLimit}
+        disabled={disabled}
+        onChange={(upLimit) => set({ upLimit })}
+      />
       <ImpactSummary value={value} errors={errors} />
       <div className="callout info" role="note">
         <Info size={15} />
         <span>
           Part size and parallel parts apply to transfers that start after saving. The simultaneous-transfers limit
-          applies to the queue immediately and never interrupts running transfers.
+          applies to the queue immediately and never interrupts running transfers. Speed limits apply to running
+          transfers within a second.
         </span>
       </div>
     </div>

@@ -938,6 +938,8 @@ interface Sim {
   partSize: number;
   failAt: number | null; // fraction at which it fails
   failMessage: string;
+  /** Bytes through so far, before uploads round down to whole parts. */
+  sent: number;
 }
 
 const sims = new Map<string, Sim>();
@@ -976,6 +978,9 @@ function startQueued() {
 function tick() {
   const now = Date.now();
   startQueued();
+  // Like the backend's shared limiter: each direction's limit is split across its running transfers.
+  const runningOf = { download: 0, upload: 0 };
+  for (const s of sims.values()) if (s.t.status === "running") runningOf[s.t.kind]++;
   let active = 0;
   for (const s of sims.values()) {
     if (s.t.status !== "running") {
@@ -983,11 +988,21 @@ function tick() {
       continue;
     }
     active++;
-    const frac = Math.min(1, (now - s.startedMs) / s.durationMs);
+    let frac = Math.min(1, (now - s.startedMs) / s.durationMs);
     // ease a little + jitter so speed looks alive
     const shaped = Math.min(1, frac * (0.92 + Math.random() * 0.16));
     const prev = s.t.transferredBytes;
-    let next = Math.max(prev, Math.floor(s.t.totalBytes * shaped));
+    const prevSent = s.sent;
+    let sent = Math.max(prevSent, Math.floor(s.t.totalBytes * shaped));
+    const limit = s.t.kind === "upload" ? settings.uploadLimitKibps : settings.downloadLimitKibps;
+    if (limit !== null && s.t.totalBytes > 0) {
+      sent = Math.min(sent, Math.floor(prevSent + (limit * 1024 * 0.1) / runningOf[s.t.kind]));
+      // Hold the clock back to match, so the transfer finishes when its bytes are through.
+      frac = Math.min(1, sent / s.t.totalBytes);
+      s.startedMs = now - frac * s.durationMs;
+    }
+    s.sent = sent;
+    let next = Math.max(prev, sent);
     if (s.t.kind === "upload") {
       // Uploads only report whole completed parts (small files jump 0 -> 100%).
       next = s.t.partsTotal <= 1 ? 0 : Math.max(prev, Math.floor(next / s.partSize) * s.partSize);
@@ -1015,8 +1030,7 @@ function tick() {
       emit(s.t);
       continue;
     }
-    const elapsed = Math.max(0.1, (now - s.startedMs) / 1000);
-    const instant = s.t.kind === "upload" ? next / elapsed : (next - prev) / 0.1 || 0;
+    const instant = (sent - prevSent) / 0.1 || 0;
     s.t.bytesPerSec = s.t.bytesPerSec ? s.t.bytesPerSec * 0.7 + instant * 0.3 : instant;
     s.t.transferredBytes = next;
     s.t.partsDone = Math.min(s.t.partsTotal, Math.floor(next / s.partSize));
@@ -1063,6 +1077,7 @@ function startSim(
     partSize,
     failAt: failMessage ? (opts.batchId ? 0.5 : 0.05) : null,
     failMessage: failMessage ?? "",
+    sent: 0,
   });
   emit(t);
   ensureTicker();
@@ -3048,7 +3063,13 @@ export const mockBackend: Backend = {
       fileManagerCommand: typeof next.fileManagerCommand === "string" ? normalizeFileManagerCommand(next.fileManagerCommand) : next.fileManagerCommand,
       // Like the backend: a missing field is {} (a settings.json without it loads {}).
       keybindings: JSON.parse(JSON.stringify(next.keybindings ?? {})) as Record<string, string[]>,
+      downloadLimitKibps: next.downloadLimitKibps,
+      uploadLimitKibps: next.uploadLimitKibps,
     };
+    // Like the backend: both limits are required (null = unlimited).
+    for (const f of ["downloadLimitKibps", "uploadLimitKibps"] as const) {
+      if (candidate[f] === undefined) throw fail("InvalidInput", `${f}: required.`);
+    }
     if (candidate.fileManagerCommand === undefined) throw fail("InvalidInput", "fileManagerCommand: required.");
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);

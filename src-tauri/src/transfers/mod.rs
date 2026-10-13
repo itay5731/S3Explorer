@@ -2,6 +2,7 @@
 
 mod download;
 pub(crate) mod gate;
+pub mod limit;
 pub mod plan;
 mod upload;
 
@@ -25,6 +26,7 @@ use gate::RunGate;
 // The object preview reads with the same stall and size-scaled bounds as a transfer.
 pub(crate) use download::next_chunk;
 pub(crate) use upload::upload_attempt_timeout;
+use limit::Limiter;
 
 pub const MIB: u64 = 1024 * 1024;
 const TICK: Duration = Duration::from_millis(100);
@@ -83,6 +85,8 @@ pub struct TransferEntry {
     /// Times a download's temp file was flushed to disk (`sync_all`) before the rename.
     file_syncs: AtomicU32,
     observer: Option<Arc<dyn TransferObserver>>,
+    /// The manager's bandwidth limiter for this transfer's direction.
+    limit: Arc<Limiter>,
 }
 
 /// Internal counters of one transfer, for tests and benchmarks (not part of the bridge contract).
@@ -198,6 +202,9 @@ pub struct TransferManager {
     /// Limits running transfers to `maxConcurrentTransfers`; resizable at runtime (see `gate`).
     running: Arc<RunGate>,
     settings: Mutex<TransferSettings>,
+    /// Bandwidth limits, one per direction, shared by every transfer (see `limit`).
+    download_limit: Arc<Limiter>,
+    upload_limit: Arc<Limiter>,
     sink: Arc<dyn ProgressSink>,
     seq: AtomicU64,
     /// Destinations (see [`dest_key`]) of queued/running downloads. The lock also serializes the
@@ -246,6 +253,8 @@ impl TransferManager {
         Arc::new(Self {
             entries: DashMap::new(),
             running: RunGate::new(settings.max_concurrent_transfers as usize),
+            download_limit: Arc::new(Limiter::new(settings.download_limit_kibps)),
+            upload_limit: Arc::new(Limiter::new(settings.upload_limit_kibps)),
             settings: Mutex::new(settings),
             sink,
             seq: AtomicU64::new(0),
@@ -260,10 +269,13 @@ impl TransferManager {
     }
 
     /// Applies new settings. Part size / parts in flight affect transfers that start running
-    /// from now on; the transfer limit applies to the queue immediately. Callers validate first.
+    /// from now on; the transfer limit applies to the queue immediately, the bandwidth limits to
+    /// running transfers within a second. Callers validate first.
     pub fn apply_settings(&self, settings: &TransferSettings) {
         *self.settings.lock().unwrap_or_else(|p| p.into_inner()) = settings.clone();
         self.running.set_limit(settings.max_concurrent_transfers as usize);
+        self.download_limit.set_kibps(settings.download_limit_kibps);
+        self.upload_limit.set_kibps(settings.upload_limit_kibps);
     }
 
     /// Transfers holding a run slot right now.
@@ -407,6 +419,10 @@ impl TransferManager {
             discarded_bytes: AtomicU64::new(0),
             file_syncs: AtomicU32::new(0),
             observer: link.map(|l| l.observer),
+            limit: match kind {
+                TransferKind::Download => self.download_limit.clone(),
+                TransferKind::Upload => self.upload_limit.clone(),
+            },
         });
         self.entries.insert(id.clone(), entry.clone());
         self.sink.emit(&entry.snapshot());
@@ -982,6 +998,145 @@ mod tests {
         assert!(!tm.has_active());
     }
 
+    /// Upload server that accepts everything: PutObject, multipart create / parts / complete.
+    async fn upload_server() -> FakeS3 {
+        FakeS3::start(|r: &Req| match r.method.as_str() {
+            "PUT" => Reply::with_headers(200, vec![h("ETag", "\"e\"")]),
+            "POST" if r.has_query("uploads") => Reply::xml(
+                200,
+                r#"<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>U1</UploadId></InitiateMultipartUploadResult>"#,
+            ),
+            "POST" if r.has_query("uploadId") => Reply::xml(
+                200,
+                r#"<CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><ETag>"m"</ETag></CompleteMultipartUploadResult>"#,
+            ),
+            _ => Reply::status(500),
+        })
+        .await
+    }
+
+    fn limited(down: Option<u32>, up: Option<u32>) -> TransferSettings {
+        TransferSettings { download_limit_kibps: down, upload_limit_kibps: up, ..TransferSettings::default() }
+    }
+
+    /// Seconds a transfer of `bytes` should take at `kibps` after the initial burst.
+    fn paced_secs(bytes: u64, kibps: u64) -> f64 {
+        bytes.saturating_sub(limit::BURST) as f64 / (kibps * 1024) as f64
+    }
+
+    fn assert_paced(took: Duration, want: f64) {
+        let took = took.as_secs_f64();
+        assert!(took > want * 0.85 && took < want * 1.3 + 1.0, "took {took:.2} s, want ~{want:.2} s");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downloads_are_paced_by_the_shared_limit() {
+        let dir = ScratchDir::new("bw-down");
+        let size = MIB + 5;
+        let s3 = object_server(size, |_, _| None, false).await;
+        let tm = manager(limited(Some(256), None), TransferTuning::default());
+        // Two downloads at once share the one limit.
+        let t0 = Instant::now();
+        let a = tm.start_download(s3.client(), "b", "k", dir.0.join("a.bin")).expect("start");
+        let b = tm.start_download(s3.client(), "b", "k", dir.0.join("b.bin")).expect("start");
+        for id in [&a, &b] {
+            let t = finished(&tm, id, Duration::from_secs(30)).await;
+            assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        }
+        assert_paced(t0.elapsed(), paced_secs(2 * size, 256)); // ~7 s
+        assert_eq!(std::fs::read(dir.0.join("a.bin")).expect("read"), expected(size));
+        assert_eq!(std::fs::read(dir.0.join("b.bin")).expect("read"), expected(size));
+        // The upload limit does not touch downloads.
+        let tm = manager(limited(None, Some(64)), TransferTuning::default());
+        let t0 = Instant::now();
+        let id = tm.start_download(s3.client(), "b", "k", dir.0.join("c.bin")).expect("start");
+        assert_eq!(finished(&tm, &id, Duration::from_secs(30)).await.status, TransferStatus::Completed);
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", t0.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uploads_are_paced_by_the_limit_single_and_multipart() {
+        let dir = ScratchDir::new("bw-up");
+        let small = dir.0.join("small.bin");
+        let data: Vec<u8> = (0..MIB).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&small, &data).expect("write");
+        let s3 = upload_server().await;
+        let tm = manager(limited(None, Some(256)), TransferTuning::default());
+        let t0 = Instant::now();
+        let id = tm.start_upload(s3.client(), "b", "k", small.clone());
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_paced(t0.elapsed(), paced_secs(MIB, 256)); // ~3 s
+        let puts: Vec<Req> = s3.requests().into_iter().filter(|r| r.method == "PUT").collect();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].body, data, "the throttled body is the file, byte for byte");
+
+        // Multipart (parts of 5 MiB + 1 MiB) at 2 MiB/s.
+        let big = dir.0.join("big.bin");
+        let data: Vec<u8> = (0..6 * MIB).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&big, &data).expect("write");
+        let s3 = upload_server().await;
+        let settings = TransferSettings { part_size_mib: Some(5), ..limited(None, Some(2048)) };
+        let tm = manager(settings, TransferTuning::default());
+        let t0 = Instant::now();
+        let id = tm.start_upload(s3.client(), "b", "k", big);
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_paced(t0.elapsed(), paced_secs(6 * MIB, 2048)); // ~2.9 s
+        let mut parts: Vec<Req> = s3.requests().into_iter().filter(|r| r.method == "PUT").collect();
+        parts.sort_by_key(|r| r.query.contains("partNumber=2"));
+        let sent: Vec<u8> = parts.iter().flat_map(|r| r.body.clone()).collect();
+        assert_eq!(sent, data);
+
+        // With request checksums on (the SDK default against AWS) the throttled body is wrapped in
+        // aws-chunked framing with a checksum trailer; it still goes through, paced.
+        let s3 = upload_server().await;
+        let conf = s3
+            .client()
+            .config()
+            .to_builder()
+            .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenSupported)
+            .build();
+        let tm = manager(limited(None, Some(256)), TransferTuning::default());
+        let t0 = Instant::now();
+        let id = tm.start_upload(Client::from_conf(conf), "b", "k", small);
+        let t = finished(&tm, &id, Duration::from_secs(30)).await;
+        assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        assert_paced(t0.elapsed(), paced_secs(MIB, 256));
+        let put = s3.requests().into_iter().find(|r| r.method == "PUT").expect("put");
+        assert!(put.header("x-amz-trailer").is_some(), "checksum trailer sent: {:?}", put.headers);
+        assert!(put.body.len() as u64 > MIB, "framed body");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_limit_change_reaches_running_transfers_within_a_second() {
+        let dir = ScratchDir::new("bw-live");
+        let size = 8 * MIB; // ~2 min at 64 KiB/s
+        let s3 = object_server(size, |_, _| None, false).await;
+        let src = dir.0.join("up.bin");
+        std::fs::write(&src, vec![3u8; 8 * MIB as usize]).expect("write");
+        let up = upload_server().await;
+        let slow = limited(Some(64), Some(64));
+        let tm = manager(slow.clone(), TransferTuning::default());
+        let down = tm.start_download(s3.client(), "b", "k", dir.0.join("d.bin")).expect("start");
+        let upload = tm.start_upload(up.client(), "b", "k", src);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let t = tm.get(&down).expect("known");
+        assert_eq!(t.status, TransferStatus::Running);
+        assert!(t.transferred_bytes < MIB, "held back: {}", t.transferred_bytes);
+        // Lifted while running: both finish quickly, without a restart or a retry.
+        let t0 = Instant::now();
+        tm.apply_settings(&TransferSettings { download_limit_kibps: None, upload_limit_kibps: None, ..slow });
+        for id in [&down, &upload] {
+            let t = finished(&tm, id, Duration::from_secs(30)).await;
+            assert_eq!(t.status, TransferStatus::Completed, "{:?}", t.error);
+        }
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(tm.stats(&down).expect("stats").part_retries, 0);
+        assert_eq!(up.count(|r| r.method == "PUT"), 1, "sent once, not restarted");
+        assert_eq!(std::fs::read(dir.0.join("d.bin")).expect("read"), expected(size));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_panicking_transfer_still_finishes() {
         let dir = ScratchDir::new("panic");
@@ -1155,6 +1310,7 @@ mod tests {
             discarded_bytes: AtomicU64::new(0),
             file_syncs: AtomicU32::new(0),
             observer: None,
+            limit: Arc::new(Limiter::new(None)),
         });
         let jobs = [
             Job::Download { dest: PathBuf::from("x"), no_replace: false, version_id: None, within: None },
