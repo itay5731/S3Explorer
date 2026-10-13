@@ -287,6 +287,8 @@ export function Toolbar() {
   const prefix = usePane((s) => s.prefix);
   const loading = usePane((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
+  // What the explorer shows: the panel only while the active pane has a bucket open (Explorer.tsx).
+  const detailsShown = detailsOpen && !!bucket;
   const searchOpen = usePaneSearch((s) => s.open);
   const searching = usePaneSearch((s) => s.loading);
   const sel = useSelectionInfo();
@@ -478,12 +480,15 @@ export function Toolbar() {
           </div>
         )}
         <SplitButton />
+        {/* The details panel waits for an open bucket in the active pane; the toggle follows it. */}
         <button
-          className={`icon-btn lg ${detailsOpen ? "active" : ""}`}
+          className={`icon-btn lg ${detailsShown ? "active" : ""}`}
           onClick={() => setDetailsOpen(!detailsOpen)}
-          title={withKey(detailsOpen ? "Hide details" : "Show details", k.details)}
+          disabled={!bucket}
+          aria-pressed={detailsShown}
+          title={bucket ? withKey(detailsOpen ? "Hide details" : "Show details", k.details) : "Open a bucket to see details"}
         >
-          {detailsOpen ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
+          {detailsShown ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
         </button>
       </div>
     </div>

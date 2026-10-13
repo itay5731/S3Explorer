@@ -23,12 +23,10 @@ export function QuickLookModal({ bucket }: { bucket: string }) {
   const close = () => openModal(null);
 
   useEffect(() => {
-    // The key press that opened Quick look is still being dispatched when this listener is added
-    // (the module is cached after the first open, so the dialog mounts within that same event):
-    // only key presses that start after the dialog opened may close it.
-    const openedAt = performance.now();
+    // The key press that opened Quick look may still be being dispatched when this effect runs (the
+    // module is cached after the first open, so the dialog mounts within that same event): the
+    // listener is added on the next macrotask, after that event is done, so it can't close it again.
     const onKey = (e: KeyboardEvent) => {
-      if (e.timeStamp < openedAt) return;
       if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
         e.preventDefault();
@@ -41,8 +39,11 @@ export function QuickLookModal({ bucket }: { bucket: string }) {
         openModal(null);
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const timer = window.setTimeout(() => window.addEventListener("keydown", onKey), 0);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener("keydown", onKey);
+    };
   }, []);
 
   const step = (to: "up" | "down") => listKeys(activePane())?.move(to, false);

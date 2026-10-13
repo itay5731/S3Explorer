@@ -165,6 +165,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "view.single": () => setSplit(false),
   "view.split": () => setSplit(true),
   "view.details": () => {
+    if (!getPane().bucket) return no(OPEN_BUCKET);
     setDetailsOpen(!useApp.getState().detailsOpen);
   },
   "view.activity": () => setTransfersOpen(!useApp.getState().transfersOpen),

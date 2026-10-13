@@ -47,14 +47,40 @@ const isTextKey = (key: string) => {
   return TEXT_EXTENSIONS.has(extOf(key)) || name === "dockerfile";
 };
 
+/** Extensions that are never text or an image: no preview, and nothing is read for a large one. */
+const BINARY_EXTENSIONS = new Set(
+  (
+    "zip gz tgz bz2 xz zst 7z rar tar pdf parquet avro orc arrow feather exe dll so dylib bin iso img dmg msi deb rpm apk jar class " +
+    "wasm mp4 mov mkv avi webm m4v mp3 wav flac ogg m4a aac doc docx xls xlsx ppt pptx odt ods woff woff2 ttf otf db sqlite pkl npy npz h5"
+  ).split(" "),
+);
+
+const ctypeOf = (contentType: string | null | undefined) => contentType?.split(";")[0].trim().toLowerCase() ?? "";
+const TEXT_TYPES = new Set(["application/json", "application/xml", "application/x-yaml"]);
+
 /**
- * Whether a preview waits for "Load preview": anything bigger than `imageAutoBytes` that may be an
- * image, decided by size whatever the extension (an extensionless `image/jpeg` included), since an
- * image is read whole. Text files read at most `textMaxBytes`; above `imageMaxBytes` an image is
- * refused without being read.
+ * What to do with an object before reading anything (see "Object preview"):
+ * - `auto`: read it. Small objects, text files (at most `textMaxBytes` is read whatever the size) and
+ *   anything above `imageMaxBytes` (an image that big is refused without being read; anything else is
+ *   only sniffed) are always safe to read.
+ * - `ask`: a large image (by extension, or an image content type with no telling extension) is read
+ *   whole, so it waits for "Load preview". Decided by size, never by extension alone.
+ * - `binary`: a large file of a known binary type (zip, pdf, parquet…): the binary-file note, nothing read.
+ * - `pending`: large, no telling extension: the content type decides (one HeadObject first).
  */
-export const asksBeforeLoading = (o: Pick<ObjectEntry, "key" | "size">) =>
-  !isTextKey(o.key) && o.size > PREVIEW_LIMITS.imageAutoBytes && o.size <= PREVIEW_LIMITS.imageMaxBytes;
+export type PreviewGate = "auto" | "ask" | "binary" | "pending";
+export function previewGate(o: Pick<ObjectEntry, "key" | "size">, contentType?: string | null): PreviewGate {
+  if (o.size <= PREVIEW_LIMITS.imageAutoBytes || o.size > PREVIEW_LIMITS.imageMaxBytes || isTextKey(o.key)) return "auto";
+  const ext = extOf(o.key);
+  if (ext in IMAGE_TYPES) return "ask";
+  if (contentType === undefined) return BINARY_EXTENSIONS.has(ext) ? "binary" : "pending";
+  const ct = ctypeOf(contentType);
+  if (ct.startsWith("image/")) return "ask";
+  if (BINARY_EXTENSIONS.has(ext)) return "binary";
+  if (ct.startsWith("text/") || TEXT_TYPES.has(ct)) return "auto";
+  // Anything else is only sniffed (8 KiB, then at most `textMaxBytes` if it is text).
+  return "auto";
+}
 
 /** The type an image is shown as: by extension (an SVG must be `image/svg+xml` to render), else as stored. */
 function imageType(key: string, contentType: string | null): string {
@@ -90,6 +116,8 @@ type PreviewState =
   | { status: "ask" }
   /** Automatic previews are off (Settings → Behavior): loaded only when asked for. */
   | { status: "manual" }
+  /** A large file of a known binary type: nothing to show, nothing read. */
+  | { status: "binary" }
   | { status: "ok"; preview: ObjectPreview }
   | { status: "error"; error: AppError };
 
@@ -99,7 +127,26 @@ type PreviewState =
  */
 function usePreviewOf(bucket: string, o: ObjectEntry, auto: boolean): [PreviewState, () => void] {
   const id = `${bucket}\n${o.key}\n${o.etag ?? ""}\n${o.lastModified ?? ""}`;
-  const ask = !auto || asksBeforeLoading(o);
+  // The content type, read only when the extension does not tell (large files without one).
+  const [ctype, setCtype] = useState<{ id: string; value: string | null } | null>(null);
+  const known = ctype?.id === id ? ctype.value : undefined;
+  const gate = previewGate(o, known);
+  useEffect(() => {
+    if (gate !== "pending" || !auto) return;
+    let stale = false;
+    const t = setTimeout(() => {
+      api.headObject(bucket, o.key).then(
+        (m) => !stale && setCtype({ id, value: m.contentType }),
+        // Unknown: it is only sniffed, never read whole unless it is an image, so asking is the safe side.
+        () => !stale && setCtype({ id, value: "image/unknown" }),
+      );
+    }, 120);
+    return () => {
+      stale = true;
+      clearTimeout(t);
+    };
+  }, [bucket, id, o.key, gate, auto]);
+  const ask = !auto || gate !== "auto";
   const [state, setState] = useState<{ id: string; attempt: number; value: PreviewState | null }>({ id, attempt: 0, value: null });
   const [wanted, setWanted] = useState<{ id: string; attempt: number } | null>(null);
   const current = state.id === id ? state : null;
@@ -125,7 +172,15 @@ function usePreviewOf(bucket: string, o: ObjectEntry, auto: boolean): [PreviewSt
   }, [bucket, id, attempt]);
 
   const value: PreviewState =
-    attempt < 0 ? (auto ? { status: "ask" } : { status: "manual" }) : current && current.attempt === attempt && current.value ? current.value : { status: "loading" };
+    attempt < 0
+      ? !auto
+        ? { status: "manual" }
+        : gate === "pending"
+          ? { status: "loading" }
+          : gate === "binary"
+            ? { status: "binary" }
+            : { status: "ask" }
+      : current && current.attempt === attempt && current.value ? current.value : { status: "loading" };
   const load = () => setWanted((w) => ({ id, attempt: w?.id === id ? w.attempt + 1 : 1 }));
   return [value, load];
 }
@@ -264,6 +319,7 @@ export function PreviewView({ bucket, object, auto = true }: { bucket: string; o
       </div>
     );
   }
+  if (state.status === "binary") return <Unsupported reason="Binary file" />;
   if (state.status === "manual") {
     return (
       <div className="pv-none">

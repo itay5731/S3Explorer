@@ -34,7 +34,18 @@ const a = (id: string, label: string, group: KeyGroup, context: KeyContext, ...d
  * owns the chord (Cmd+W closes the window, Cmd+H hides the app, Cmd+M minimizes it).
  */
 const onMac = clientOS === "mac";
-const byOS = (other: string[], mac: string[]): string[] => (onMac ? mac : other);
+/** Per action with per-platform defaults: the defaults of the platform this is NOT (for imports). */
+const OTHER_PLATFORM_DEFAULTS = new Map<string, readonly string[]>();
+let byOSFor = "";
+const byOS = (other: string[], mac: string[]): string[] => {
+  OTHER_PLATFORM_DEFAULTS.set(byOSFor, onMac ? other : mac);
+  return onMac ? mac : other;
+};
+/** Name the action whose defaults the next `byOS` call gives. */
+const os = (id: string) => {
+  byOSFor = id;
+  return id;
+};
 
 export const KEY_ACTIONS: readonly KeyAction[] = [
   // Navigate
@@ -53,7 +64,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("nav.prevPane", "Previous pane", "Navigate", "files", "Shift+Tab"),
   // Mod+T is "Tags" (since v0.7.0), so a new tab is Mod+N.
   a("tab.new", "New tab", "Navigate", "global", "Mod+N"),
-  a("tab.close", "Close tab", "Navigate", "global", ...byOS(["Mod+W"], ["Mod+Shift+W"])),
+  a(os("tab.close"), "Close tab", "Navigate", "global", ...byOS(["Mod+W"], ["Mod+Shift+W"])),
   a("tab.next", "Next tab", "Navigate", "global", "Mod+Tab", "Mod+PageDown"),
   a("tab.prev", "Previous tab", "Navigate", "global", "Mod+Shift+Tab", "Mod+PageUp"),
   a("tab.reopen", "Reopen closed tab", "Navigate", "global", "Mod+Shift+T"),
@@ -61,7 +72,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("view.split", "Split view", "Navigate", "global", "Mod+2"),
   a("view.details", "Toggle details panel", "Navigate", "global", "Mod+I"),
   a("view.activity", "Toggle Activity panel", "Navigate", "global", "Mod+J"),
-  a("view.history", "Show the history (Activity)", "Navigate", "global", ...byOS(["Mod+H"], ["Mod+Shift+H"])),
+  a(os("view.history"), "Show the history (Activity)", "Navigate", "global", ...byOS(["Mod+H"], ["Mod+Shift+H"])),
   a("view.settings", "Settings", "Navigate", "global", "Mod+,"),
   a("help.shortcuts", "Keyboard shortcuts (cheat sheet)", "Navigate", "global", "F1", "?"),
   // Select
@@ -94,7 +105,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("act.versions", "Show versions", "Act", "files", "Mod+Shift+V"),
   a("act.restore", "Restore archived", "Act", "files"),
   a("act.preview", "Quick look", "Act", "files", "F3"),
-  a("act.editMetadata", "Edit content type and metadata", "Act", "files", ...byOS(["Mod+M"], [])),
+  a(os("act.editMetadata"), "Edit content type and metadata", "Act", "files", ...byOS(["Mod+M"], [])),
   a("act.folderSize", "Calculate folder size", "Act", "files"),
   a("act.pauseAll", "Pause all transfers", "Act", "global"),
   a("act.resumeAll", "Resume all transfers", "Act", "global"),
@@ -622,8 +633,13 @@ export function parseImport(text: string, currentOverrides: Bindings): ImportRes
       if (problem) throw new Error(`${id}: ${n}: ${problem}`);
       if (!norm.includes(n)) norm.push(n);
     }
-    bindings[id] = norm;
-    if (!sameChordList(norm, current[id])) changes.push({ id, label: act.label, from: current[id], to: norm });
+    // A file from the other platform carries that platform's defaults (Cmd+Shift+W on macOS, Ctrl+W
+    // elsewhere): they mean "the default" here, not an override. An empty list stays an explicit
+    // unbind (it is also what "unbound by default" exports as, so it is ambiguous; unbinding wins).
+    const other = OTHER_PLATFORM_DEFAULTS.get(id);
+    const asDefault = other !== undefined && other.length > 0 && sameChordList(norm, other) ? [...act.defaults] : norm;
+    bindings[id] = asDefault;
+    if (!sameChordList(asDefault, current[id])) changes.push({ id, label: act.label, from: current[id], to: asDefault });
   }
   return { bindings, changes, unknown };
 }

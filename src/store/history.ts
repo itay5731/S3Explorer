@@ -6,9 +6,9 @@ import { create } from "zustand";
 import { HISTORY_MAX_ENTRIES, HISTORY_STORAGE_KEY, type Batch, type HistoryEntry, type HistoryJob, type HistoryJobKind, type Job, type Transfer } from "../lib/types";
 import { isJobActive } from "../lib/ops";
 import { connectionKey, onForgetConnection, useApp } from "./app";
-import { isBatchActive, onBatchUpdate } from "./batches";
-import { jobRequest, onJobUpdate } from "./jobs";
-import { onTransferFinished } from "./transfers";
+import { isBatchActive, onBatchUpdate, useBatches } from "./batches";
+import { jobRequest, onJobUpdate, useJobs } from "./jobs";
+import { onTransferFinished, useTransfers } from "./transfers";
 import { useVersionDownloads } from "./versions";
 
 const TRANSFER_KINDS = new Set(["download", "upload", "folderDownload", "folderUpload"]);
@@ -114,8 +114,31 @@ function setEntries(entries: HistoryEntry[]) {
 
 function record(entry: NewEntry) {
   const rest = useHistory.getState().entries.filter((e) => e.id !== entry.id);
-  setEntries(capped([{ ...entry, connectionKey: lastKey }, ...rest]));
+  // The connection it ran on (noted when it first appeared), not the one in use when it finished.
+  const ran = ranOn.get(entry.id);
+  setEntries(capped([{ ...entry, connection: ran?.label ?? entry.connection, connectionKey: ran?.key ?? lastKey }, ...rest]));
 }
+
+/**
+ * The connection each transfer, folder transfer and job ran on, by id: noted the first time the id
+ * appears in its store (its first event arrives while that connection is in use), dropped when it
+ * leaves the store. A transfer that finishes after a disconnect or a switch keeps its own connection.
+ */
+const ranOn = new Map<string, { key: string; label: string }>();
+
+/** Note the new ids of a store, forget the removed ones (only when the id list changed). */
+function trackIds(ids: string[], prev: string[] | null, live: () => Set<string>) {
+  if (ids === prev) return;
+  for (const id of ids) if (!ranOn.has(id)) ranOn.set(id, { key: lastKey, label: lastLabel });
+  if (prev && prev.length > ids.length) {
+    const all = live();
+    for (const id of prev) if (!all.has(id)) ranOn.delete(id);
+  }
+}
+const liveIds = () => new Set([...useTransfers.getState().ids, ...useBatches.getState().ids, ...useJobs.getState().ids]);
+
+/** For tests: the connection key noted for an id. */
+export const ranOnKey = (id: string) => ranOn.get(id)?.key ?? null;
 
 /** A saved connection was deleted: its history entries go too. */
 export function forgetConnectionHistory(key: string) {
@@ -238,6 +261,14 @@ export function installHistory(): () => void {
     }
   });
   const offForget = onForgetConnection(forgetConnectionHistory);
+  trackIds(useTransfers.getState().ids, null, liveIds);
+  trackIds(useBatches.getState().ids, null, liveIds);
+  trackIds(useJobs.getState().ids, null, liveIds);
+  const offIds = [
+    useTransfers.subscribe((s, p) => trackIds(s.ids, p.ids, liveIds)),
+    useBatches.subscribe((s, p) => trackIds(s.ids, p.ids, liveIds)),
+    useJobs.subscribe((s, p) => trackIds(s.ids, p.ids, liveIds)),
+  ];
   const offTransfers = onTransferFinished((t) => {
     const e = fromTransfer(t);
     if (e) record(e);
@@ -256,6 +287,7 @@ export function installHistory(): () => void {
   return () => {
     offApp();
     offForget();
+    offIds.forEach((off) => off());
     offJobs();
     offTransfers();
     offBatches();
