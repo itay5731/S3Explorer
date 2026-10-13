@@ -4778,6 +4778,138 @@ input[type="checkbox"].switch:disabled {
   color: var(--accent-text);
 }
 
+/* The bookmarks bar (BookmarksBar.tsx): a slim row under the toolbar; chips that don't fit go under "»". */
+.bookmarks-bar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+  min-width: 0;
+}
+.bm-chips {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+.bm-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  max-width: 200px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+  flex: none;
+  transition: background 0.1s, color 0.1s;
+}
+.bm-chip:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.bm-chip:focus-visible {
+  outline: none;
+  box-shadow: inset var(--focus-ring);
+}
+.bm-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bm-icon {
+  flex: none;
+  color: var(--muted);
+}
+.bm-chip.current {
+  color: var(--text);
+  font-weight: 600;
+}
+.bm-bar-label {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  flex: none;
+  color: var(--dim);
+}
+/* The chip (or » item) of the folder the active pane is in: its icon takes the accent. */
+.bm-chip.current .bm-icon,
+.bm-current svg {
+  color: var(--accent-text);
+}
+.bm-chip.current .ficon-folder,
+.bm-current .ficon-folder {
+  color: var(--accent-text);
+  fill: color-mix(in srgb, var(--accent) 30%, transparent);
+}
+/* The chip being dragged follows the pointer above the others (useTileReorder) and ignores hit-testing. */
+.bm-chip.dragging {
+  z-index: 3;
+  background: var(--bg-elev);
+  box-shadow: var(--shadow);
+  pointer-events: none;
+}
+.bm-chips:has(.dragging) {
+  cursor: grabbing;
+}
+.bm-chip.editing {
+  max-width: none;
+  padding-right: 2px;
+}
+/* An invisible copy of every chip, only to measure how many fit. */
+.bm-measure {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  gap: 2px;
+  visibility: hidden;
+  pointer-events: none;
+}
+.bm-rename:not([type="checkbox"]) {
+  width: 160px;
+  height: 22px;
+  padding: 0 6px;
+  font-size: 12.5px;
+}
+.bm-more {
+  flex: none;
+}
+.bm-overflow {
+  position: fixed;
+  left: auto;
+  max-height: 60vh;
+  max-width: 320px;
+  overflow: auto;
+}
+/* .menu-item svg would mute the folder icon; keep the file table's colour. */
+.bm-overflow .menu-item:not(:hover):not(:focus-visible) .ficon-folder {
+  color: var(--folder);
+}
+.bm-overflow .menu-item.bm-current:not(:hover):not(:focus-visible) .ficon-folder {
+  color: var(--accent-text);
+}
+.bm-overflow .menu-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.crumb-star.on {
+  color: var(--accent-text);
+}
+
 /* Add-a-bucket dialog: the bucket name as parsed */
 .parsed-bucket {
   display: flex;

@@ -12,6 +12,7 @@ import { selectActiveJobCount, useJobs } from "./jobs";
 import { clearRecent } from "./recent";
 import { clearArchive } from "./archive";
 import { clearVersioning } from "./versions";
+import { clearBookmarksConnection, forgetBookmarks, setBookmarksConnection } from "./bookmarks";
 import { selectActiveCount, useTransfers } from "./transfers";
 import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, usePanes, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
 import { readPref, writePref } from "./prefs";
@@ -241,6 +242,7 @@ export function setConnected(info: ConnectionInfo, savedId: string | null = null
   clearRecent();
   clearArchive();
   clearVersioning();
+  setBookmarksConnection(info, savedId);
   resetPanes();
   set({
     connection: info,
@@ -266,6 +268,7 @@ export async function disconnect(cancelActive = false) {
   clearRecent();
   clearArchive();
   clearVersioning();
+  clearBookmarksConnection();
   // Both panes go; the split preference stays.
   resetPanes();
   set({
@@ -289,9 +292,10 @@ export function requestDisconnect() {
 
 /**
  * A saved connection was deleted. The backend also forgets the buckets added by name for it, so if
- * it is the one in use, the cached list of added buckets goes too.
+ * it is the one in use, the cached list of added buckets goes too. Its bookmarks go in any case.
  */
 export function forgetSavedConnection(id: string) {
+  forgetBookmarks(id, get().connection);
   if (savedConnectionId !== id) return;
   savedConnectionId = null;
   set({ addedBuckets: [], addedError: null });

@@ -35,6 +35,7 @@ import { toast } from "./toasts";
 import { currentKeys, focusBuckets, focusPaneList, listKeys, searchInput, setCheatOpen, useKeys, type MoveTarget } from "./keyboard";
 import { requestVersionsOpen, useVersioning, hasVersions } from "./versions";
 import { useRowDragView } from "../components/RowDrag";
+import { toggleBookmark } from "./bookmarks";
 
 /** What a handler did: nothing to do here (`false`: the key keeps its usual meaning), or why it can't. */
 type Outcome = void | boolean | { unavailable: string };
@@ -120,6 +121,11 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     const next = useSearch.getState().scope === "folder" ? "bucket" : "folder";
     setSearchScope(next);
     toast.info(next === "bucket" ? "Search: the whole bucket" : "Search: this folder");
+  },
+  "nav.bookmark": () => {
+    const { bucket, prefix } = getPane();
+    if (!bucket) return no(OPEN_BUCKET);
+    toggleBookmark(bucket, prefix);
   },
   "nav.nextPane": () => {
     const other = shownOtherPane();

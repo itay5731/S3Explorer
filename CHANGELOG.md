@@ -8,6 +8,7 @@ The section for a version becomes the text of its GitHub Release.
 ### New
 
 - **Folder size.** Right-click a folder and choose Calculate size, or use Calculate in the details panel, to see how many objects and how many bytes it holds. Select several folders to get their total. The size then shows in the file list too, stays for the session, and is cleared as soon as anything inside the folder is uploaded, deleted, moved or copied. Very large folders stop counting at 200,000 keys and say "at least"; Cancel stops a count at any time.
+- **Bookmarks bar.** Star a folder in the path bar, press `Ctrl+Shift+D`, or right-click folders or a bucket and choose Bookmark, and it appears as a chip in a bookmarks bar under the toolbar, one click away (middle-click or `Ctrl`+click opens it in the other pane). Chips that don't fit wait under » at the end of the bar. Bookmarks are kept per connection; drag chips to reorder, and rename or remove them from the right-click menu.
 
 ## [0.7.0] - 2026-10-11
 

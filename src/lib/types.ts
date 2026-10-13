@@ -513,3 +513,16 @@ export interface FolderSize {
 
 /** `folder_size` lists at most this many keys. */
 export const FOLDER_SIZE_SCAN_LIMIT = 200_000;
+
+// ---- Bookmarks (added on request after v0.7.0; frontend only, see "Bookmarks" in docs/CONTRACT.md) ----
+
+/** A bookmarked folder, stored per connection in localStorage. */
+export interface Bookmark {
+  bucket: string;
+  /** Verbatim from the server, "" for a bucket root. */
+  prefix: string;
+  /** Defaults to the folder name, or the bucket name at a root. */
+  label: string;
+}
+
+export const BOOKMARKS_MAX = 100;

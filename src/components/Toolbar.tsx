@@ -26,11 +26,13 @@ import {
   CopyPlus,
   Folder,
   FolderInput,
+  Star,
 } from "lucide-react";
 import { goHistory, navigate, readPref, refresh, setDetailsOpen, setFilter, setSplit, useApp, usePane, usePaneId, writePref } from "../store/app";
 import { otherPane, usePanes } from "../store/panes";
 import { getSearch, leaveSearch, requestResultsFocus, rerunSearch, runSearch, scheduleSearch, searchScheduled, setSearchScope, usePaneSearch, useSearch } from "../store/search";
 import { focusPaneListSoon, useKeyHint, withKey } from "../store/keyboard";
+import { isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
 import { clearClipboard, useClipboard } from "../store/clipboard";
 import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, useArchiveBlocked } from "../store/archive";
@@ -464,6 +466,8 @@ export function Breadcrumbs() {
   const sel = useSelectionInfo();
   // While search results are open they say what they hold; the folder's counts would only confuse.
   const searchOpen = usePaneSearch((s) => s.open);
+  const bookmarked = useBookmarks((s) => !!bucket && isBookmarked(s.items, bucket, prefix));
+  const bookmarkKey = useKeyHint("nav.bookmark");
   if (!bucket) return null;
   const segs = prefixSegments(prefix);
   const selCount = sel.folders + sel.objects;
@@ -501,6 +505,15 @@ export function Breadcrumbs() {
           aria-label="Copy path"
         >
           <Copy size={12} />
+        </button>
+        <button
+          className={`icon-btn crumb-star ${bookmarked ? "on" : ""}`}
+          onClick={() => toggleBookmark(bucket, prefix)}
+          title={withKey(bookmarked ? "Remove bookmark" : "Bookmark this folder", bookmarkKey)}
+          aria-label={bookmarked ? "Remove bookmark" : "Bookmark this folder"}
+          aria-pressed={bookmarked}
+        >
+          <Star size={12} fill={bookmarked ? "currentColor" : "none"} />
         </button>
       </nav>
       <div className="crumb-info muted" hidden={searchOpen}>
