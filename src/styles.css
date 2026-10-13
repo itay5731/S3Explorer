@@ -4190,6 +4190,14 @@ input.range:focus-visible::-webkit-slider-thumb {
   outline: none;
   box-shadow: var(--focus-ring);
 }
+/* Scrolling lists that take the keyboard focus (cheat sheet, a Settings tab): the usual ring, inset
+   so the scroll container's edge does not clip it. */
+.shortcuts-grid:focus-visible,
+.settings-panel:focus-visible {
+  outline: none;
+  box-shadow: inset var(--focus-ring);
+  border-radius: var(--radius);
+}
 .upd-actions {
   display: flex;
   gap: 8px;
@@ -6969,7 +6977,8 @@ kbd {
   gap: 6px 22px;
   overflow: auto;
   min-height: 0;
-  padding-right: 4px;
+  /* Room for the inset focus ring (the list takes the focus to scroll by keyboard). */
+  padding: 2px 6px 2px 8px;
 }
 .shortcuts-group h3 {
   margin: 6px 0 6px;

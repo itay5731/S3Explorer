@@ -956,6 +956,8 @@ function SettingsDialogInner() {
             <div
               className="settings-panel"
               role="tabpanel"
+              // Focusable, so a long tab (Keyboard) scrolls with the arrow keys, Page Up/Down, Home and End.
+              tabIndex={0}
               id={`settings-panel-${current.id}`}
               aria-labelledby={`settings-tab-${current.id}`}
             >

@@ -31,11 +31,13 @@ function Sheet() {
   useSettings((s) => s.settings?.keybindings);
   const { bindings } = currentKeys();
   const ref = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const close = () => setCheatOpen(false);
 
   useEffect(() => {
     const opener = document.activeElement as HTMLElement | null;
-    ref.current?.focus();
+    // The list takes the focus, so the arrow keys, Page Up/Down, Home and End scroll it.
+    (listRef.current ?? ref.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -43,7 +45,7 @@ function Sheet() {
         close();
       } else if (e.key === "Tab" && ref.current) {
         // Keep the focus inside the sheet.
-        const items = [...ref.current.querySelectorAll<HTMLElement>("button:not([disabled])")];
+        const items = [...ref.current.querySelectorAll<HTMLElement>("button:not([disabled]), .shortcuts-grid")];
         if (!items.length) return;
         const first = items[0];
         const last = items[items.length - 1];
@@ -79,7 +81,7 @@ function Sheet() {
             <X size={16} />
           </button>
         </div>
-        <div className="shortcuts-grid">
+        <div ref={listRef} className="shortcuts-grid" tabIndex={0} aria-label="Shortcuts list (scroll with the arrow keys)">
           {KEY_GROUPS.map((g) => (
             <section key={g} className="shortcuts-group" aria-label={g}>
               <h3 className="section-title">{g}</h3>
