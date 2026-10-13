@@ -5,6 +5,8 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-13
+
 ### New
 
 - **Tabs.** Keep several folders open in each pane and switch between them instantly. Middle-click a folder or choose **Open in new tab**; `Ctrl+N` duplicates the current tab, `Ctrl+W` closes it (`Cmd+Shift+W` on macOS), `Ctrl+Tab` / `Ctrl+Shift+Tab` (or `Ctrl+PageDown` / `Ctrl+PageUp`) move between tabs, and `Ctrl+Shift+T` brings back the last one you closed. Each tab keeps its own selection, filter, search results and back/forward history; drag tabs to reorder them. When you had more than one tab open, your tabs come back the next time you connect with the same connection.
