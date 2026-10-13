@@ -63,6 +63,11 @@ impl Bucket {
         self.rate = rate.map(|r| r as f64);
     }
 
+    /// The rate in bytes per second; `None` = unlimited.
+    pub(crate) fn rate(&self) -> Option<u64> {
+        self.rate.map(|r| r as u64)
+    }
+
     /// Asks for `n` bytes; returns the ticket to wait for, or `None` when unlimited.
     pub(crate) fn reserve(&mut self, n: u64, now: Duration) -> Option<f64> {
         self.rate?;
@@ -153,6 +158,14 @@ impl Limiter {
     /// Whether a limit is set right now.
     pub fn is_limited(&self) -> bool {
         self.limited.load(Ordering::Relaxed)
+    }
+
+    /// The limit right now in bytes per second; `None` when unlimited.
+    pub fn bytes_per_sec(&self) -> Option<u64> {
+        if !self.limited.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.lock().rate()
     }
 
     /// Gives back a ticket whose waiter left before it came up (see [`Bucket::refund`]).

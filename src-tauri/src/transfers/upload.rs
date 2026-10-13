@@ -22,26 +22,35 @@ use super::limit::Limiter;
 use super::{cancellable, plan, AbortOnDrop, PartSettings, Runner, TransferEntry};
 use crate::error::{AppError, AppResult, ErrorCode};
 
-/// Slowest uplink assumed healthy: 32 KiB/s (256 kbit/s) in total, shared evenly by every
-/// body-carrying request the app may have in flight at once. While an upload limit is set the
-/// share is the most requests the settings could ever allow at once ([`LIMITED_LINK_SHARE`]): the
-/// lowest limit (64 KiB/s) is above this rate, so a limited healthy link never hits the timeout
-/// whatever the parallelism, even after the settings change mid-transfer.
+/// Slowest uplink assumed healthy without a limit: 32 KiB/s (256 kbit/s) in total, shared evenly
+/// by every body-carrying request the app may have in flight at once.
 pub(crate) const UPLOAD_MIN_RATE: u64 = 32 * 1024;
-/// Parts per transfer x transfers at once, both at their setting maximum.
+/// Parts per transfer x transfers at once, both at their setting maximum: the most requests the
+/// upload limiter may split the limit over, whatever the settings are changed to mid-transfer.
 pub(crate) const LIMITED_LINK_SHARE: u64 =
     crate::models::MAX_CONCURRENT_PARTS_MAX as u64 * crate::models::MAX_CONCURRENT_TRANSFERS_MAX as u64;
 /// Fixed allowance per attempt (connection setup, the server committing the data, latency).
 const UPLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(60);
+/// Cap of the unlimited bound only (see [`upload_attempt_timeout`]).
 const UPLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Per-attempt bound for a request carrying `body_len` bytes when up to `share` such requests
-/// may run at once: `60 s + body_len * share / 32 KiB/s`, at most 6 h. A healthy link at or above
-/// the assumed rate always sends the body and gets the answer within it; a server that takes the
-/// whole body and then never answers is cut off instead of waiting forever.
+/// may run at once and no limit is set: `60 s + body_len * share / 32 KiB/s`, at most 6 h. A healthy
+/// link at or above the assumed rate always sends the body and gets the answer within it; a server
+/// that takes the whole body and then never answers is cut off instead of waiting forever.
 pub(crate) fn upload_attempt_timeout(body_len: u64, share: u64) -> Duration {
     let secs = body_len.saturating_mul(share.max(1)).div_ceil(UPLOAD_MIN_RATE);
     UPLOAD_TIMEOUT_BASE.saturating_add(Duration::from_secs(secs)).min(UPLOAD_TIMEOUT_MAX)
+}
+
+/// Per-attempt bound while the upload limit is `limit` bytes per second:
+/// `60 s + body_len * share / limit`, with no cap. The limiter never lets a request send faster
+/// than its share of the limit, so this is exactly the longest a healthy limited link can take, and
+/// a 6-hour cap would time out every attempt of a large part at a low limit (64 MiB x 320 at
+/// 64 KiB/s is ~91 h) and resend it until the attempts run out.
+fn limited_upload_attempt_timeout(body_len: u64, share: u64, limit: u64) -> Duration {
+    let secs = body_len.saturating_mul(share.max(1)).div_ceil(limit.max(1));
+    UPLOAD_TIMEOUT_BASE.saturating_add(Duration::from_secs(secs))
 }
 
 /// Config override for requests that carry a body (PutObject, UploadPart).
@@ -50,24 +59,25 @@ pub(crate) fn upload_attempt_timeout(body_len: u64, share: u64) -> Duration {
 /// response headers arrive, so it also covers *sending* the body. On a slow uplink a part can
 /// legitimately take minutes to send (100 MiB at 190 KiB/s is ~9 min), and every attempt would
 /// time out and start the part over. These requests replace it with an `operation_attempt_timeout`
-/// scaled to the body size ([`upload_attempt_timeout`]). The SDK still retries a timed-out
-/// attempt (the body is re-read from disk); the connect timeout is inherited from the client.
+/// scaled to the body size. The SDK still retries a timed-out attempt (the body is re-read from
+/// disk); the connect timeout is inherited from the client.
 ///
-/// While the upload limit is on (checked per request, so a limit switched on mid-transfer counts for
-/// the parts sent from then on) the share is [`LIMITED_LINK_SHARE`]: the limiter splits the limit
-/// over every request in flight, and a low limit with high parallelism must not time parts out.
-fn body_upload_config(cfg: &PartSettings, body_len: u64, limited: bool) -> aws_sdk_s3::config::Builder {
-    let t = cfg.upload_attempt_timeout.unwrap_or_else(|| upload_attempt_timeout(body_len, attempt_share(cfg, limited)));
+/// `limit` is the upload limit in bytes per second, read for every request, so a limit switched on
+/// (or changed) mid-transfer counts for the parts sent from then on; a part already in flight keeps
+/// the bound it was sent with. While it is set the bound comes from the limit itself with the share
+/// [`LIMITED_LINK_SHARE`] ([`limited_upload_attempt_timeout`]); otherwise it assumes
+/// [`UPLOAD_MIN_RATE`] shared by this transfer's requests ([`upload_attempt_timeout`]).
+fn body_upload_config(cfg: &PartSettings, body_len: u64, limit: Option<u64>) -> aws_sdk_s3::config::Builder {
+    let t = cfg.upload_attempt_timeout.unwrap_or_else(|| attempt_bound(cfg, body_len, limit));
     aws_sdk_s3::config::Builder::default()
         .timeout_config(TimeoutConfig::builder().disable_read_timeout().operation_attempt_timeout(t).build())
 }
 
-/// The share [`upload_attempt_timeout`] assumes for a request of this transfer.
-fn attempt_share(cfg: &PartSettings, limited: bool) -> u64 {
-    if limited {
-        LIMITED_LINK_SHARE.max(cfg.link_share)
-    } else {
-        cfg.link_share
+/// The per-attempt bound for a request of this transfer under upload limit `limit` (bytes/s).
+fn attempt_bound(cfg: &PartSettings, body_len: u64, limit: Option<u64>) -> Duration {
+    match limit {
+        Some(limit) => limited_upload_attempt_timeout(body_len, LIMITED_LINK_SHARE.max(cfg.link_share), limit),
+        None => upload_attempt_timeout(body_len, cfg.link_share),
     }
 }
 
@@ -213,7 +223,7 @@ pub(super) async fn run(
                 .content_length(size as i64)
                 .body(body)
                 .customize()
-                .config_override(body_upload_config(&cfg, size, entry.limit.is_limited()))
+                .config_override(body_upload_config(&cfg, size, entry.limit.bytes_per_sec()))
                 .send();
             match cancellable(&runner.token(), put).await {
                 Ok(r) => {
@@ -376,7 +386,7 @@ async fn upload_parts(
                     .content_length(len as i64)
                     .body(body)
                     .customize()
-                    .config_override(body_upload_config(&cfg, len, entry.limit.is_limited()))
+                    .config_override(body_upload_config(&cfg, len, entry.limit.bytes_per_sec()))
                     .send(),
             )
             .await??;
@@ -408,18 +418,31 @@ mod tests {
     use crate::transfers::MIB;
 
     #[test]
-    fn a_limited_upload_sizes_its_timeout_from_the_widest_share() {
+    fn a_limited_upload_sizes_its_timeout_from_the_limit_without_a_cap() {
         let cfg = PartSettings { part_size_mib: Some(8), max_parts: 1, link_share: 1, upload_attempt_timeout: None };
-        assert_eq!(attempt_share(&cfg, false), 1);
-        assert_eq!(attempt_share(&cfg, true), LIMITED_LINK_SHARE);
         assert_eq!(LIMITED_LINK_SHARE, 320);
-        // At the lowest limit split over every request the settings allow, a part still makes it.
+        // At the lowest limit split over every request the settings allow, a part still makes it,
+        // even when its real send time is far past the 6 h cap of the unlimited bound.
         let min_limit = u64::from(crate::models::BANDWIDTH_LIMIT_KIBPS_MIN) * 1024;
+        assert_eq!(min_limit, 64 * 1024);
         for len in [5 * MIB, 8 * MIB, 64 * MIB] {
             let send = Duration::from_secs(len * LIMITED_LINK_SHARE / min_limit);
-            let bound = upload_attempt_timeout(len, attempt_share(&cfg, true));
-            assert!(bound > send || bound == UPLOAD_TIMEOUT_MAX, "{len}: {bound:?} vs {send:?}");
+            let bound = attempt_bound(&cfg, len, Some(min_limit));
+            assert!(bound > send, "{len}: {bound:?} vs {send:?}");
         }
+        let send_64 = Duration::from_secs(64 * MIB * LIMITED_LINK_SHARE / min_limit);
+        assert!(send_64 > UPLOAD_TIMEOUT_MAX, "the case the cap broke: {send_64:?}");
+        assert_eq!(attempt_bound(&cfg, 64 * MIB, Some(min_limit)), UPLOAD_TIMEOUT_BASE + send_64);
+        // A transfer sharing wider than the settings maximum still gets its own share.
+        let wide = PartSettings { link_share: 640, ..cfg };
+        assert!(attempt_bound(&wide, 8 * MIB, Some(min_limit)) > attempt_bound(&cfg, 8 * MIB, Some(min_limit)));
+        // No overflow.
+        assert!(attempt_bound(&cfg, u64::MAX, Some(1)) > UPLOAD_TIMEOUT_MAX);
+        assert_eq!(limited_upload_attempt_timeout(MIB, 1, 0), limited_upload_attempt_timeout(MIB, 1, 1));
+        // Unlimited: the old behaviour, 32 KiB/s per this transfer's share, capped at 6 h.
+        assert_eq!(attempt_bound(&cfg, 8 * MIB, None), upload_attempt_timeout(8 * MIB, 1));
+        let busy = PartSettings { link_share: 320, ..cfg };
+        assert_eq!(attempt_bound(&busy, 64 * MIB, None), UPLOAD_TIMEOUT_MAX);
     }
 
     /// A throttled body dropped while its chunk waits refunds the chunk.
