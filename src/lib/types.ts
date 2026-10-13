@@ -50,6 +50,9 @@ export interface ObjectMeta extends ObjectEntry {
   restore: { inProgress: boolean; expiresAt: string | null } | null;
   /** v0.5.0: true when the object must be restored before it can be read. */
   archived: boolean;
+  /** Edit metadata (after v0.7.0): the Cache-Control and Content-Disposition headers. */
+  cacheControl: string | null;
+  contentDisposition: string | null;
 }
 
 export type TransferKind = "download" | "upload";
@@ -526,3 +529,25 @@ export interface Bookmark {
 }
 
 export const BOOKMARKS_MAX = 100;
+
+// Edit content type and metadata (added on request after v0.7.0)
+/** One object's headers to write by copying it onto itself (`update_object_metadata`). */
+export interface MetadataEdit {
+  bucket: string;
+  /** Verbatim. */
+  key: string;
+  /** The ETag the dialog showed; the copy is conditional on it. */
+  expectedEtag: string;
+  /** The LastModified the dialog showed (ISO-8601, as in ObjectMeta); the copy is conditional on it too. */
+  expectedLastModified: string;
+  /** 1..=255 printable ASCII. */
+  contentType: string;
+  /** null = no header. */
+  cacheControl: string | null;
+  /** null = no header. */
+  contentDisposition: string | null;
+  /** User metadata; replaces the old set entirely. */
+  metadata: Record<string, string>;
+}
+
+export const METADATA_LIMITS = { maxTotalBytes: 2048, maxKeyChars: 128 } as const;

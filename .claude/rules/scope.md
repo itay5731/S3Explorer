@@ -53,6 +53,8 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     `Mod+Shift+D` or the right-click menus (added on request after v0.7.0; see "Bookmarks" in `docs/CONTRACT.md`).
 30. Tabs in each pane: several locations open at once, remembered per connection (added on request after
     v0.7.0; see "Tabs" in `docs/CONTRACT.md`).
+31. Edit an object's content type, Cache-Control, Content-Disposition and user metadata (a copy onto itself,
+    confirmed before it runs; added on request after v0.7.0; see "Edit content type and metadata" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

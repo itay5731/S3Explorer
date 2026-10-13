@@ -168,6 +168,7 @@ S3 Explorer only does what your credentials allow. It needs no permissions outsi
 | Restore a version as current | `CopyObject` (or multipart copy) from a version | `s3:GetObjectVersion` and `s3:PutObject` on the objects (plus the tagging permissions to carry tags) |
 | Permanently delete a version | `DeleteObject` with a version id | `s3:DeleteObjectVersion` on the objects |
 | Restore archived objects | `HeadObject`, `RestoreObject` | `s3:RestoreObject` on the objects |
+| Edit content type and metadata | `HeadObject`, then `CopyObject` of the object onto itself (keeping its tags), then `HeadObject` to verify | `s3:GetObject`, `s3:PutObject`, `s3:GetObjectTagging` and `s3:PutObjectTagging` on the objects |
 
 Two things that surprise people:
 
@@ -225,7 +226,7 @@ Replace `my-bucket` with your bucket name. Add more buckets by adding their ARNs
 
 ### Read-only
 
-Browse, search and download, nothing else (searching by tag also needs `s3:GetObjectTagging`). Upload, new folder, delete, rename, copy, move, tag editing and lifecycle rules will fail with "Access Denied", which is the point.
+Browse, search and download, nothing else (searching by tag also needs `s3:GetObjectTagging`). Upload, new folder, delete, rename, copy, move, tag and metadata editing and lifecycle rules will fail with "Access Denied", which is the point.
 
 ```json
 {
@@ -252,12 +253,12 @@ Browse, search and download, nothing else (searching by tag also needs `s3:GetOb
 
 ### Depending on your setup
 
-- **Tagged objects.** Copying keeps an object's tags, which needs `s3:GetObjectTagging` on the source and `s3:PutObjectTagging` on the destination. The tagging permissions are in the full policy above; drop them if you never use tags.
+- **Tagged objects.** Copying, and editing an object's content type or metadata (which copies the object onto itself), keep an object's tags, which needs `s3:GetObjectTagging` on the source and `s3:PutObjectTagging` on the destination. The tagging permissions are in the full policy above; drop them if you never use tags.
 - **Shared buckets.** The owner of a bucket in another account grants you access with a bucket policy on their side; you need nothing in your own account beyond the rows above. Lifecycle rules and bucket tags on someone else's bucket are usually not granted, and the app says so.
 - **Lifecycle rules** are a bucket-level setting with real consequences. Give `s3:PutLifecycleConfiguration` only to people who should be able to schedule deletion of the bucket's contents.
 - **Versioned buckets.** Seeing and restoring versions needs `s3:ListBucketVersions` and `s3:GetObjectVersion`. `s3:DeleteObjectVersion` is the one permission in this app that allows an unrecoverable action; leave it out if you only want versions to be a safety net.
 - **Archived objects.** Restoring needs `s3:RestoreObject`, and AWS bills each restore.
-- **KMS-encrypted buckets (SSE-KMS).** Downloads need `kms:Decrypt` and uploads and copies need `kms:GenerateDataKey` on the bucket's KMS key. S3 calls KMS on your behalf; the app itself does not.
+- **KMS-encrypted buckets (SSE-KMS).** Downloads need `kms:Decrypt` and uploads, copies and metadata edits need `kms:GenerateDataKey` (metadata edits also `kms:Decrypt`) on the bucket's KMS key. S3 calls KMS on your behalf; the app itself does not.
 - **Other S3-compatible storage** (MinIO, Cloudflare R2, SeaweedFS and others) has its own permission model. The table of calls above tells you what the app will ask the server to do.
 
 The app remembers no more than it must: saved connections keep the secret key in your operating system's keychain, and an AWS profile is read from `~/.aws` each time you connect.

@@ -20,6 +20,7 @@ const UploadFolderModal = lazy(() => import("./BatchDialogs").then((m) => ({ def
 const DownloadFoldersModal = lazy(() => import("./BatchDialogs").then((m) => ({ default: m.DownloadFoldersModal })));
 const RestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ default: m.RestoreModal })));
 const BulkRestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ default: m.BulkRestoreModal })));
+const MetadataDialog = lazy(() => import("./MetadataDialog").then((m) => ({ default: m.MetadataDialog })));
 const VersionActionModal = lazy(() => import("./VersionDialogs").then((m) => ({ default: m.VersionActionModal })));
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
@@ -716,6 +717,8 @@ function ModalSwitch() {
       );
     case "objectTags":
       return <ObjectTagsModal key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} />;
+    case "editMetadata":
+      return <MetadataDialog key={`${modal.bucket}/${modal.key}`} bucket={modal.bucket} objectKey={modal.key} />;
     case "bulkTags":
       return <BulkTagsModal bucket={modal.bucket} prefix={modal.prefix} items={modal.items} />;
     case "disconnect":
