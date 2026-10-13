@@ -94,6 +94,7 @@ interface Draft {
   textWeight: number;
   accent: AccentColor;
   confirmCopyMove: boolean;
+  previewAutomatically: boolean;
   fileManager: FileManagerDraft;
   /** Overrides only (see "Settings → Keyboard" in docs/CONTRACT.md). */
   keybindings: Bindings;
@@ -144,6 +145,7 @@ const toDraft = (s: AppSettings): Draft => ({
   textWeight: s.textWeight,
   accent: s.accent,
   confirmCopyMove: s.confirmCopyMove,
+  previewAutomatically: s.previewAutomatically,
   fileManager: { mode: s.fileManagerCommand ? "program" : "system", command: s.fileManagerCommand ?? "" },
   keybindings: normalizeOverrides(s.keybindings ?? {}),
 });
@@ -194,6 +196,7 @@ function toSettings(d: Draft): AppSettings | null {
     textWeight: d.textWeight,
     accent: d.accent,
     confirmCopyMove: d.confirmCopyMove,
+    previewAutomatically: d.previewAutomatically,
     fileManagerCommand: d.fileManager.mode === "system" ? null : normalizeFileManagerCommand(d.fileManager.command),
     keybindings: normalizeOverrides(d.keybindings),
     downloadLimitKibps: t.downLimit.unlimited ? null : limitKibps(t.downLimit),
@@ -255,6 +258,7 @@ const TABS: SettingsTab[] = [
     render: (ctx) => (
       <BehaviorTab
         confirmCopyMove={ctx.draft.confirmCopyMove}
+        previewAutomatically={ctx.draft.previewAutomatically}
         fileManager={ctx.draft.fileManager}
         fileManagerError={
           fileManagerError(ctx.draft.fileManager) ??
@@ -262,11 +266,20 @@ const TABS: SettingsTab[] = [
         }
         disabled={ctx.disabled}
         onConfirmCopyMoveChange={(confirmCopyMove) => ctx.update({ ...ctx.draft, confirmCopyMove })}
+        onPreviewAutomaticallyChange={(previewAutomatically) => ctx.update({ ...ctx.draft, previewAutomatically })}
         onFileManagerChange={(fileManager) => ctx.update({ ...ctx.draft, fileManager })}
       />
     ),
-    reset: (d) => ({ ...d, confirmCopyMove: DEFAULT_DRAFT.confirmCopyMove, fileManager: DEFAULT_DRAFT.fileManager }),
-    atDefaults: (d) => d.confirmCopyMove === DEFAULT_DRAFT.confirmCopyMove && d.fileManager.mode === "system",
+    reset: (d) => ({
+      ...d,
+      confirmCopyMove: DEFAULT_DRAFT.confirmCopyMove,
+      previewAutomatically: DEFAULT_DRAFT.previewAutomatically,
+      fileManager: DEFAULT_DRAFT.fileManager,
+    }),
+    atDefaults: (d) =>
+      d.confirmCopyMove === DEFAULT_DRAFT.confirmCopyMove &&
+      d.previewAutomatically === DEFAULT_DRAFT.previewAutomatically &&
+      d.fileManager.mode === "system",
   },
   {
     id: "appearance",

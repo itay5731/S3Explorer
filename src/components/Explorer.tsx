@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
 import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNarrow, useApp, writePref } from "../store/app";
@@ -245,11 +245,29 @@ function useSidebarResize() {
   return { workspace, style, onPointerDown, reset: () => save(null) };
 }
 
+/**
+ * The toolbar's rendered height as `--toolbar-h` on the app, so the sidebar's bucket head lines up
+ * with it at every text size (the toolbar's height follows its buttons, not a fixed number).
+ */
+function useToolbarHeightVar(main: RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const bar = main.current?.querySelector<HTMLElement>(":scope > .toolbar");
+    const app = main.current?.closest<HTMLElement>(".app");
+    if (!bar || !app) return;
+    const apply = () => app.style.setProperty("--toolbar-h", `${bar.getBoundingClientRect().height}px`);
+    apply();
+    const ro = new ResizeObserver(apply);
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, [main]);
+}
+
 export function Explorer() {
   const active = useApp((s) => s.activePane);
   const shown = useApp((s) => s.split && !s.narrow);
-  // The details panel is there from the start too (empty until an item is selected).
-  const detailsOpen = useApp((s) => s.detailsOpen);
+  // The details panel waits for an open bucket (the toolbar and search row are there from the start).
+  const bucket = usePanes((s) => s[active].bucket);
+  const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
   const dropTarget = useFileDrop();
   const sidebar = useSidebarResize();
   const main = useNarrowWatch();
@@ -263,6 +281,7 @@ export function Explorer() {
   useEffect(() => installTagEffects(), []);
   useEffect(() => installArchiveEffects(), []);
   useEffect(() => installFolderSizeEffects(), []);
+  useToolbarHeightVar(main);
 
   return (
     <div className="app">

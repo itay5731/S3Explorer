@@ -1960,7 +1960,9 @@ input[type="checkbox"] {
 }
 /* The buckets head is as tall as the toolbar, so the filter box below it sits on the search row's line. */
 .sidebar-buckets > .sidebar-head {
-  height: 46px;
+  /* Measured from the toolbar (Explorer.tsx), so it follows the text size; 46px before the first measure. */
+  height: var(--toolbar-h, 46px);
+  box-sizing: border-box;
 }
 /* The sidebar is split by share: buckets on top, newest files below (see useSplit in Sidebar.tsx). */
 .sidebar-buckets {
@@ -4487,6 +4489,15 @@ input[type="checkbox"].switch:disabled {
 }
 .hint.err-text {
   color: var(--danger);
+}
+/* A hint long enough to wrap: the text wraps beside its icon, not under it. */
+.hint.hint-block {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+.hint.hint-block > svg {
+  flex: none;
+  margin-top: 2px;
 }
 .form-error-body {
   display: flex;
@@ -7201,6 +7212,11 @@ kbd {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+/* The table's Size cell while a folder with a size is recalculated. */
+.fsize-cell-spin {
+  vertical-align: -1px;
+  margin-right: 4px;
 }
 
 /* ---- Tabs (after v0.7.0): a pane's tab strip, above its path bar, shown with two or more tabs ---- */

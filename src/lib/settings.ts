@@ -91,6 +91,7 @@ export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
   a.textWeight === b.textWeight &&
   a.accent === b.accent &&
   a.confirmCopyMove === b.confirmCopyMove &&
+  a.previewAutomatically === b.previewAutomatically &&
   (a.downloadLimitKibps ?? null) === (b.downloadLimitKibps ?? null) &&
   (a.uploadLimitKibps ?? null) === (b.uploadLimitKibps ?? null) &&
   (a.fileManagerCommand ?? null) === (b.fileManagerCommand ?? null) &&
@@ -130,6 +131,7 @@ export function validateAppSettings(s: AppSettings): { field: keyof AppSettings;
   }
   if (!ACCENT_COLORS.includes(s.accent)) return { field: "accent", message: `Must be one of ${ACCENT_COLORS.join(", ")}.` };
   if (typeof s.confirmCopyMove !== "boolean") return { field: "confirmCopyMove", message: "Must be true or false." };
+  if (typeof s.previewAutomatically !== "boolean") return { field: "previewAutomatically", message: "Must be true or false." };
   const fm = validateFileManagerCommand(s.fileManagerCommand ?? null);
   if (fm) return { field: "fileManagerCommand", message: fm };
   const kb = validateKeybindings(s.keybindings);

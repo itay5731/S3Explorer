@@ -61,12 +61,23 @@ export function contentTypeError(s: string): string | null {
 /** Cache-Control / Content-Disposition: empty means "no header". */
 export const optionalHeaderError = (s: string) => (s === "" ? null : headerValueError(s));
 
+/**
+ * A metadata key is the tail of an `x-amz-meta-*` header name: an HTTP token (RFC 7230 `tchar`),
+ * lowercase, since S3 lowercases names on the way in. The same rule as `is_metadata_key` in
+ * src-tauri/src/metadata.rs.
+ */
+export const METADATA_KEY_RE = /^[a-z0-9!#$%&'*+.^_`|~-]+$/;
+
 export function metaKeyError(key: string): string | null {
   if (key === "") return "Enter a key.";
   if (key.length > METADATA_LIMITS.maxKeyChars) return `At most ${METADATA_LIMITS.maxKeyChars} characters (this has ${key.length}).`;
-  if (!/^[a-z0-9-]+$/.test(key)) return "Use lowercase letters a-z, digits and hyphens only.";
+  if (/[A-Z]/.test(key)) return "Use lowercase letters; S3 stores metadata keys in lowercase.";
+  if (!METADATA_KEY_RE.test(key)) return "Use letters a-z, digits and ! # $ % & ' * + - . ^ _ ` | ~ only (no spaces).";
   return null;
 }
+
+/** A user metadata value: may be empty; otherwise a header value that survives the round trip. */
+export const metaValueError = (s: string) => (s === "" ? null : headerValueError(s));
 
 /** User metadata size as S3 counts it: keys and values in UTF-8 bytes. */
 export const metadataBytes = (pairs: [string, string][]) => pairs.reduce((n, [k, v]) => n + utf8Bytes(k) + utf8Bytes(v), 0);
@@ -85,7 +96,7 @@ export function metadataEditError(edit: MetadataEdit): string | null {
   for (const [k, v] of pairs) {
     const ke = metaKeyError(k);
     if (ke) return `Metadata key “${k}”: ${ke}`;
-    const ve = headerValueError(v);
+    const ve = metaValueError(v);
     if (ve) return `The value of metadata key “${k}”: ${ve}`;
   }
   const total = metadataBytes(pairs);

@@ -31,25 +31,71 @@ import * as api from "../lib/api";
 import type { AppError, HistoryEntry, HistoryJob, HistoryKind } from "../lib/types";
 import { basename, displayName, formatBytes, formatExact, formatRelative, parentPrefix, refusedToOpen, sanitizeFileName } from "../lib/format";
 import { plural } from "../lib/ops";
-import { openModal, setTransfersOpen } from "../store/app";
+import { connectionKey, openModal, setTransfersOpen, useApp } from "../store/app";
 import { copyText } from "../store/actions";
 import { clearHistory, removeHistory, useHistory } from "../store/history";
-import { scheduleTransferResync } from "../store/transfers";
+import { scheduleTransferResync, useTransfers } from "../store/transfers";
+import { useBatches } from "../store/batches";
 import { rememberVersionDownload, shortVersionId } from "../store/versions";
 import { toast, toastFailure } from "../store/toasts";
 import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
 import { ModalShell } from "./Modals";
-import { copyPathItem, goFolder, goItem, goObject, useKnownBucket } from "./activityItems";
+import { copyPathItem, goFolder, goObject, useKnownBucket } from "./activityItems";
 
 // ---- panel state -------------------------------------------------------------------------------
 
 export type HistoryFilter = "all" | "transfers" | "jobs";
 
-/** Which tab the Activity panel shows, and the History filter chip and search text. */
-export const useActivityTab = create<{ tab: "now" | "history"; filter: HistoryFilter; query: string }>(() => ({ tab: "now", filter: "all", query: "" }));
+/**
+ * Which tab the Activity panel shows, the History filter chip and search text, and whether History
+ * shows every connection's entries (`allConnections`) or only the current connection's (the default).
+ */
+export const useActivityTab = create<{ tab: "now" | "history"; filter: HistoryFilter; query: string; allConnections: boolean }>(() => ({
+  tab: "now",
+  filter: "all",
+  query: "",
+  allConnections: false,
+}));
 const showNow = () => useActivityTab.setState({ tab: "now" });
 
+/** The entries the History tab lists before the chips and search: this connection's, or all. */
+function useScopedEntries(): HistoryEntry[] {
+  const entries = useHistory((s) => s.entries);
+  const all = useActivityTab((s) => s.allConnections);
+  // Re-read when the connection changes (the key itself lives outside the store).
+  const connection = useApp((s) => s.connection);
+  return useMemo(() => {
+    if (all) return entries;
+    const key = connection ? connectionKey() : null;
+    return key ? entries.filter((e) => e.connectionKey === key) : entries;
+  }, [entries, all, connection]);
+}
+
 export const useHistoryCount = () => useHistory((s) => s.entries.length);
+
+/**
+ * Whether an entry's "Go to …", "Download again" and "Upload again" apply here: only on the connection
+ * it ran on (same `connectionKey()`), and only while its bucket is one of this connection's buckets.
+ * The reason is the hint and tooltip of the disabled item.
+ */
+type Availability = { ok: true } | { ok: false; hint: string; title: string };
+function useAvailability(): (e: HistoryEntry, bucket: string) => Availability {
+  const known = useKnownBucket();
+  const connection = useApp((s) => s.connection);
+  return useMemo(() => {
+    const key = connection ? connectionKey() : null;
+    return (e: HistoryEntry, bucket: string): Availability => {
+      if (!key || e.connectionKey !== key) return { ok: false, hint: "Other connection", title: "From another connection" };
+      if (!known(bucket)) return { ok: false, hint: "Not in this connection", title: `s3://${bucket} is not one of this connection's buckets` };
+      return { ok: true };
+    };
+  }, [known, connection]);
+}
+
+/** A menu item that is disabled, with the reason, when the entry does not apply to this connection. */
+function gated(item: PopupMenuItem, avail: Availability): PopupMenuItem {
+  return avail.ok ? item : { ...item, action: () => {}, disabled: true, hint: avail.hint, title: avail.title };
+}
 
 const ROW_H = 44;
 
@@ -201,8 +247,8 @@ function jobGoLabel(e: HistoryEntry, j: HistoryJob): string {
   return e.kind !== "delete" && j.items === 1 && j.first && !j.first.endsWith("/") ? "Go to object" : "Go to folder";
 }
 
-function jobMenuGroups(e: HistoryEntry, j: HistoryJob, known: boolean, el: HTMLElement | null): PopupMenuItem[][] {
-  const go = goItem(jobGoLabel(e, j), jobTargetBucket(j), known, () => jobGo(e, j));
+function jobMenuGroups(e: HistoryEntry, j: HistoryJob, avail: Availability, el: HTMLElement | null): PopupMenuItem[][] {
+  const go = gated({ label: jobGoLabel(e, j), icon: <LocateFixed size={14} />, action: () => jobGo(e, j) }, avail);
   const copies: PopupMenuItem[] = [{ label: "Copy source path", icon: <Copy size={14} />, action: () => void copyText(jobSource(j), "Source path") }];
   const dest = jobDest(j);
   if (dest) copies.push({ label: "Copy destination path", icon: <Copy size={14} />, action: () => void copyText(dest, "Destination path") });
@@ -213,9 +259,22 @@ function jobMenuGroups(e: HistoryEntry, j: HistoryJob, known: boolean, el: HTMLE
 
 // ---- actions -----------------------------------------------------------------------------------
 
-/** Downloads that can be opened: a finished file, or a folder transfer that wrote something. */
-const canOpen = (e: HistoryEntry) =>
-  ((e.kind === "download" && e.status === "completed") || (e.kind === "folderDownload" && e.files > 0)) && !refusedToOpen(e.localPath);
+/**
+ * Downloads that can be opened: a finished file, or a folder transfer that wrote something, while the
+ * transfer or folder transfer is still in the Activity list (`open_local` only accepts downloads the
+ * backend still knows; Show in folder works for any path).
+ */
+const canOpen = (e: HistoryEntry, live: boolean) =>
+  live && ((e.kind === "download" && e.status === "completed") || (e.kind === "folderDownload" && e.files > 0)) && !refusedToOpen(e.localPath);
+
+/** Is the entry's transfer or folder transfer still in the backend's list (this session, not removed)? */
+function useLive(e: HistoryEntry): boolean {
+  const transfer = useTransfers((s) => e.kind === "download" && !!s.byId[e.id]);
+  const batch = useBatches((s) => e.kind === "folderDownload" && !!s.byId[e.id]);
+  return transfer || batch;
+}
+const isLive = (e: HistoryEntry) =>
+  (e.kind === "download" && !!useTransfers.getState().byId[e.id]) || (e.kind === "folderDownload" && !!useBatches.getState().byId[e.id]);
 /** Show in folder: anything that finished on this computer (the local file or folder of an upload too). */
 const canShow = (e: HistoryEntry) => e.status === "completed" || (e.kind === "folderDownload" && e.files > 0);
 
@@ -296,18 +355,16 @@ function againLabel(e: HistoryEntry) {
   return isDownload(e.kind) ? "Download again" : "Upload again";
 }
 
-function menuGroups(e: HistoryEntry, known: boolean, el: HTMLElement | null): PopupMenuItem[][] {
+function menuGroups(e: HistoryEntry, avail: Availability, el: HTMLElement | null): PopupMenuItem[][] {
   const j = jobOf(e);
-  if (j) return jobMenuGroups(e, j, known, el);
+  if (j) return jobMenuGroups(e, j, avail, el);
   const open: PopupMenuItem[] = [];
-  if (canOpen(e)) {
+  if (canOpen(e, isLive(e))) {
     open.push({ label: e.kind === "folderDownload" ? "Open folder" : "Open file", icon: <ExternalLink size={14} />, action: () => void openEntry(e) });
   }
   if (canShow(e)) open.push({ label: "Show in folder", icon: <FolderSearch size={14} />, action: () => void showEntry(e) });
-  const go = goItem(isFolder(e.kind) ? "Go to folder" : "Go to object", e.bucket, known, () => goToEntry(e));
-  const again: PopupMenuItem = known
-    ? { label: againLabel(e), icon: <RotateCw size={14} />, action: () => void runAgain(e) }
-    : { label: againLabel(e), icon: <RotateCw size={14} />, action: () => {}, disabled: true, hint: "Other connection", title: `s3://${e.bucket} is not one of this connection's buckets` };
+  const go = gated({ label: isFolder(e.kind) ? "Go to folder" : "Go to object", icon: <LocateFixed size={14} />, action: () => goToEntry(e) }, avail);
+  const again = gated({ label: againLabel(e), icon: <RotateCw size={14} />, action: () => void runAgain(e) }, avail);
   const copyKey: PopupMenuItem = isFolder(e.kind)
     ? { label: "Copy prefix", icon: <Copy size={14} />, action: () => void copyText(e.key, "Prefix") }
     : { label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(e.key, "Key") };
@@ -341,8 +398,8 @@ function menuProps(id: string) {
 function HistoryMenu() {
   const menu = useHistoryMenu((s) => s.menu);
   const entry = useHistory((s) => (menu ? s.entries.find((e) => e.id === menu.id) : undefined));
-  const known = useKnownBucket();
-  const groups = useMemo(() => (menu && entry ? menuGroups(entry, known(targetBucket(entry)), menu.el) : null), [menu, entry, known]);
+  const availability = useAvailability();
+  const groups = useMemo(() => (menu && entry ? menuGroups(entry, availability(entry, targetBucket(entry)), menu.el) : null), [menu, entry, availability]);
   const close = () => {
     const el = useHistoryMenu.getState().menu?.el;
     useHistoryMenu.setState({ menu: null });
@@ -364,7 +421,7 @@ const targetBucket = (e: HistoryEntry) => {
   return j ? jobTargetBucket(j) : e.bucket;
 };
 
-const JobHistoryRow = memo(function JobHistoryRow({ e, j, known, now, top }: { e: HistoryEntry; j: HistoryJob; known: boolean; now: number; top: number }) {
+const JobHistoryRow = memo(function JobHistoryRow({ e, j, avail, now, top }: { e: HistoryEntry; j: HistoryJob; avail: Availability; now: number; top: number }) {
   const Icon = KIND_ICON[e.kind];
   const { label, icon: StatusIcon } = STATUS[e.status];
   const tip = jobTooltip(e, j);
@@ -401,11 +458,15 @@ const JobHistoryRow = memo(function JobHistoryRow({ e, j, known, now, top }: { e
         {label}
       </div>
       <div className="xactions hactions">
-        {known && (
-          <button className="icon-btn" onClick={() => jobGo(e, j)} title={jobGoLabel(e, j)} aria-label={jobGoLabel(e, j)}>
-            <LocateFixed size={14} />
-          </button>
-        )}
+        <button
+          className="icon-btn"
+          onClick={() => jobGo(e, j)}
+          disabled={!avail.ok}
+          title={avail.ok ? jobGoLabel(e, j) : `${jobGoLabel(e, j)}: ${avail.title}`}
+          aria-label={jobGoLabel(e, j)}
+        >
+          <LocateFixed size={14} />
+        </button>
         <button className="icon-btn" onClick={(ev) => removeEntry(e, ev.currentTarget.closest<HTMLElement>(".xrow"))} title="Remove from history" aria-label="Remove from history">
           <X size={14} />
         </button>
@@ -414,8 +475,10 @@ const JobHistoryRow = memo(function JobHistoryRow({ e, j, known, now, top }: { e
   );
 });
 
-const HistoryRow = memo(function HistoryRow({ e, known, now, top }: { e: HistoryEntry; known: boolean; now: number; top: number }) {
+const HistoryRow = memo(function HistoryRow({ e, avail, now, top }: { e: HistoryEntry; avail: Availability; now: number; top: number }) {
   const Icon = KIND_ICON[e.kind];
+  const live = useLive(e);
+  const goLabel = isFolder(e.kind) ? "Go to folder" : "Go to object";
   const { label, icon: StatusIcon } = STATUS[e.status];
   const where = entryWhere(e);
   return (
@@ -443,7 +506,7 @@ const HistoryRow = memo(function HistoryRow({ e, known, now, top }: { e: History
         {label}
       </div>
       <div className="xactions hactions">
-        {canOpen(e) && (
+        {canOpen(e, live) && (
           <button className="icon-btn" onClick={() => void openEntry(e)} title={e.kind === "folderDownload" ? "Open folder" : "Open file"} aria-label="Open">
             <ExternalLink size={14} />
           </button>
@@ -453,16 +516,18 @@ const HistoryRow = memo(function HistoryRow({ e, known, now, top }: { e: History
             <FolderSearch size={14} />
           </button>
         )}
-        {known && (
-          <button className="icon-btn" onClick={() => goToEntry(e)} title={isFolder(e.kind) ? "Go to folder" : "Go to object"} aria-label={isFolder(e.kind) ? "Go to folder" : "Go to object"}>
-            <LocateFixed size={14} />
-          </button>
-        )}
-        {known && (
-          <button className="icon-btn" onClick={() => void runAgain(e)} title={againLabel(e)} aria-label={againLabel(e)}>
-            <RotateCw size={14} />
-          </button>
-        )}
+        <button className="icon-btn" onClick={() => goToEntry(e)} disabled={!avail.ok} title={avail.ok ? goLabel : `${goLabel}: ${avail.title}`} aria-label={goLabel}>
+          <LocateFixed size={14} />
+        </button>
+        <button
+          className="icon-btn"
+          onClick={() => void runAgain(e)}
+          disabled={!avail.ok}
+          title={avail.ok ? againLabel(e) : `${againLabel(e)}: ${avail.title}`}
+          aria-label={againLabel(e)}
+        >
+          <RotateCw size={14} />
+        </button>
         <button className="icon-btn" onClick={(ev) => removeEntry(e, ev.currentTarget.closest<HTMLElement>(".xrow"))} title="Remove from history" aria-label="Remove from history">
           <X size={14} />
         </button>
@@ -481,10 +546,11 @@ function matches(e: HistoryEntry, q: string): boolean {
 
 /** The History tab's list (the panel body). */
 export function HistoryList() {
-  const entries = useHistory((s) => s.entries);
+  const entries = useScopedEntries();
+  const total = useHistoryCount();
   const query = useActivityTab((s) => s.query);
   const filter = useActivityTab((s) => s.filter);
-  const known = useKnownBucket();
+  const availability = useAvailability();
   const scrollRef = useRef<HTMLDivElement>(null);
   // "5 minutes ago" moves on while the panel is open.
   const [now, setNow] = useState(() => Date.now());
@@ -506,10 +572,15 @@ export function HistoryList() {
 
   return (
     <div className="transfers-body history-body" ref={scrollRef}>
-      {entries.length === 0 ? (
+      {total === 0 ? (
         <div className="empty-note">
           <History size={16} />
           Nothing here yet. Finished uploads, downloads and file operations are listed here, and kept after you close the app.
+        </div>
+      ) : entries.length === 0 ? (
+        <div className="empty-note">
+          <History size={16} />
+          Nothing from this connection yet. Choose “All connections” to see the others.
         </div>
       ) : shown.length === 0 ? (
         <div className="empty-note">
@@ -521,9 +592,9 @@ export function HistoryList() {
             const e = shown[v.index];
             const j = jobOf(e);
             return j ? (
-              <JobHistoryRow key={e.id} e={e} j={j} known={known(jobTargetBucket(j))} now={now} top={v.start} />
+              <JobHistoryRow key={e.id} e={e} j={j} avail={availability(e, jobTargetBucket(j))} now={now} top={v.start} />
             ) : (
-              <HistoryRow key={e.id} e={e} known={known(e.bucket)} now={now} top={v.start} />
+              <HistoryRow key={e.id} e={e} avail={availability(e, e.bucket)} now={now} top={v.start} />
             );
           })}
         </div>
@@ -581,6 +652,8 @@ export function HistoryBar() {
   const count = useHistoryCount();
   const query = useActivityTab((s) => s.query);
   const filter = useActivityTab((s) => s.filter);
+  const all = useActivityTab((s) => s.allConnections);
+  const connected = useApp((s) => !!s.connection);
   const [confirming, setConfirming] = useState(false);
   return (
     <>
@@ -591,6 +664,16 @@ export function HistoryBar() {
               {f.label}
             </button>
           ))}
+          {connected && (
+            <button
+              className={`hchip hchip-conn ${all ? "active" : ""}`}
+              aria-pressed={all}
+              title={all ? "Showing the history of every connection" : "Showing this connection's history only"}
+              onClick={() => useActivityTab.setState({ allConnections: !all })}
+            >
+              All connections
+            </button>
+          )}
         </div>
       )}
       {count > 0 && (

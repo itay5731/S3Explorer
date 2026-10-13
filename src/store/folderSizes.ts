@@ -1,6 +1,7 @@
 // Folder sizes calculated on request (see "Folder size" in docs/CONTRACT.md), cached per bucket +
 // prefix for the session. Anything that changes what is under a cached folder drops its entry (and
-// cancels its scan), so a stale size is never shown.
+// cancels its scan): a size is cleared by changes made in this app (changes made elsewhere are
+// not seen until it is recalculated).
 
 import { create } from "zustand";
 import * as api from "../lib/api";

@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import { HISTORY_MAX_ENTRIES, HISTORY_STORAGE_KEY, type Batch, type HistoryEntry, type HistoryJob, type HistoryJobKind, type Job, type Transfer } from "../lib/types";
 import { isJobActive } from "../lib/ops";
-import { useApp } from "./app";
+import { connectionKey, onForgetConnection, useApp } from "./app";
 import { isBatchActive, onBatchUpdate } from "./batches";
 import { jobRequest, onJobUpdate } from "./jobs";
 import { onTransferFinished } from "./transfers";
@@ -29,7 +29,8 @@ function validJob(j: unknown): j is HistoryJob {
 }
 
 /** A stored entry is kept only when every field has the right type (the store may be from another version or edited). */
-function valid(e: unknown): e is HistoryEntry {
+/** `connectionKey` is not checked: entries from before it existed read as "" (another connection). */
+function valid(e: unknown): e is Omit<HistoryEntry, "connectionKey"> {
   if (!e || typeof e !== "object") return false;
   const h = e as Record<string, unknown>;
   return (
@@ -48,21 +49,59 @@ function valid(e: unknown): e is HistoryEntry {
   );
 }
 
+/** An entry as the recorders build it; `record` adds the connection key. */
+type NewEntry = Omit<HistoryEntry, "connectionKey">;
+
+/** Separate caps, so one big multi-download cannot push every file operation out (and the reverse). */
+export const HISTORY_MAX_TRANSFERS = 400;
+export const HISTORY_MAX_JOBS = HISTORY_MAX_ENTRIES - HISTORY_MAX_TRANSFERS;
+
+/** Newest first; at most HISTORY_MAX_TRANSFERS transfers and HISTORY_MAX_JOBS jobs. */
+function capped(entries: HistoryEntry[]): HistoryEntry[] {
+  let transfers = 0;
+  let jobs = 0;
+  return entries.filter((e) => (e.job ? ++jobs <= HISTORY_MAX_JOBS : ++transfers <= HISTORY_MAX_TRANSFERS));
+}
+
 function load(): HistoryEntry[] {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(HISTORY_STORAGE_KEY) ?? "[]");
-    return Array.isArray(parsed) ? parsed.filter(valid).slice(0, HISTORY_MAX_ENTRIES) : [];
+    if (!Array.isArray(parsed)) return [];
+    return capped(
+      parsed.filter(valid).map((e) => {
+        const k = (e as Partial<HistoryEntry>).connectionKey;
+        return { ...e, connectionKey: typeof k === "string" ? k : "" };
+      }),
+    );
   } catch {
     return [];
   }
 }
 
-function save(entries: HistoryEntry[]) {
+/** Writes are coalesced: a burst of finished transfers costs one write, half a second after the last. */
+const SAVE_DELAY_MS = 500;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function writeNow() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = null;
   try {
-    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(entries));
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(useHistory.getState().entries));
   } catch {
     /* storage full or unavailable: the list still works for this session */
   }
+}
+
+function scheduleSave() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(writeNow, SAVE_DELAY_MS);
+}
+
+// A pending write is not lost when the window closes.
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => {
+    if (saveTimer) writeNow();
+  });
 }
 
 /** Newest first. */
@@ -70,12 +109,19 @@ export const useHistory = create<{ entries: HistoryEntry[] }>(() => ({ entries: 
 
 function setEntries(entries: HistoryEntry[]) {
   useHistory.setState({ entries });
-  save(entries);
+  scheduleSave();
 }
 
-function record(entry: HistoryEntry) {
+function record(entry: NewEntry) {
   const rest = useHistory.getState().entries.filter((e) => e.id !== entry.id);
-  setEntries([entry, ...rest].slice(0, HISTORY_MAX_ENTRIES));
+  setEntries(capped([{ ...entry, connectionKey: lastKey }, ...rest]));
+}
+
+/** A saved connection was deleted: its history entries go too. */
+export function forgetConnectionHistory(key: string) {
+  const entries = useHistory.getState().entries;
+  const kept = entries.filter((e) => e.connectionKey !== key);
+  if (kept.length !== entries.length) setEntries(kept);
 }
 
 export function removeHistory(ids: string[]) {
@@ -87,11 +133,17 @@ export function clearHistory() {
   setEntries([]);
 }
 
+/** Flush a pending write at once (tests, and before the store is read back). */
+export function flushHistory() {
+  if (saveTimer) writeNow();
+}
+
 // The last connection seen: transfers cancelled by a disconnect finish after the connection is gone.
 let lastLabel = "";
+let lastKey = "";
 const connectionLabel = () => useApp.getState().connection?.label ?? lastLabel;
 
-function fromTransfer(t: Transfer): HistoryEntry | null {
+function fromTransfer(t: Transfer): NewEntry | null {
   if (t.status !== "completed" && t.status !== "failed" && t.status !== "cancelled") return null;
   return {
     id: t.id,
@@ -109,7 +161,7 @@ function fromTransfer(t: Transfer): HistoryEntry | null {
   };
 }
 
-function fromBatch(b: Batch): HistoryEntry | null {
+function fromBatch(b: Batch): NewEntry | null {
   if (b.status !== "completed" && b.status !== "failed" && b.status !== "cancelled") return null;
   return {
     id: b.id,
@@ -132,7 +184,7 @@ function folderOf(keyOrPrefix: string): string {
   return body.slice(0, body.lastIndexOf("/") + 1);
 }
 
-function fromJob(j: Job): HistoryEntry | null {
+function fromJob(j: Job): NewEntry | null {
   if (j.status !== "completed" && j.status !== "failed" && j.status !== "cancelled") return null;
   // The request names the items; it is known for every job started in this session.
   const req = jobRequest(j.id);
@@ -178,9 +230,14 @@ function fromJob(j: Job): HistoryEntry | null {
 /** Record transfers, folder transfers and jobs as they reach a final status. */
 export function installHistory(): () => void {
   lastLabel = useApp.getState().connection?.label ?? lastLabel;
+  lastKey = connectionKey() ?? lastKey;
   const offApp = useApp.subscribe((s) => {
-    if (s.connection) lastLabel = s.connection.label;
+    if (s.connection) {
+      lastLabel = s.connection.label;
+      lastKey = connectionKey() ?? lastKey;
+    }
   });
+  const offForget = onForgetConnection(forgetConnectionHistory);
   const offTransfers = onTransferFinished((t) => {
     const e = fromTransfer(t);
     if (e) record(e);
@@ -198,6 +255,7 @@ export function installHistory(): () => void {
   });
   return () => {
     offApp();
+    offForget();
     offJobs();
     offTransfers();
     offBatches();

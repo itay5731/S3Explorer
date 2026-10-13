@@ -2189,9 +2189,11 @@ function mockPreview(bucket: string, key: string, o: MockObject): ObjectPreview 
   const p: ObjectPreview = { kind: "unsupported", contentType: o.contentType, size: o.size, truncated: false, text: null, dataBase64: null, reason: null };
   const ext = key.slice(key.lastIndexOf("/") + 1).toLowerCase().split(".").pop() ?? "";
   if (needsRestore(bucket, key, o)) return { ...p, reason: "Archived: restore it to preview" };
-  if (PREVIEW_IMAGE_EXT.includes(ext)) {
+  // An image extension, or (with no text extension) an image content type, like the backend.
+  const imageType = !PREVIEW_TEXT_EXT.has(ext) && o.contentType.startsWith("image/");
+  if (PREVIEW_IMAGE_EXT.includes(ext) || imageType) {
     if (o.size > PREVIEW_LIMITS.imageMaxBytes) return { ...p, reason: "Too large to preview" };
-    return { ...p, kind: "image", dataBase64: mockImage(key, ext) };
+    return { ...p, kind: "image", dataBase64: mockImage(key, PREVIEW_IMAGE_EXT.includes(ext) ? ext : o.contentType === "image/jpeg" ? "jpg" : "png") };
   }
   if (PREVIEW_TEXT_EXT.has(ext) || o.contentType.startsWith("text/")) {
     return { ...p, kind: "text", text: mockText(key, ext), truncated: o.size > PREVIEW_LIMITS.textMaxBytes };
@@ -2429,6 +2431,15 @@ async function mockFolderSize(id: string, bucket: string, prefix: string): Promi
 Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   setFolderSizeLimit: (n: number | null) => {
     folderSizeLimit = n ?? FOLDER_SIZE_SCAN_LIMIT;
+  },
+  /** Add an object as a test fixture, with the content type given (else from its extension). */
+  putFixture: (bucket: string, key: string, size: number, contentType?: string, storageClass?: string) => {
+    const b = buckets.get(bucket);
+    if (!b) return false;
+    put(b, key, size, storageClass ? { storageClass } : {});
+    const o = b.objects.get(key);
+    if (o && contentType) o.contentType = contentType;
+    return true;
   },
 });
 
@@ -2799,6 +2810,13 @@ export const mockBackend: Backend = {
       throw fail("Conflict", "The object changed since the dialog opened, so nothing was written. Reload to edit the current version.");
     }
     if (o.size > MAX_EDIT_BYTES) throw fail("InvalidInput", "The object is larger than 5 GiB, the most S3 can copy in one request, so its metadata cannot be edited here.");
+    // GLACIER / DEEP_ARCHIVE, restored or not: the copy would put the data back in the archive.
+    if (o.storageClass === "GLACIER" || o.storageClass === "DEEP_ARCHIVE") {
+      throw fail(
+        "NotSupported",
+        `The object is in ${o.storageClass}. Editing metadata copies the object, which would put it back in the archive (a restored copy would be lost), so it cannot be edited here.`,
+      );
+    }
     if (needsRestore(edit.bucket, edit.key, o)) throw fail("InvalidInput", "The object is archived; restore it first to edit its metadata.");
     if (b.readOnly) throw fail("AccessDenied", DENIED_WRITE.slice("AccessDenied: ".length));
     // A copy onto itself: a new object (and version) with the same body, storage class and tags.
@@ -3136,6 +3154,7 @@ export const mockBackend: Backend = {
       textWeight: next.textWeight,
       accent: next.accent,
       confirmCopyMove: next.confirmCopyMove,
+      previewAutomatically: next.previewAutomatically,
       // Like the backend: trimmed, empty becomes null; the field is required.
       fileManagerCommand: typeof next.fileManagerCommand === "string" ? normalizeFileManagerCommand(next.fileManagerCommand) : next.fileManagerCommand,
       // Like the backend: a missing field is {} (a settings.json without it loads {}).
@@ -3148,6 +3167,7 @@ export const mockBackend: Backend = {
       if (candidate[f] === undefined) throw fail("InvalidInput", `${f}: required.`);
     }
     if (candidate.fileManagerCommand === undefined) throw fail("InvalidInput", "fileManagerCommand: required.");
+    if (candidate.previewAutomatically === undefined) throw fail("InvalidInput", "previewAutomatically: required.");
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
     settings = candidate;

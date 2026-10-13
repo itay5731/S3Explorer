@@ -208,9 +208,11 @@ export function DetailsPanel() {
     const metaEntries = m ? Object.entries(m.metadata) : [];
     const editBlocked = !m
       ? null
-      : m.archived
-        ? "The object is archived; restore it first to edit its metadata"
-        : m.size > MAX_EDIT_BYTES
+      : isArchiveClass(m.storageClass)
+        ? "Objects in Glacier or Deep Archive can’t be edited: the copy would put them back in the archive"
+        : m.archived
+          ? "The object is archived; restore it first to edit its metadata"
+          : m.size > MAX_EDIT_BYTES
           ? "Objects over 5 GiB can’t be edited (S3 copies at most 5 GiB in one request)"
           : null;
     const editable = !!m && !editBlocked;
@@ -227,7 +229,6 @@ export function DetailsPanel() {
             <div className="muted small">{formatBytes(obj.size)}</div>
           </div>
         </div>
-        <PreviewSection bucket={bucket} object={obj} />
         <div className="dactions">
           <button className="btn" onClick={() => void downloadObjects([obj])} disabled={blocked} title={blocked ? ARCHIVED_REASON : undefined}>
             <Download size={14} /> Download
@@ -253,6 +254,7 @@ export function DetailsPanel() {
             {obj.key}
           </Field>
         </div>
+        <PreviewSection bucket={bucket} object={obj} />
         <ObjectTagsSection bucket={bucket} objKey={obj.key} />
         <VersionsSection bucket={bucket} objKey={obj.key} name={obj.name} />
         <div className="dsection">

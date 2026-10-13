@@ -29,6 +29,13 @@ const a = (id: string, label: string, group: KeyGroup, context: KeyContext, ...d
   defaults,
 });
 
+/**
+ * Per-platform defaults: `mac` on macOS, `other` on Windows and Linux. Used where the macOS menu bar
+ * owns the chord (Cmd+W closes the window, Cmd+H hides the app, Cmd+M minimizes it).
+ */
+const onMac = clientOS === "mac";
+const byOS = (other: string[], mac: string[]): string[] => (onMac ? mac : other);
+
 export const KEY_ACTIONS: readonly KeyAction[] = [
   // Navigate
   a("nav.open", "Open folder / go to object", "Navigate", "files", "Enter"),
@@ -44,15 +51,17 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("nav.bookmark", "Bookmark this folder", "Navigate", "global", "Mod+Shift+D"),
   a("nav.nextPane", "Next pane", "Navigate", "files", "Tab"),
   a("nav.prevPane", "Previous pane", "Navigate", "files", "Shift+Tab"),
-  a("tab.new", "New tab", "Navigate", "global", "Mod+Alt+T"),
-  a("tab.close", "Close tab", "Navigate", "global", "Mod+W"),
+  // Mod+T is "Tags" (since v0.7.0), so a new tab is Mod+N.
+  a("tab.new", "New tab", "Navigate", "global", "Mod+N"),
+  a("tab.close", "Close tab", "Navigate", "global", ...byOS(["Mod+W"], ["Mod+Shift+W"])),
   a("tab.next", "Next tab", "Navigate", "global", "Mod+Tab", "Mod+PageDown"),
   a("tab.prev", "Previous tab", "Navigate", "global", "Mod+Shift+Tab", "Mod+PageUp"),
-  a("tab.reopen", "Reopen closed tab", "Navigate", "global", "Mod+Alt+Shift+T"),
+  a("tab.reopen", "Reopen closed tab", "Navigate", "global", "Mod+Shift+T"),
   a("view.single", "Single view", "Navigate", "global", "Mod+1"),
   a("view.split", "Split view", "Navigate", "global", "Mod+2"),
   a("view.details", "Toggle details panel", "Navigate", "global", "Mod+I"),
   a("view.activity", "Toggle Activity panel", "Navigate", "global", "Mod+J"),
+  a("view.history", "Show the history (Activity)", "Navigate", "global", ...byOS(["Mod+H"], ["Mod+Shift+H"])),
   a("view.settings", "Settings", "Navigate", "global", "Mod+,"),
   a("help.shortcuts", "Keyboard shortcuts (cheat sheet)", "Navigate", "global", "F1", "?"),
   // Select
@@ -85,6 +94,10 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("act.versions", "Show versions", "Act", "files", "Mod+Shift+V"),
   a("act.restore", "Restore archived", "Act", "files"),
   a("act.preview", "Quick look", "Act", "files", "F3"),
+  a("act.editMetadata", "Edit content type and metadata", "Act", "files", ...byOS(["Mod+M"], [])),
+  a("act.folderSize", "Calculate folder size", "Act", "files"),
+  a("act.pauseAll", "Pause all transfers", "Act", "global"),
+  a("act.resumeAll", "Resume all transfers", "Act", "global"),
   a("act.disconnect", "Disconnect", "Act", "global", "Mod+Shift+Q"),
 ];
 
@@ -186,7 +199,7 @@ export function normalizeChord(text: string): string | null {
   return c ? chordToString(c) : null;
 }
 
-const isMac = clientOS === "mac";
+const isMac = onMac;
 
 /**
  * The chord as this platform presses it, for matching: `Mod` resolves to Ctrl (Windows, Linux) or

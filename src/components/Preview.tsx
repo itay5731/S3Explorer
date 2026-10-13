@@ -2,11 +2,12 @@
 // docs/CONTRACT.md). Shown at the top of the details panel and, larger, in Quick look (QuickLook.tsx).
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, FileQuestion, ImageDown, Loader2, Maximize2, RotateCw } from "lucide-react";
+import { AlertCircle, Eye, FileQuestion, ImageDown, Loader2, Maximize2, RotateCw } from "lucide-react";
 import * as api from "../lib/api";
 import { PREVIEW_LIMITS, type AppError, type ObjectEntry, type ObjectPreview } from "../lib/types";
 import { openModal } from "../store/app";
 import { useKeyHint, withKey } from "../store/keyboard";
+import { useSettings } from "../store/settings";
 import { formatBytes } from "../lib/format";
 
 // ---- kinds -------------------------------------------------------------------------------------
@@ -30,7 +31,30 @@ const extOf = (key: string) => {
   return i >= 0 ? name.slice(i + 1) : "";
 };
 
-const isImageKey = (key: string) => extOf(key) in IMAGE_TYPES;
+/**
+ * Text extensions the backend previews as text (see "Object preview" in docs/CONTRACT.md). A text
+ * extension wins over an image content type, so such a file is never read whole: at most the first
+ * `textMaxBytes`, whatever its size.
+ */
+const TEXT_EXTENSIONS = new Set(
+  (
+    "txt md markdown json jsonl csv tsv log xml yaml yml toml ini conf cfg env sql sh bat ps1 py js mjs ts tsx jsx css scss html htm " +
+    "rs go java kt c h cpp cs rb php swift tf hcl properties gitignore dockerfile"
+  ).split(" "),
+);
+const isTextKey = (key: string) => {
+  const name = key.slice(key.lastIndexOf("/") + 1).toLowerCase();
+  return TEXT_EXTENSIONS.has(extOf(key)) || name === "dockerfile";
+};
+
+/**
+ * Whether a preview waits for "Load preview": anything bigger than `imageAutoBytes` that may be an
+ * image, decided by size whatever the extension (an extensionless `image/jpeg` included), since an
+ * image is read whole. Text files read at most `textMaxBytes`; above `imageMaxBytes` an image is
+ * refused without being read.
+ */
+export const asksBeforeLoading = (o: Pick<ObjectEntry, "key" | "size">) =>
+  !isTextKey(o.key) && o.size > PREVIEW_LIMITS.imageAutoBytes && o.size <= PREVIEW_LIMITS.imageMaxBytes;
 
 /** The type an image is shown as: by extension (an SVG must be `image/svg+xml` to render), else as stored. */
 function imageType(key: string, contentType: string | null): string {
@@ -64,6 +88,8 @@ type PreviewState =
   | { status: "loading" }
   /** A large image: loaded only when asked for. */
   | { status: "ask" }
+  /** Automatic previews are off (Settings → Behavior): loaded only when asked for. */
+  | { status: "manual" }
   | { status: "ok"; preview: ObjectPreview }
   | { status: "error"; error: AppError };
 
@@ -71,9 +97,9 @@ type PreviewState =
  * The preview of `o`, tagged with the object it was read for so a late answer for a previous
  * selection is never shown. Images above `imageAutoBytes` wait for `load()`.
  */
-function usePreviewOf(bucket: string, o: ObjectEntry): [PreviewState, () => void] {
+function usePreviewOf(bucket: string, o: ObjectEntry, auto: boolean): [PreviewState, () => void] {
   const id = `${bucket}\n${o.key}\n${o.etag ?? ""}\n${o.lastModified ?? ""}`;
-  const ask = isImageKey(o.key) && o.size > PREVIEW_LIMITS.imageAutoBytes && o.size <= PREVIEW_LIMITS.imageMaxBytes;
+  const ask = !auto || asksBeforeLoading(o);
   const [state, setState] = useState<{ id: string; attempt: number; value: PreviewState | null }>({ id, attempt: 0, value: null });
   const [wanted, setWanted] = useState<{ id: string; attempt: number } | null>(null);
   const current = state.id === id ? state : null;
@@ -99,24 +125,34 @@ function usePreviewOf(bucket: string, o: ObjectEntry): [PreviewState, () => void
   }, [bucket, id, attempt]);
 
   const value: PreviewState =
-    attempt < 0 ? { status: "ask" } : current && current.attempt === attempt && current.value ? current.value : { status: "loading" };
+    attempt < 0 ? (auto ? { status: "ask" } : { status: "manual" }) : current && current.attempt === attempt && current.value ? current.value : { status: "loading" };
   const load = () => setWanted((w) => ({ id, attempt: w?.id === id ? w.attempt + 1 : 1 }));
   return [value, load];
 }
 
 // ---- rendering ---------------------------------------------------------------------------------
 
-/** `<img>` from a `blob:` URL of the bytes (allowed by the CSP's `img-src blob:`), revoked on change. */
+/**
+ * `<img>` from a `blob:` URL of the bytes (allowed by the CSP's `img-src blob:`). The URL is made and
+ * revoked by the same effect and kept in state, so StrictMode's simulated unmount (which runs the
+ * cleanup and then the effect again) never leaves the image pointing at a revoked URL.
+ */
 function ImageView({ data, type, alt }: { data: string; type: string; alt: string }) {
-  const url = useMemo(() => {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
     const bin = atob(data);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    return URL.createObjectURL(new Blob([bytes], { type }));
+    const made = URL.createObjectURL(new Blob([bytes], { type }));
+    setUrl(made);
+    return () => {
+      URL.revokeObjectURL(made);
+      setUrl((u) => (u === made ? null : u));
+    };
   }, [data, type]);
-  useEffect(() => () => URL.revokeObjectURL(url), [url]);
   const [broken, setBroken] = useState(false);
   if (broken) return <Unsupported reason="This image could not be shown" />;
+  if (!url) return <div className="pv-image" />;
   return (
     <div className="pv-image">
       <img src={url} alt={alt} draggable={false} onError={() => setBroken(true)} />
@@ -209,8 +245,8 @@ export function Unsupported({ reason }: { reason: string }) {
 }
 
 /** The preview area for one object: loading, the ask for a large image, an error with Retry, or the content. */
-export function PreviewView({ bucket, object }: { bucket: string; object: ObjectEntry }) {
-  const [state, load] = usePreviewOf(bucket, object);
+export function PreviewView({ bucket, object, auto = true }: { bucket: string; object: ObjectEntry; auto?: boolean }) {
+  const [state, load] = usePreviewOf(bucket, object, auto);
   if (state.status === "loading") {
     return (
       <div className="pv-none">
@@ -224,6 +260,15 @@ export function PreviewView({ bucket, object }: { bucket: string; object: Object
       <div className="pv-none">
         <button type="button" className="btn btn-sm" onClick={load}>
           <ImageDown size={13} /> Load preview ({formatBytes(object.size)})
+        </button>
+      </div>
+    );
+  }
+  if (state.status === "manual") {
+    return (
+      <div className="pv-none">
+        <button type="button" className="btn btn-sm" onClick={load} title="Read the start of the file to show what is inside">
+          <Eye size={13} /> Preview
         </button>
       </div>
     );
@@ -259,6 +304,8 @@ export function PreviewView({ bucket, object }: { bucket: string; object: Object
 /** The details panel's Preview section (one object selected). */
 export function PreviewSection({ bucket, object }: { bucket: string; object: ObjectEntry }) {
   const hint = useKeyHint("act.preview");
+  // Settings → Behavior, "Preview files automatically" (Quick look always reads).
+  const auto = useSettings((s) => s.settings?.previewAutomatically ?? true);
   return (
     <div className="dsection pv-section">
       <div className="dsection-title dsection-title-row">
@@ -267,7 +314,7 @@ export function PreviewSection({ bucket, object }: { bucket: string; object: Obj
           <Maximize2 size={12} /> Quick look
         </button>
       </div>
-      <PreviewView key={`${bucket}\n${object.key}`} bucket={bucket} object={object} />
+      <PreviewView key={`${bucket}\n${object.key}`} bucket={bucket} object={object} auto={auto} />
     </div>
   );
 }

@@ -10,15 +10,15 @@ import {
   COMMON_CONTENT_TYPES,
   MAX_EDIT_BYTES,
   contentTypeError,
-  headerValueError,
   metaKeyError,
+  metaValueError,
   metadataBytes,
   metadataChanges,
   optionalHeaderError,
   type MetadataChange,
 } from "../lib/metadata";
 import { formatStorageClass, s3Uri } from "../lib/format";
-import { openModal } from "../store/app";
+import { openModal, replaceListedObject } from "../store/app";
 import { isArchiveClass, rememberArchiveMeta } from "../store/archive";
 import { bumpObject, ensureVersioning, hasVersions, useVersioning } from "../store/versions";
 import { isDenied, nothingWritten, permissionText, toast } from "../store/toasts";
@@ -121,7 +121,7 @@ export function MetadataDialog({ bucket, objectKey }: { bucket: string; objectKe
     for (const r of form.rows) counts.set(r.key, (counts.get(r.key) ?? 0) + 1);
     const rows = form.rows.map((r) => ({
       key: metaKeyError(r.key) ?? ((counts.get(r.key) ?? 0) > 1 ? "This key is used more than once." : null),
-      value: headerValueError(r.value),
+      value: metaValueError(r.value),
     }));
     const bytes = metadataBytes(form.rows.map((r) => [r.key, r.value]));
     const fields = {
@@ -150,15 +150,19 @@ export function MetadataDialog({ bucket, objectKey }: { bucket: string; objectKe
   const changes = meta && edit ? metadataChanges(meta, edit) : [];
   const blocked = !meta
     ? null
-    : meta.archived
-      ? "The object is archived; restore it first to edit its metadata."
-      : meta.size > MAX_EDIT_BYTES
+    : isArchiveClass(meta.storageClass)
+      ? `The object is in ${formatStorageClass(meta.storageClass ?? "")}. Editing metadata copies the object, which would put it back in the archive (a restored copy would be lost), so it can’t be edited here.`
+      : meta.archived
+        ? "The object is archived; restore it first to edit its metadata."
+        : meta.size > MAX_EDIT_BYTES
         ? "The object is larger than 5 GiB, the most S3 can copy in one request, so its metadata can’t be edited here."
         : !meta.etag || !meta.lastModified
           ? "The server didn’t report an ETag and last-modified time for this object, so the edit can’t be made safely."
           : null;
   const versioned = hasVersions(versioning);
-  const restoredArchive = !!meta && isArchiveClass(meta.storageClass) && !meta.archived;
+  // Intelligent-Tiering archive tiers (an object that was restored from one): the copy is a new object,
+  // so it starts again in the Frequent Access tier.
+  const intelligentTiering = !!meta && meta.storageClass === "INTELLIGENT_TIERING" && !!meta.restore;
 
   const set = (patch: Partial<Form>) => {
     setForm((f) => (f ? { ...f, ...patch } : f));
@@ -192,6 +196,8 @@ export function MetadataDialog({ bucket, objectKey }: { bucket: string; objectKe
       const fresh = await api.updateObjectMetadata(pending);
       rememberArchiveMeta(bucket, fresh);
       bumpObject(bucket, objectKey);
+      // Every pane and tab listing the object shows its new Last modified (and ETag) at once.
+      replaceListedObject(bucket, { key: fresh.key, name: fresh.name, size: fresh.size, lastModified: fresh.lastModified, etag: fresh.etag, storageClass: fresh.storageClass });
       toast.success("Metadata saved", s3Uri(bucket, objectKey));
       close();
     } catch (err) {
@@ -247,11 +253,16 @@ export function MetadataDialog({ bucket, objectKey }: { bucket: string; objectKe
               <Info size={12} /> The object is replaced by the copy; its last-modified time changes.
             </p>
           )}
-          {restoredArchive && (
+          <p className="hint hint-block">
+            <Info size={12} />
+            <span>Object ACL grants are not kept: the copy gets the bucket’s default (private unless the bucket says otherwise).</span>
+          </p>
+          {intelligentTiering && (
             <div className="callout warn">
               <AlertTriangle size={15} />
               <span>
-                The copy is written back to {formatStorageClass(meta.storageClass ?? "")}, so it will need a new restore before it can be read.
+                The object was restored from an Intelligent-Tiering archive tier: the copy is a new object, so it starts again in the
+                Frequent Access tier and moves back to the archive tiers only by the bucket’s Intelligent-Tiering configuration.
               </span>
             </div>
           )}

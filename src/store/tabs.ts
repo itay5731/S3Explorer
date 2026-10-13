@@ -10,7 +10,9 @@ import {
   isPaneShown,
   isSplitShown,
   navigate,
+  onBucketForgotten,
   onConnectionChange,
+  onForgetConnection,
   readPref,
   refresh,
   refreshInPlace,
@@ -286,13 +288,18 @@ function persist() {
   writePref(TABS_KEY, all);
 }
 
-/** Open a connection's remembered tabs (the second pane's only in split view). */
+/**
+ * Open a connection's remembered tabs (the second pane's only in split view). Only when some pane had
+ * two or more tabs: a single remembered location is not restored, so a connection without tabs still
+ * starts at the bucket list.
+ */
 function restore(key: string) {
   const stored = readAll()[key];
   if (!isObject(stored)) return;
   const panes = PANE_IDS.filter((p) => p === "a" || useApp.getState().split)
     .map((p) => ({ pane: p, saved: parsePane(stored[p]) }))
     .filter((x): x is { pane: PaneId; saved: StoredPane } => !!x.saved);
+  if (!panes.some((x) => x.saved.tabs.length >= 2)) return;
   for (const { pane, saved } of panes) {
     const at = saved.tabs[saved.active];
     // With both panes remembered, neither follows the other to its first bucket.
@@ -308,6 +315,43 @@ function restore(key: string) {
     );
   }
 }
+
+/** A saved connection was deleted: forget its remembered tabs. */
+onForgetConnection((key) => {
+  const all = readAll();
+  if (!(key in all)) return;
+  delete all[key];
+  writePref(TABS_KEY, all);
+  if (persistKey === key) lastWritten = "";
+});
+
+/**
+ * An added bucket was removed from the list (and is not one of the listed buckets): it leaves the
+ * closed-tab list and this connection's remembered tabs. Open tabs are closed by the caller.
+ */
+function forgetBucketTabs(bucket: string) {
+  for (let i = closed.length - 1; i >= 0; i--) if (closed[i].at.bucket === bucket) closed.splice(i, 1);
+  if (!persistKey) return;
+  const all = readAll();
+  const stored = all[persistKey];
+  if (!isObject(stored)) return;
+  let changed = false;
+  for (const p of PANE_IDS) {
+    const pane = parsePane(stored[p]);
+    if (!pane) continue;
+    const activeLoc = pane.tabs[pane.active];
+    const tabs = pane.tabs.filter((t) => t.bucket !== bucket);
+    if (tabs.length === pane.tabs.length) continue;
+    changed = true;
+    if (!tabs.length) delete stored[p];
+    else stored[p] = { tabs, active: Math.max(0, tabs.indexOf(activeLoc)) };
+  }
+  if (!changed) return;
+  writePref(TABS_KEY, all);
+  lastWritten = "";
+}
+
+onBucketForgotten(forgetBucketTabs);
 
 onConnectionChange((key) => {
   persistKey = null;

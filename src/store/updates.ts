@@ -9,6 +9,51 @@ import { readPref, writePref } from "./prefs";
 
 /** The version the user last saw running: "What's new" shows once when it changes. */
 const SEEN_KEY = "s3x.seenVersion";
+/** The update the user answered "Later" to: the popup opens again only for a newer one. */
+export const LATER_KEY = "s3x.updateLaterVersion";
+
+/** Compare two versions (`0.8.0`, `v0.10.1`, `1.0.0-rc.1`): negative, zero or positive. */
+export function compareVersions(a: string, b: string): number {
+  const parse = (v: string) => {
+    const [core, pre] = v.trim().replace(/^v/i, "").split("-", 2);
+    return { nums: core.split(".").map((n) => Number.parseInt(n, 10) || 0), pre: pre ?? null };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < Math.max(x.nums.length, y.nums.length); i++) {
+    const d = (x.nums[i] ?? 0) - (y.nums[i] ?? 0);
+    if (d) return d;
+  }
+  // A pre-release comes before its release.
+  if (x.pre === y.pre) return 0;
+  if (x.pre === null) return 1;
+  if (y.pre === null) return -1;
+  return x.pre < y.pre ? -1 : 1;
+}
+
+/** Should the popup open for this version, or did the user say Later to it (or a newer one)? */
+function laterSaidFor(version: string | null): boolean {
+  const later = readPref<string | null>(LATER_KEY, null);
+  return typeof later === "string" && !!version && compareVersions(version, later) <= 0;
+}
+
+/** Has this window's storage any preference of an earlier version (so this is not a fresh install)? */
+function hasEarlierPreferences(): boolean {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("s3x.") && k !== SEEN_KEY && !k.startsWith("s3x.mock.")) return true;
+    }
+  } catch {
+    /* storage unavailable: treat as a fresh install */
+  }
+  return false;
+}
+/**
+ * Read once when the app starts, before anything of this session is written (the theme mirror is
+ * written as soon as the settings load), so a fresh install is told apart from an upgrade.
+ */
+const EXISTING_USER_AT_START = hasEarlierPreferences();
 
 
 export type CheckStatus = "idle" | "checking" | "done" | "error";
@@ -74,8 +119,10 @@ export async function checkForUpdates({ silent = false } = {}): Promise<void> {
     const info = await api.checkForUpdate();
     set({ status: "done", info, error: null, checkedAt: Date.now(), version: info.currentVersion });
     if (silent && info.available) {
-      // Opens the version dialog (taking the place of "What's new" if that is up).
-      set({ notice: true, dialog: true });
+      // The title-bar pill always shows; the dialog opens (taking the place of "What's new" if that is
+      // up) unless the user said Later to this version.
+      if (laterSaidFor(info.latestVersion)) set({ notice: true });
+      else set({ notice: true, dialog: true });
     }
   } catch (e) {
     if (!silent) set({ status: "error", error: e as AppError });
@@ -103,12 +150,21 @@ export const dismissUpdateNotice = () => set({ notice: false });
 /** Reopen the version dialog (the title-bar pill). */
 export const openUpdateDialog = () => set({ dialog: true });
 
-/** Close the version dialog; "What's new" is done with (the update offer stays in the title-bar pill). */
-export const closeUpdateDialog = () => set({ dialog: false, whatsNew: null });
+/**
+ * Close the version dialog; "What's new" is done with (the update offer stays in the title-bar pill).
+ * Closing the update offer (Later, Esc, the backdrop) remembers its version: the popup opens again at
+ * launch only for a newer one.
+ */
+export function closeUpdateDialog() {
+  const { notice, info } = get();
+  if (notice && info?.available && info.latestVersion) writePref(LATER_KEY, info.latestVersion);
+  set({ dialog: false, whatsNew: null });
+}
 
 /**
  * Once per version: the first launch after an update shows what changed, from the changelog
- * bundled with the app. The very first launch only records the version.
+ * bundled with the app. A launch without a recorded version shows it too when other preferences
+ * exist (an upgrade from a version that did not record it); only a fresh install just records it.
  */
 export async function checkWhatsNew(): Promise<void> {
   await loadVersion();
@@ -116,8 +172,9 @@ export async function checkWhatsNew(): Promise<void> {
   if (!version) return;
   const seen = readPref<string | null>(SEEN_KEY, null);
   if (seen === version) return;
+  const existingUser = seen !== null || EXISTING_USER_AT_START;
   writePref(SEEN_KEY, version);
-  if (seen === null) return;
+  if (!existingUser) return;
   const notes = releaseNotes(version);
   if (notes) set({ dialog: true, whatsNew: notes });
 }

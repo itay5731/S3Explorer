@@ -4,7 +4,7 @@
 import { useContext } from "react";
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry, ObjectVersion } from "../lib/types";
+import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionConfig, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry, ObjectVersion } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
 import { clearClipboard } from "./clipboard";
 import { selectActiveBatchCount, useBatches } from "./batches";
@@ -242,6 +242,68 @@ async function fetchPage(pane: PaneId, bucket: string, prefix: string, token: st
 
 /** The saved connection the app is connected through (null: connected without saving, or not connected). */
 let savedConnectionId: string | null = null;
+/** The key of the connection in use (see `connectionKey`); null while disconnected. */
+let currentConnectionKey: string | null = null;
+
+/**
+ * The connection in use, after a window reload: the webview reconnects through `connection_status`
+ * without knowing the saved id or the full credentials identity, so the last key is kept for the
+ * tab's session and reused when the reconnected `ConnectionInfo` matches it.
+ */
+const CONNECTION_SESSION_KEY = "s3x.connection.session";
+interface ConnectionSession {
+  key: string;
+  savedId: string | null;
+  label: string;
+  region: string;
+  endpoint: string | null;
+}
+
+function readConnectionSession(): ConnectionSession | null {
+  try {
+    const v = sessionStorage.getItem(CONNECTION_SESSION_KEY);
+    const s = v ? (JSON.parse(v) as Partial<ConnectionSession>) : null;
+    if (!s || typeof s.key !== "string" || typeof s.label !== "string" || typeof s.region !== "string") return null;
+    return { key: s.key, savedId: typeof s.savedId === "string" ? s.savedId : null, label: s.label, region: s.region, endpoint: typeof s.endpoint === "string" ? s.endpoint : null };
+  } catch {
+    return null;
+  }
+}
+
+function writeConnectionSession(s: ConnectionSession | null) {
+  try {
+    if (s) sessionStorage.setItem(CONNECTION_SESSION_KEY, JSON.stringify(s));
+    else sessionStorage.removeItem(CONNECTION_SESSION_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/**
+ * The identity of a connection made without saving it, from what was typed in: the kind plus the
+ * profile name or the access key id (never a secret), the endpoint and the region.
+ */
+export function connectionIdentity(config: ConnectionConfig, info: ConnectionInfo): string {
+  const who = config.kind === "profile" ? `profile:${config.profile}` : `static:${config.accessKeyId.trim()}`;
+  return `conn:${who}|${info.endpoint ?? ""}|${info.region}`;
+}
+
+/** The saved connection's key, as `connectionKey()` returns it while connected through it. */
+export const savedConnectionKey = (id: string) => `saved:${id}`;
+
+/**
+ * One key for everything remembered per connection (tabs, bookmarks, history): `saved:<id>` when
+ * connected through a saved connection, else the kind, profile or access key id, endpoint and region
+ * (`connectionIdentity`). Null while disconnected. Never only the display label, never a secret.
+ */
+export function connectionKey(): string | null {
+  return currentConnectionKey;
+}
+
+/** The saved connection in use, or null. */
+export function currentSavedConnectionId(): string | null {
+  return savedConnectionId;
+}
 
 const connectionListeners = new Set<(key: string | null) => void>();
 /**
@@ -258,14 +320,31 @@ function resetPanes() {
   for (const id of PANE_IDS) resetPane(id);
 }
 
-export function setConnected(info: ConnectionInfo, savedId: string | null = null) {
+/**
+ * Connected. `savedId`: through a saved connection. `identity`: from `connectionIdentity` when the
+ * config is known (a connection made without saving); without either (a window reload), the key the
+ * window used before is reused when the connection matches, else one from the label, endpoint and region.
+ */
+export function setConnected(info: ConnectionInfo, savedId: string | null = null, identity: string | null = null) {
   notifyConnection(null);
+  let key: string;
+  if (savedId) key = savedConnectionKey(savedId);
+  else if (identity) key = identity;
+  else {
+    const s = readConnectionSession();
+    if (s && s.label === info.label && s.region === info.region && s.endpoint === info.endpoint) {
+      key = s.key;
+      savedId = s.savedId;
+    } else key = `conn:${info.label}|${info.endpoint ?? ""}|${info.region}`;
+  }
+  writeConnectionSession({ key, savedId, label: info.label, region: info.region, endpoint: info.endpoint });
   savedConnectionId = savedId;
+  currentConnectionKey = key;
   clearClipboard();
   clearRecent();
   clearArchive();
   clearVersioning();
-  setBookmarksConnection(info, savedId);
+  setBookmarksConnection(key);
   resetPanes();
   set({
     connection: info,
@@ -277,7 +356,7 @@ export function setConnected(info: ConnectionInfo, savedId: string | null = null
   });
   if (info.canListBuckets) void loadBuckets();
   void loadAddedBuckets();
-  notifyConnection(savedId ? `saved:${savedId}` : `conn:${info.label}|${info.endpoint ?? ""}|${info.region}`);
+  notifyConnection(key);
 }
 
 /** `cancelActive`: cancel every queued or running transfer, folder transfer and job before disconnecting. */
@@ -289,6 +368,8 @@ export async function disconnect(cancelActive = false) {
     /* disconnect is best effort */
   }
   savedConnectionId = null;
+  currentConnectionKey = null;
+  writeConnectionSession(null);
   clearClipboard();
   clearRecent();
   clearArchive();
@@ -317,13 +398,23 @@ export function requestDisconnect() {
 
 /**
  * A saved connection was deleted. The backend also forgets the buckets added by name for it, so if
- * it is the one in use, the cached list of added buckets goes too. Its bookmarks go in any case.
+ * it is the one in use, the cached list of added buckets goes too. Everything remembered for it in
+ * this app goes in any case: bookmarks, remembered tabs and history entries.
  */
 export function forgetSavedConnection(id: string) {
-  forgetBookmarks(id, get().connection);
+  const key = savedConnectionKey(id);
+  forgetBookmarks(key);
+  forgetConnectionListeners.forEach((cb) => cb(key));
   if (savedConnectionId !== id) return;
   savedConnectionId = null;
   set({ addedBuckets: [], addedError: null });
+}
+
+const forgetConnectionListeners = new Set<(key: string) => void>();
+/** Called with a connection key whose remembered state (tabs, bookmarks, history) must be forgotten. */
+export function onForgetConnection(cb: (key: string) => void): () => void {
+  forgetConnectionListeners.add(cb);
+  return () => forgetConnectionListeners.delete(cb);
 }
 
 export async function loadBuckets() {
@@ -360,6 +451,13 @@ export async function addSharedBucket(input: string): Promise<AddedBucket> {
   return added;
 }
 
+const bucketForgottenListeners = new Set<(bucket: string) => void>();
+/** Called when an added bucket leaves the list and is not a listed bucket either (remembered tabs). */
+export function onBucketForgotten(cb: (bucket: string) => void): () => void {
+  bucketForgottenListeners.add(cb);
+  return () => bucketForgottenListeners.delete(cb);
+}
+
 /** Forget an added bucket. Only the local list changes; the bucket and its contents are untouched. */
 export async function removeSharedBucket(name: string): Promise<void> {
   await api.removeAddedBucket(name);
@@ -367,6 +465,7 @@ export async function removeSharedBucket(name: string): Promise<void> {
   set((s) => ({ addedBuckets: s.addedBuckets.filter((b) => b.name !== name) }));
   // Close it in every pane that shows it, unless it is also in the regular list.
   if (buckets.some((b) => b.name === name)) return;
+  bucketForgottenListeners.forEach((cb) => cb(name));
   usePaneTabs.setState((s) => {
     const next = { ...s };
     for (const id of PANE_IDS) next[id] = s[id].filter((t) => t.saved?.bucket !== name);
@@ -637,6 +736,30 @@ export function upsertListedObject(bucket: string, obj: ObjectEntry, pane: PaneI
   if (i >= 0) objects[i] = obj;
   else objects.push(obj);
   setPane(pane, { listing: { ...s.listing, objects } });
+}
+
+/**
+ * An object changed in place (its metadata was edited): every pane and hidden tab whose listing has
+ * this exact key gets the new entry (size, Last modified, ETag). Nothing is added where it isn't listed.
+ */
+export function replaceListedObject(bucket: string, obj: ObjectEntry) {
+  const swap = (s: PaneState): PaneState | null => {
+    if (s.bucket !== bucket) return null;
+    const i = s.listing.objects.findIndex((o) => o.key === obj.key);
+    if (i < 0) return null;
+    const objects = s.listing.objects.slice();
+    objects[i] = obj;
+    return { ...s, listing: { ...s.listing, objects } };
+  };
+  for (const id of PANE_IDS) {
+    const next = swap(getPane(id));
+    if (next) setPane(id, { listing: next.listing });
+  }
+  usePaneTabs.setState((t) => {
+    const out = { ...t };
+    for (const id of PANE_IDS) out[id] = t[id].map((e) => (e.saved ? { ...e, saved: swap(e.saved) ?? e.saved } : e));
+    return out;
+  });
 }
 
 /** Ensure a sub-folder entry exists in a pane's listing (after an upload into a new sub-path). */

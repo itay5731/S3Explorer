@@ -12,13 +12,30 @@ import {
   type FolderSizeEntry,
 } from "../store/folderSizes";
 
-/** The file table's Size cell for a folder: its calculated size (muted), a spinner while scanning, else "—". */
+/** The scan stops at 2,000 pages too (see "Folder size" in docs/CONTRACT.md). */
+const FOLDER_SIZE_PAGE_LIMIT = 2_000;
+
+/**
+ * Why a truncated scan stopped: the key limit, or the page limit when fewer keys than that were
+ * listed (a server returning small pages).
+ */
+export function truncationReason(scanned: number): string {
+  return scanned >= FOLDER_SIZE_SCAN_LIMIT
+    ? `stopped after ${FOLDER_SIZE_SCAN_LIMIT.toLocaleString()} keys`
+    : `stopped after ${FOLDER_SIZE_PAGE_LIMIT.toLocaleString()} pages (${scanned.toLocaleString()} keys)`;
+}
+
+/**
+ * The file table's Size cell for a folder: its calculated size (muted), a spinner while scanning
+ * (next to the previous size while recalculating), else "—".
+ */
 export const FolderSizeCell = memo(function FolderSizeCell({ bucket, prefix }: { bucket: string; prefix: string }) {
   const e = useFolderSize(bucket, prefix);
   if (e?.size) {
     const at = e.at ? ` · calculated ${formatRelative(e.at)}` : "";
     return (
-      <span className="dim" title={`${plural(e.size.objects, "object")}${e.size.truncated ? " at least" : ""}${at}`}>
+      <span className="dim" title={`${e.scan ? "Recalculating… " : ""}${plural(e.size.objects, "object")}${e.size.truncated ? " at least" : ""}${at}`}>
+        {e.scan && <Loader2 size={11} className="spin fsize-cell-spin" aria-label="Recalculating size" />}
         {e.size.truncated ? "≥ " : ""}
         {formatBytes(e.size.bytes)}
       </span>
@@ -78,7 +95,13 @@ export function FolderSizeField({ bucket, prefixes }: { bucket: string; prefixes
         </span>
         <span className="muted small" title={formatExact(at)}>
           Calculated {formatRelative(at)}
-          {truncated ? ` · stopped after ${FOLDER_SIZE_SCAN_LIMIT.toLocaleString()} keys` : ""}
+          {truncated
+            ? ` · ${done
+                .filter((e) => e!.size!.truncated)
+                .map((e) => truncationReason(e!.size!.scanned))
+                .filter((r, i, all) => all.indexOf(r) === i)
+                .join("; ")}`
+            : ""}
         </span>
         {error && (
           <span className="inline-error">

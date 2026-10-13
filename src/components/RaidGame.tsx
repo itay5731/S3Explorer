@@ -4,6 +4,7 @@ import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment
 import { toast } from "../store/toasts";
 import { createRaidSound } from "./raidSound";
 import { RaidLoadingScreen } from "./RaidLoading";
+import { CHEAT_WINDOW_MS, GOD_MODE_CODE, cheatMatcher } from "./raidCheat";
 
 // A second hidden game on the start screen (started by typing "secret", see TransferBackdrop):
 // a first-person raid on a five-floor glass headquarters at night. Every floor has its own look and
@@ -1469,8 +1470,9 @@ function runRaid(
   let deaths = 0;
   let civiliansHit = 0;
   let elapsed = 0;
-  let testUsed = false; // dev builds only: a test run never saves a best score
+  // God mode (the `iddqd` cheat code): a run that ever had it on never records a best score.
   let god = false;
+  let godUsed = false;
 
   const inside = (x: number, y: number) => x > 0 && y > 0 && x < MAP_W - 1 && y < MAP_H - 1;
   const cellAt = (x: number, y: number): string => (x < 0 || y < 0 || x >= MAP_W || y >= MAP_H ? "#" : map[y][x]);
@@ -2977,7 +2979,7 @@ function runRaid(
     <div class="raid-fps"></div>
     <div class="raid-hurt"></div>
     <div class="raid-alarmglow"></div>
-    <div class="raid-fade"></div>${import.meta.env.DEV ? `<div class="raid-testbadge" style="top:14px;right:18px;padding:2px 8px;border-radius:6px;background:#ff3324;font:700 11px var(--mono);letter-spacing:0.1em;display:none">TEST</div>` : ""}
+    <div class="raid-fade"></div>
     <div class="raid-intro"><div><p></p><p></p><p></p><p></p></div><span>Click or press E to skip</span></div>
     <div class="raid-down"><h2></h2><p></p></div>
     <div class="raid-card raid-start">
@@ -3000,12 +3002,6 @@ function runRaid(
         <li><kbd>M</kbd> mute</li>
         <li><kbd>Esc</kbd> pause</li>
       </ul>
-      ${
-          import.meta.env.DEV
-            ? `<label style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:12px;font-size:12px;pointer-events:auto">Test: start on floor <select data-test-floor style="pointer-events:auto">${FLOORS.map((_, i) => `<option value="${i}">${i + 1}</option>`).join("")}</select></label>
-        <p style="font-size:11.5px">Test keys: F9 next floor · Shift+F9 previous · F10 finish the objective · F11 god mode</p>`
-            : ""
-        }
       <button type="button" class="btn btn-primary" data-start>Start the raid</button>
       <p class="raid-best"></p>
     </div>
@@ -3048,13 +3044,6 @@ function runRaid(
   const diffButtons = [...hud.querySelectorAll<HTMLElement>("[data-diff]")];
   const pausedEl = el(".raid-paused");
   const resultsEl = el(".raid-results");
-  const testBadge = import.meta.env.DEV ? hud.querySelector<HTMLElement>(".raid-testbadge") : null;
-  let testFloor = 0;
-  if (import.meta.env.DEV) {
-    hud.querySelector<HTMLSelectElement>("[data-test-floor]")?.addEventListener("change", (e) => {
-      testFloor = Number((e.target as HTMLSelectElement).value);
-    });
-  }
   /** Writes a style only when it changes, so the HUD does not restyle every frame. */
   const styleCache = new WeakMap<HTMLElement, Record<string, string>>();
   const css = (node: HTMLElement, prop: "opacity" | "transform" | "width" | "display", value: string) => {
@@ -3381,7 +3370,7 @@ function runRaid(
   };
 
   const hurtPlayer = (from: Guard) => {
-    if (import.meta.env.DEV && god) return;
+    if (god) return;
     const diff = DIFFICULTIES[difficulty];
     player.health -= rand(...GUARD_DAMAGE) * diff.damage * (from.kind === "boss" ? 1.2 : 1);
     player.hurt = 0.4;
@@ -3702,7 +3691,7 @@ function runRaid(
     );
     const rank = !won ? "C" : score >= 9000 ? "S" : score >= 7000 ? "A" : score >= 5000 ? "B" : "C";
     const best = readBest();
-    if (score > best && !(import.meta.env.DEV && testUsed)) {
+    if (score > best && !godUsed) {
       try {
         localStorage.setItem(BEST_KEY, String(score));
       } catch {
@@ -3710,7 +3699,7 @@ function runRaid(
       }
     }
     const time = `${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, "0")}`;
-    setText(resultsEl.querySelector(".raid-kicker")!, `${import.meta.env.DEV && testUsed ? "Test run · " : ""}${diff.name} · ${won ? "Mission complete" : "Mission failed"}`);
+    setText(resultsEl.querySelector(".raid-kicker")!, `${godUsed ? "God mode · " : ""}${diff.name} · ${won ? "Mission complete" : "Mission failed"}`);
     setText(resultsEl.querySelector("h2")!, won ? "You're out with the secrets." : reason === "Locked down" ? "Locked down." : "Caught.");
     setText(resultsEl.querySelector(".raid-rank b")!, rank);
     setText(resultsEl.querySelector(".raid-rank span")!, `Score ${score}`);
@@ -3726,7 +3715,7 @@ function runRaid(
       ["Floor reached", String(Math.min(floorIndex + 1, FLOORS.length))],
     ];
     resultsEl.querySelector("dl")!.innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("");
-    setText(resultsEl.querySelector(".raid-best")!, import.meta.env.DEV && testUsed ? "Test run: the best score is not saved." : score > best ? "A new best score." : `Best score ${best}`);
+    setText(resultsEl.querySelector(".raid-best")!, godUsed ? "God mode was on: the best score is not saved." : score > best ? "A new best score." : `Best score ${best}`);
     resultsEl.classList.add("shown", won ? "won" : "lost");
     lastSummary = `${won ? "Out with the secrets" : reason}: rank ${rank}, score ${score}, ${kills} guards down, ${accuracy}% accuracy.`;
   };
@@ -4233,10 +4222,6 @@ function runRaid(
     introLine = 0;
     introChars = 0;
     introHold = 0;
-    if (import.meta.env.DEV && testFloor > 0) {
-      testUsed = true;
-      loadFloor(testFloor, true).catch(swallow);
-    }
   };
   const skipIntro = () => {
     if (phase === "intro" && !loading) startPlay();
@@ -4480,7 +4465,6 @@ function runRaid(
     introEl.classList.toggle("typing", phase === "intro");
     introLines.forEach((p, i) => setText(p, i < introLine ? INTRO[i] : i === introLine ? (INTRO[i] ?? "").slice(0, Math.floor(introChars)) : ""));
     downEl.classList.toggle("shown", downT > 0 || failT > 0 || restarting);
-    if (import.meta.env.DEV && testBadge) css(testBadge, "display", testUsed ? "" : "none");
     startEl.classList.toggle("shown", phase === "menu");
     diffButtons.forEach((b, i) => b.classList.toggle("on", i === difficulty));
     pausedEl.classList.toggle("shown", paused());
@@ -4602,49 +4586,25 @@ function runRaid(
       }
     }
   };
-  /** Dev builds only: skip floors, finish objectives, god mode. */
-  const testKey = (e: KeyboardEvent) => {
-    if (!import.meta.env.DEV || phase !== "play" || loading || ride) return false;
-    if (e.code === "F9") {
-      const to = e.shiftKey ? Math.max(0, floorIndex - 1) : Math.min(LAST, floorIndex + 1);
-      testUsed = true;
-      keypad = null;
-      loadFloor(to, true).then(() => radio(ARRIVE[to]), swallow);
-    } else if (e.code === "F10") {
-      testUsed = true;
-      if (floorIndex === 0) for (const st of stations) if (st.kind === "T" && !st.done) completeStation(st);
-      if (floorIndex === 1 || floorIndex === 3) {
-        run = null;
-        backupT = 0;
-        if (boss && boss.dying === 0) {
-          boss.health = 0;
-          boss.dying = 0.6;
-        }
-        unlockFloor("Test: objective done");
-      }
-      if (floorIndex === 2) for (const st of stations) if (st.kind === "F" && !st.done) completeStation(st);
-      if (floorIndex === LAST) {
-        hasKey = keyDoorOpen = true;
-        flowFrom = -1;
-        if (keycardNode) stow(keycardNode);
-        if (keycardSpot) keycardSpot.intensity = keycardSpot.base = 0;
-        if (keyDoorNode) keyDoorNode.visible = false;
-        if (finale <= 0) startFinale();
-      }
-    } else if (e.code === "F11") {
-      testUsed = true;
-      god = !god;
-      showBanner(god ? "Test: god mode on" : "Test: god mode off");
-    } else return false;
-    e.preventDefault();
-    return true;
+  /**
+   * The god-mode cheat code (`iddqd`, letters in sequence within 2 s, no modifiers), in every build:
+   * toggles taking no damage, with a short notice. A run that had it on never records a best score.
+   */
+  const godCode = cheatMatcher(GOD_MODE_CODE, CHEAT_WINDOW_MS);
+  const cheat = (e: KeyboardEvent) => {
+    if (phase !== "play" && phase !== "intro") return;
+    if (!godCode(e)) return;
+    god = !god;
+    if (god) godUsed = true;
+    hud.dataset.god = god ? "on" : "off";
+    showBanner(god ? "GOD MODE ON" : "GOD MODE OFF");
   };
   const onKeyDown = (e: KeyboardEvent) => {
     if (!booted) {
       if (e.code === "Escape") onExit();
       return;
     }
-    if (import.meta.env.DEV && testKey(e)) return;
+    cheat(e);
     if (e.code === "Escape") {
       // While the mouse is held the browser releases it on Esc (and the game pauses); a second Esc leaves.
       if (keypad) keypad = null;
@@ -4703,7 +4663,7 @@ function runRaid(
   const onKeyUp = (e: KeyboardEvent) => keys.delete(e.code);
   const onPointerDown = (e: PointerEvent) => {
     const target = e.target as HTMLElement;
-    if (!booted || target.closest("select, label")) return;
+    if (!booted) return;
     const diffButton = target.closest<HTMLElement>("[data-diff]");
     if (diffButton) {
       if (phase === "menu") difficulty = Number(diffButton.dataset.diff);

@@ -2,22 +2,12 @@
 // Frontend only: nothing here reaches the backend. Prefixes are kept exactly as the pane had them.
 
 import { create } from "zustand";
-import { BOOKMARKS_MAX, type Bookmark, type ConnectionInfo } from "../lib/types";
+import { BOOKMARKS_MAX, type Bookmark } from "../lib/types";
 import { displayName, prefixSegments } from "../lib/format";
 import { readPref, writePref } from "./prefs";
 import { toast } from "./toasts";
 
 const STORE_PREFIX = "s3x.bookmarks.";
-/** The saved connection in use, so a window reload (which reconnects without a saved id) finds its bookmarks. */
-const SESSION_KEY = "s3x.bookmarks.session";
-
-interface SessionEntry {
-  id: string;
-  label: string;
-  region: string;
-  endpoint: string | null;
-}
-
 interface BookmarksState {
   /** The localStorage key of the connection in use; null while disconnected. */
   storeKey: string | null;
@@ -29,9 +19,6 @@ export const useBookmarks = create<BookmarksState>(() => ({ storeKey: null, item
 const set = useBookmarks.setState;
 const get = useBookmarks.getState;
 
-/** A stable, secret-free key for a connection made without saving it. */
-const derivedKey = (info: ConnectionInfo) => `${info.label}|${info.region}|${info.endpoint ?? ""}`;
-
 /** The two places are the same bookmark (bucket names cannot contain "/", so this id is unique). */
 export const bookmarkId = (b: Pick<Bookmark, "bucket" | "prefix">) => `${b.bucket}/${b.prefix}`;
 
@@ -39,24 +26,6 @@ export const bookmarkId = (b: Pick<Bookmark, "bucket" | "prefix">) => `${b.bucke
 export function defaultLabel(bucket: string, prefix: string): string {
   const segs = prefixSegments(prefix);
   return segs.length ? displayName(segs[segs.length - 1].name) : bucket;
-}
-
-function readSession(): SessionEntry | null {
-  try {
-    const v = sessionStorage.getItem(SESSION_KEY);
-    return v ? (JSON.parse(v) as SessionEntry) : null;
-  } catch {
-    return null;
-  }
-}
-
-function writeSession(entry: SessionEntry | null) {
-  try {
-    if (entry) sessionStorage.setItem(SESSION_KEY, JSON.stringify(entry));
-    else sessionStorage.removeItem(SESSION_KEY);
-  } catch {
-    /* storage unavailable */
-  }
 }
 
 /** Only well-formed, distinct entries survive a read (the stored value may be edited or corrupt). */
@@ -99,41 +68,29 @@ if (typeof window !== "undefined") {
   });
 }
 
-/** A connection was made (`savedId`: through a saved connection). Loads its bookmarks. */
-export function setBookmarksConnection(info: ConnectionInfo, savedId: string | null) {
-  let id = savedId;
-  if (id) {
-    writeSession({ id, label: info.label, region: info.region, endpoint: info.endpoint });
-  } else {
-    const s = readSession();
-    if (s && s.label === info.label && s.region === info.region && s.endpoint === info.endpoint) id = s.id;
-    else writeSession(null);
-  }
-  const storeKey = STORE_PREFIX + (id ?? derivedKey(info));
+/** A connection was made: loads its bookmarks. `key` is `connectionKey()` (store/app.ts). */
+export function setBookmarksConnection(key: string) {
+  const storeKey = STORE_PREFIX + key;
   set({ storeKey, items: readItems(storeKey) });
 }
 
 /** Disconnected: nothing is shown until the next connection. */
 export function clearBookmarksConnection() {
-  writeSession(null);
   set({ storeKey: null, items: [] });
 }
 
 /**
- * A saved connection was deleted: its bookmarks go too. If it is the one in use, the list empties
- * and new bookmarks are kept for this connection as if it had been made without saving.
+ * A saved connection was deleted (`key` is its connection key): its bookmarks go too. If it is the one
+ * in use, the list empties; new bookmarks are still kept under that key until the next connection.
  */
-export function forgetBookmarks(savedId: string, info: ConnectionInfo | null) {
+export function forgetBookmarks(key: string) {
+  const storeKey = STORE_PREFIX + key;
   try {
-    localStorage.removeItem(STORE_PREFIX + savedId);
+    localStorage.removeItem(storeKey);
   } catch {
     /* storage unavailable */
   }
-  if (readSession()?.id === savedId) writeSession(null);
-  if (get().storeKey === STORE_PREFIX + savedId) {
-    const storeKey = info ? STORE_PREFIX + derivedKey(info) : null;
-    set({ storeKey, items: storeKey ? readItems(storeKey) : [] });
-  }
+  if (get().storeKey === storeKey) set({ items: [] });
 }
 
 export function isBookmarked(items: Bookmark[], bucket: string, prefix: string): boolean {
@@ -151,7 +108,7 @@ export function toggleBookmark(bucket: string, prefix: string) {
     return;
   }
   if (items.length >= BOOKMARKS_MAX) {
-    toast.warning(`You can keep up to ${BOOKMARKS_MAX} bookmarks`, "Remove one from the sidebar to add another.");
+    toast.warning(`You can keep up to ${BOOKMARKS_MAX} bookmarks`, "Remove one from the bookmarks bar to add another.");
     return;
   }
   const label = defaultLabel(bucket, prefix);
@@ -180,7 +137,7 @@ export function addBookmarks(bucket: string, prefixes: string[]) {
   if (added.length < fresh.length) {
     toast.warning(
       added.length ? `Bookmarked ${added.length} of ${fresh.length} folders` : `You can keep up to ${BOOKMARKS_MAX} bookmarks`,
-      `The limit is ${BOOKMARKS_MAX} per connection. Remove some from the sidebar to add more.`,
+      `The limit is ${BOOKMARKS_MAX} per connection. Remove some from the bookmarks bar to add more.`,
     );
   } else if (added.length === 1) {
     toast.success("Bookmarked", added[0].label);

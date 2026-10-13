@@ -23,7 +23,12 @@ export function QuickLookModal({ bucket }: { bucket: string }) {
   const close = () => openModal(null);
 
   useEffect(() => {
+    // The key press that opened Quick look is still being dispatched when this listener is added
+    // (the module is cached after the first open, so the dialog mounts within that same event):
+    // only key presses that start after the dialog opened may close it.
+    const openedAt = performance.now();
     const onKey = (e: KeyboardEvent) => {
+      if (e.timeStamp < openedAt) return;
       if (e.key === "ArrowUp" || e.key === "ArrowDown") {
         if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
         e.preventDefault();

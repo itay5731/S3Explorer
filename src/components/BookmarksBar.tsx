@@ -277,6 +277,8 @@ function OverflowMenu({
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // While a bookmark is renamed in the menu, Escape belongs to its field: it cancels the rename.
+        if (renaming) return;
         e.preventDefault();
         e.stopPropagation();
         closeRef.current(true);

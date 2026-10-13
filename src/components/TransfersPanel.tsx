@@ -32,6 +32,7 @@ import type { AppError, Batch, BatchStatus, Job, JobKind, Transfer, TransferStat
 import { isActive, isMoving, selectActiveCount, setTransferPaused, useTransfers } from "../store/transfers";
 import { jobRequest, removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
 import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, setBatchPaused, useBatches } from "../store/batches";
+import { setAllPaused } from "../store/pause";
 import { setTransfersOpen, useApp } from "../store/app";
 import { copyText } from "../store/actions";
 import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
@@ -61,8 +62,18 @@ const STATUS_ICON: Record<TransferStatus, typeof Clock | null> = {
   cancelled: Ban,
 };
 
-/** The Pause / Resume button of a row, next to Cancel; nothing for a finished or planning row. */
+/** Why a folder transfer that is still being planned shows its Pause button disabled. */
+const PLANNING_NO_PAUSE = "Pause becomes available once the folder has been read";
+
+/** The Pause / Resume button of a row, next to Cancel; disabled while planning, nothing for a finished row. */
 function PauseButton({ status, onToggle, what }: { status: string; onToggle: (pause: boolean) => void; what: string }) {
+  if (status === "planning") {
+    return (
+      <button className="icon-btn" disabled title={PLANNING_NO_PAUSE} aria-label={`Pause ${what}: ${PLANNING_NO_PAUSE}`}>
+        <Pause size={14} />
+      </button>
+    );
+  }
   if (status === "paused") {
     return (
       <button className="icon-btn" onClick={() => onToggle(false)} title="Resume" aria-label={`Resume ${what}`}>
@@ -483,13 +494,15 @@ function folderOf(keyOrPrefix: string): string {
 }
 
 const cancelItem = (run: () => void): PopupMenuItem => ({ label: "Cancel", icon: <CircleStop size={14} />, action: run });
-/** Pause (queued or running) or Resume (paused), or nothing (planning). */
+/** Pause (queued or running) or Resume (paused); a disabled Pause with the reason while planning. */
 const pauseItems = (status: string, toggle: (pause: boolean) => void): PopupMenuItem[] =>
   status === "paused"
     ? [{ label: "Resume", icon: <Play size={14} />, action: () => toggle(false) }]
     : status === "running" || status === "queued"
       ? [{ label: "Pause", icon: <Pause size={14} />, action: () => toggle(true) }]
-      : [];
+      : status === "planning"
+        ? [{ label: "Pause", icon: <Pause size={14} />, action: () => {}, disabled: true, hint: "Planning", title: PLANNING_NO_PAUSE }]
+        : [];
 /**
  * "Remove from list" takes the row away: keep the keyboard focus in the panel by moving it to the
  * next row, else the previous one, else the panel's toggle.
@@ -729,18 +742,6 @@ export function ActivityPanel() {
   const pausedBatches = useBatches((s) => s.ids.some((id) => s.byId[id]?.status === "paused"));
   const canPause = pausableTransfers || pausableBatches;
   const canResume = pausedTransfers || pausedBatches;
-  const setAllPaused = (pause: boolean) => {
-    const ts = useTransfers.getState();
-    for (const id of ts.ids) {
-      const t = ts.byId[id];
-      if (t && (pause ? isMoving(t) : t.status === "paused")) void setTransferPaused(id, pause);
-    }
-    const bs = useBatches.getState();
-    for (const id of bs.ids) {
-      const st = bs.byId[id]?.status;
-      if (pause ? st === "queued" || st === "running" : st === "paused") void setBatchPaused(id, pause);
-    }
-  };
 
   const clearFinished = () => {
     const ts = useTransfers.getState();

@@ -36,7 +36,11 @@ function RaidLoading({ onCancel }: { onCancel(): void }) {
   );
 }
 
-function RaidError({ message, onRetry, onExit }: { message: string; onRetry(): void; onExit(): void }) {
+/**
+ * A failed download of the game's code is remembered by the webview for the rest of the session (the
+ * module map keeps the failure), so a retry that fails with the same message needs a restart.
+ */
+function RaidError({ message, repeated, onRetry, onExit }: { message: string; repeated: boolean; onRetry(): void; onExit(): void }) {
   useEscape(onExit);
   return (
     <div className="raid-game raid-loading">
@@ -44,6 +48,7 @@ function RaidError({ message, onRetry, onExit }: { message: string; onRetry(): v
         <span className="raid-kicker">Raid the HQ</span>
         <h2>Couldn't start the game</h2>
         <p>{message || "Something went wrong while loading it."}</p>
+        {repeated && <p>Trying again failed the same way. Restart S3 Explorer to load the game again.</p>}
         <div>
           <button type="button" className="btn btn-primary" onClick={onRetry}>
             Try again
@@ -59,18 +64,22 @@ function RaidError({ message, onRetry, onExit }: { message: string; onRetry(): v
 }
 
 /** Catches a failed download of the raid or an error inside it, so the start screen never goes blank. */
-class RaidBoundary extends Component<{ children: ReactNode; onRetry(): void; onExit(): void; onFail(): void }, { error: Error | null }> {
+class RaidBoundary extends Component<
+  { children: ReactNode; previousError: string | null; onRetry(): void; onExit(): void; onFail(message: string): void },
+  { error: Error | null }
+> {
   state: { error: Error | null } = { error: null };
   static getDerivedStateFromError(error: unknown) {
     return { error: error instanceof Error ? error : new Error(String(error)) };
   }
   componentDidCatch() {
     document.documentElement.classList.remove("playing-game");
-    this.props.onFail();
+    this.props.onFail(this.state.error?.message ?? "");
   }
   render() {
     if (!this.state.error) return this.props.children;
-    return <RaidError message={this.state.error.message} onRetry={this.props.onRetry} onExit={this.props.onExit} />;
+    const message = this.state.error.message;
+    return <RaidError message={message} repeated={this.props.previousError === message} onRetry={this.props.onRetry} onExit={this.props.onExit} />;
   }
 }
 
@@ -299,7 +308,10 @@ export function TransferBackdrop() {
   // Each attempt at the raid gets a fresh lazy component, so Try again downloads it again.
   const [raidAttempt, setRaidAttempt] = useState(0);
   const RaidGame = useMemo(() => lazy(loadRaid), [raidAttempt]);
-  const raidFailed = useCallback(() => {
+  // The error of the attempt before this one: the same failure again means a restart is needed.
+  const raidErrors = useRef<string[]>([]);
+  const raidFailed = useCallback((message: string) => {
+    raidErrors.current.push(message);
     api.lockWindowSize(false).catch(() => {});
   }, []);
   const retryRaid = useCallback(() => {
@@ -315,7 +327,12 @@ export function TransferBackdrop() {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement | null;
       if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
-      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.tagName === "SELECT" || t.isContentEditable)) return;
+      // Never over a dialog (adding a connection, settings): its keys are its own.
+      if (document.querySelector(".modal-backdrop")) {
+        typed = "";
+        return;
+      }
       typed = (typed + e.key.toLowerCase()).slice(-SECRET_WORD.length);
       if (typed === SECRET_WORD) startGame("raid");
     };
@@ -442,7 +459,13 @@ export function TransferBackdrop() {
       </svg>
       {game === "defend" && <DefendGame onExit={stopPlaying} />}
       {game === "raid" && (
-        <RaidBoundary key={raidAttempt} onRetry={retryRaid} onExit={stopPlaying} onFail={raidFailed}>
+        <RaidBoundary
+          key={raidAttempt}
+          previousError={raidAttempt > 0 ? (raidErrors.current[raidErrors.current.length - 1] ?? null) : null}
+          onRetry={retryRaid}
+          onExit={stopPlaying}
+          onFail={raidFailed}
+        >
           <Suspense fallback={<RaidLoading onCancel={stopPlaying} />}>
             <RaidGame onExit={stopPlaying} />
           </Suspense>
