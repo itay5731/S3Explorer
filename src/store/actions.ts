@@ -4,7 +4,7 @@ import * as api from "../lib/api";
 import type { AppError, ObjectEntry, Transfer } from "../lib/types";
 import { basename, joinKey, sanitizeFileName, uniqueFileName } from "../lib/format";
 import { activePane, getPane, openModal, refresh, setTransfersOpen, upsertListedFolder, upsertListedObject } from "./app";
-import { PANE_IDS, type PaneId } from "./panes";
+import { markHiddenTabsStale, PANE_IDS, type PaneId } from "./panes";
 import { isDenied, toast, toastDenied, toastFailure } from "./toasts";
 import { notifyInBackground } from "./notify";
 import { ARCHIVED_MESSAGE, splitReadable, toastArchivedSkipped } from "./archive";
@@ -94,7 +94,8 @@ export async function createFolder(name: string, bucket: string, prefix: string)
     await api.createFolder(bucket, full);
     toast.success("Folder created", full);
     // Every pane that shows the folder.
-    for (const id of PANE_IDS) if (getPane(id).bucket === bucket && getPane(id).prefix === prefix) refresh(id);
+    for (const id of PANE_IDS) if (getPane(id).bucket === bucket && getPane(id).prefix === prefix) void refresh(id);
+    markHiddenTabsStale((b, p) => b === bucket && p === prefix);
     return true;
   } catch (e) {
     toastFailure("Could not create folder", e as AppError, "create folders");
@@ -153,7 +154,9 @@ export function installTransferEffects(): () => void {
       return;
     }
     if (t.status !== "completed" || t.kind !== "upload") return;
-    // Every pane showing the folder the file went into (or a parent of it) gets the new row.
+    // Every pane showing the folder the file went into (or a parent of it) gets the new row; hidden
+    // tabs showing it refresh when they are shown.
+    markHiddenTabsStale((bucket, prefix) => t.bucket === bucket && t.key.startsWith(prefix));
     for (const pane of PANE_IDS) {
       const { bucket, prefix } = getPane(pane);
       if (t.bucket !== bucket || !t.key.startsWith(prefix)) continue;

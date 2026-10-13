@@ -51,6 +51,8 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     "Folder size" in `docs/CONTRACT.md`).
 29. Bookmarked folders per connection in a bookmarks bar under the toolbar, toggled from the path bar,
     `Mod+Shift+D` or the right-click menus (added on request after v0.7.0; see "Bookmarks" in `docs/CONTRACT.md`).
+30. Tabs in each pane: several locations open at once, remembered per connection (added on request after
+    v0.7.0; see "Tabs" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

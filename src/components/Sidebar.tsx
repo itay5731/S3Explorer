@@ -1,9 +1,10 @@
 import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, Tag, Tags, Users, X } from "lucide-react";
+import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, SquarePlus, Tag, Tags, Users, X } from "lucide-react";
 import { activePane, loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, usePane, writePref } from "../store/app";
 import { focusPaneListSoon } from "../store/keyboard";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
+import { openFolderInNewTab } from "../store/tabs";
 import { PopupMenu } from "./PopupMenu";
 import { RecentFiles } from "./RecentFiles";
 import { isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
@@ -100,6 +101,13 @@ function BucketRow({ b, selected, onMenu }: { b: BucketEntry; selected: boolean;
       data-drop-bucket={b.name}
       data-drop-prefix=""
       onClick={() => openBucket(b.name)}
+      // Middle-click: the bucket's root in a new background tab (the press must not autoscroll).
+      onMouseDown={(e) => e.button === 1 && e.preventDefault()}
+      onAuxClick={(e) => {
+        if (e.button !== 1) return;
+        e.preventDefault();
+        openFolderInNewTab(b.name, "", activePane(), false);
+      }}
       onContextMenu={(e) => {
         e.preventDefault();
         onMenu(b, e.clientX, e.clientY);
@@ -302,6 +310,7 @@ export function Sidebar() {
           groups={[
             [
               { label: "Open", icon: <FolderOpen size={14} />, action: () => openBucket(menu.b.name) },
+              { label: "Open in new tab", icon: <SquarePlus size={14} />, action: () => openFolderInNewTab(menu.b.name, "") },
               isBookmarked(bookmarks, menu.b.name, "")
                 ? { label: "Remove bookmark", icon: <BookmarkX size={14} />, action: () => toggleBookmark(menu.b.name, "") }
                 : { label: "Bookmark bucket", icon: <Bookmark size={14} />, action: () => toggleBookmark(menu.b.name, "") },

@@ -32,8 +32,9 @@ import { getSelected } from "./view";
 import { rerunSearch, scheduleSearch, setSearchScope, useSearch } from "./search";
 import { openSettings, useSettings } from "./settings";
 import { toast } from "./toasts";
-import { currentKeys, focusBuckets, focusPaneList, listKeys, searchInput, setCheatOpen, useKeys, type MoveTarget } from "./keyboard";
+import { currentKeys, focusBuckets, focusPaneList, focusPaneListSoon, listKeys, searchInput, setCheatOpen, useKeys, type MoveTarget } from "./keyboard";
 import { requestVersionsOpen, useVersioning, hasVersions } from "./versions";
+import { closeTab, cycleTab, openTab, reopenClosedTab } from "./tabs";
 import { useRowDragView } from "../components/RowDrag";
 import { toggleBookmark } from "./bookmarks";
 
@@ -103,7 +104,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     const { bucket, search } = getPane();
     if (!bucket) return;
     if (search.open) rerunSearch();
-    else refresh();
+    else void refresh();
   },
   "nav.focusFiles": () => {
     focusPaneList(activePane());
@@ -138,6 +139,24 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     if (!other) return false;
     setActivePane(other);
     focusPaneList(other);
+  },
+  "tab.new": () => {
+    if (!getPane().bucket) return no(OPEN_BUCKET);
+    afterTabSwitch(() => openTab(activePane(), null, true));
+  },
+  // Always used, even with nothing to do: the key must never reach the webview.
+  "tab.close": () => {
+    afterTabSwitch(() => closeTab(activePane()));
+  },
+  "tab.next": () => {
+    afterTabSwitch(() => cycleTab(activePane(), 1));
+  },
+  "tab.prev": () => {
+    afterTabSwitch(() => cycleTab(activePane(), -1));
+  },
+  "tab.reopen": () => {
+    if (!reopenClosedTab()) return no("No closed tab to reopen");
+    focusPaneListSoon(activePane());
   },
   "view.single": () => setSplit(false),
   "view.split": () => setSplit(true),
@@ -257,6 +276,13 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   },
   "act.disconnect": () => requestDisconnect(),
 };
+
+/** Switch tabs from the keyboard: the shown tab's list keeps the keyboard if the pane had it. */
+function afterTabSwitch(fn: () => boolean) {
+  const pane = activePane();
+  const inPane = !!document.activeElement?.closest(`[data-pane="${pane}"]`);
+  if (fn() && inPane) focusPaneListSoon(pane);
+}
 
 function selectedKeys(): string[] {
   const { folders, objects } = selection();

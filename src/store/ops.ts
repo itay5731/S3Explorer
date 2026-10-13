@@ -6,7 +6,7 @@ import { JOB_MAX_ITEMS, type AppError, type Job, type JobItem, type JobRequest }
 import { copyName, isJobActive, KIND_VERB, plural, touchesPrefix } from "../lib/ops";
 import { parentPrefix, s3Uri } from "../lib/format";
 import { activePane, getPane, navigate, openModal, refreshInPlace, setTransfersOpen, shownOtherPane } from "./app";
-import { PANE_IDS, type PaneId } from "./panes";
+import { PANE_IDS, updateHiddenTabs, type PaneId } from "./panes";
 import { clearClipboard, setClipboard, useClipboard, type ClipItem } from "./clipboard";
 import { jobRequest, onJobUpdate, rememberJobRequest, useJobs } from "./jobs";
 import { notifyInBackground } from "./notify";
@@ -77,10 +77,17 @@ export function requestBulkTags() {
  * toast naming how many. Folders are kept: the backend fails archived objects inside per object.
  * Returns null when nothing is left.
  */
-export async function withoutArchived(bucket: string, items: ClipItem[], action: string, pane: PaneId = activePane()): Promise<ClipItem[] | null> {
+export async function withoutArchived(
+  bucket: string,
+  items: ClipItem[],
+  action: string,
+  pane: PaneId = activePane(),
+  /** Storage classes captured earlier (a row drag, whose pane may show another tab by the drop). */
+  captured?: ReadonlyMap<string, string | null>,
+): Promise<ClipItem[] | null> {
   // The storage class as listed: the pane's folder rows, or its selected search hits.
-  const listed = new Map([...getPane(pane).listing.objects, ...getSelected(pane).objects].map((o) => [o.key, o]));
-  const objects = items.filter((i) => !i.isPrefix).map((i) => ({ key: i.key, storageClass: listed.get(i.key)?.storageClass ?? null }));
+  const listed = captured ?? new Map([...getPane(pane).listing.objects, ...getSelected(pane).objects].map((o) => [o.key, o.storageClass]));
+  const objects = items.filter((i) => !i.isPrefix).map((i) => ({ key: i.key, storageClass: listed.get(i.key) ?? null }));
   const { blocked } = await splitReadable(bucket, objects);
   if (!blocked.length) return items;
   const out = new Set(blocked.map((o) => o.key));
@@ -388,8 +395,8 @@ export async function startConfirmedJob(
 
 // ---- effects: keep the listing in sync and report results -----------------------------------
 
-function touchesView(job: Job, pane: PaneId): boolean {
-  const { bucket, prefix } = getPane(pane);
+/** Does a job touch the folder at this location (a pane's, or a hidden tab's)? */
+function touchesView(job: Job, { bucket, prefix }: { bucket: string | null; prefix: string }): boolean {
   if (!bucket) return false;
   const req = jobRequest(job.id);
   if (!req) return job.srcBucket === bucket || job.destBucket === bucket;
@@ -468,10 +475,9 @@ export function scheduleRefresh(now: boolean, pane: PaneId = activePane()): Prom
   }, wait);
 }
 
-/** Did this finished job move or delete the folder a pane shows, or one of its ancestors? */
-function movedViewFolder(job: Job, pane: PaneId): boolean {
+/** Did this finished job move or delete the folder at this location, or one of its ancestors? */
+function movedViewFolder(job: Job, { bucket, prefix }: { bucket: string | null; prefix: string }): boolean {
   if (job.kind !== "move" && job.kind !== "delete") return false;
-  const { bucket, prefix } = getPane(pane);
   const req = jobRequest(job.id);
   if (!bucket || !prefix || !req || req.srcBucket !== bucket) return false;
   return req.items.some((it) => it.isPrefix && prefix.startsWith(it.from));
@@ -482,7 +488,7 @@ function movedViewFolder(job: Job, pane: PaneId): boolean {
  * nearest ancestor that still holds something (else the bucket root), with a toast. A folder that
  * still has content (failed items stay) is left alone.
  */
-async function leaveVanishedFolder(pane: PaneId) {
+export async function leaveVanishedFolder(pane: PaneId) {
   const { bucket, prefix, listing } = getPane(pane);
   if (!bucket || !prefix || listing.loading || listing.error || listing.folders.length || listing.objects.length) return;
   let at = parentPrefix(prefix);
@@ -513,16 +519,21 @@ export function installJobEffects(): () => void {
       }
     }
     for (const pane of PANE_IDS) {
-      if (!touchesView(j, pane)) continue;
+      const at = getPane(pane);
+      if (!touchesView(j, at)) continue;
       if (finished) {
         // Only a job that moved or deleted something can have taken the folder away.
-        const vanished = j.doneItems > 0 && movedViewFolder(j, pane);
+        const vanished = j.doneItems > 0 && movedViewFolder(j, at);
         const done = scheduleRefresh(true, pane);
         if (vanished && done) void done.then(() => leaveVanishedFolder(pane));
       } else if (j.status === "running" && j.phase === "working" && (!prev || prev.doneItems !== j.doneItems)) {
         scheduleRefresh(false, pane);
       }
     }
+    // Hidden tabs refresh (and leave a vanished folder) when they are shown.
+    updateHiddenTabs((t) =>
+      touchesView(j, t.saved) ? { stale: true, vanished: t.vanished || (finished && j.doneItems > 0 && movedViewFolder(j, t.saved)) } : null,
+    );
   });
   return () => {
     off();

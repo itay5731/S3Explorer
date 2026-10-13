@@ -5147,6 +5147,7 @@ body.row-dragging .bucket-more {
 }
 .trow[data-drop-target="move"],
 .crumb[data-drop-target="move"],
+.tab[data-drop-target="move"],
 .bucket-item[data-drop-target="move"] {
   background: var(--sel-strong);
   box-shadow: inset 0 0 0 1.5px var(--accent);
@@ -5154,6 +5155,7 @@ body.row-dragging .bucket-more {
 }
 .trow[data-drop-target="copy"],
 .crumb[data-drop-target="copy"],
+.tab[data-drop-target="copy"],
 .bucket-item[data-drop-target="copy"] {
   background: color-mix(in srgb, var(--drop-copy) 18%, transparent);
   box-shadow: inset 0 0 0 1.5px var(--drop-copy);
@@ -5161,6 +5163,7 @@ body.row-dragging .bucket-more {
 }
 .trow[data-drop-target="refused"],
 .crumb[data-drop-target="refused"],
+.tab[data-drop-target="refused"],
 .bucket-item[data-drop-target="refused"] {
   background: var(--danger-soft);
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 60%, transparent);
@@ -6910,4 +6913,101 @@ kbd {
   flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+}
+
+/* ---- Tabs (after v0.7.0): a pane's tab strip, above its path bar, shown with two or more tabs ---- */
+.tab-strip {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 32px;
+  padding: 4px 8px 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  flex: none;
+  min-width: 0;
+  overflow: hidden;
+}
+.tab {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 180px;
+  min-width: 56px;
+  height: 27px;
+  padding: 0 4px 0 10px;
+  border: 1px solid transparent;
+  border-bottom: 0;
+  border-radius: 7px 7px 0 0;
+  color: var(--muted);
+  font-size: 12.5px;
+  cursor: default;
+  user-select: none;
+  transition: background 0.1s, color 0.1s;
+}
+.tab:hover {
+  background: var(--bg-hover);
+  color: var(--text-2);
+}
+.tab.active {
+  background: var(--bg);
+  border-color: var(--border);
+  color: var(--text);
+  font-weight: 500;
+  /* Sits on the strip's bottom border, so the tab and its pane read as one surface. */
+  margin-bottom: -1px;
+  height: 28px;
+}
+.panes.split .pane.active .tab.active {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+.tab-icon {
+  flex: none;
+  color: var(--folder);
+}
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.tab-close {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  visibility: hidden;
+}
+.tab:hover .tab-close,
+.tab.active .tab-close {
+  visibility: visible;
+}
+.tab-close:hover {
+  background: var(--bg-active);
+  color: var(--text);
+}
+/* The tab being dragged to a new place (see useTileReorder): above the others, transparent to the pointer. */
+.tab.dragging {
+  z-index: 3;
+  background: var(--bg-elev);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+}
+.tab-strip:has(.dragging) {
+  cursor: grabbing;
+}
+/* A tab dragged over the other pane: its tab strip or path bar takes the tab on release. */
+.tab-strip[data-tab-drop],
+.breadcrumbs[data-tab-drop] {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
