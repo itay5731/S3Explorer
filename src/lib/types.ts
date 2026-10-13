@@ -573,3 +573,62 @@ export interface ObjectPreview {
 }
 
 export const PREVIEW_LIMITS = { textMaxBytes: 262_144, imageMaxBytes: 10_485_760, imageAutoBytes: 2_097_152 } as const;
+
+// ---- History (added after v0.7.0; frontend only, see "History" in docs/CONTRACT.md) ----
+
+export type HistoryTransferKind = "download" | "upload" | "folderDownload" | "folderUpload";
+/** File operations (jobs); a move of one item within its folder is recorded as "rename". */
+export type HistoryJobKind = "copy" | "move" | "rename" | "delete" | "tag" | "restore";
+export type HistoryKind = HistoryTransferKind | HistoryJobKind;
+
+/** What a finished job did (set exactly when the entry's kind is a `HistoryJobKind`). */
+export interface HistoryJob {
+  srcBucket: string;
+  /** The folder holding the chosen items (verbatim); "" for the bucket root. */
+  srcPrefix: string;
+  destBucket: string | null;
+  /** The folder the items went to (verbatim); null for delete / tag / restore. */
+  destPrefix: string | null;
+  /** Items the user chose (keys or prefixes). */
+  items: number;
+  /** The first chosen key or prefix, and where it went (verbatim). */
+  first: string;
+  firstTo: string | null;
+  /** Objects the job covered once folders were expanded, and how they ended. */
+  objects: number;
+  done: number;
+  skipped: number;
+  failed: number;
+  firstError: string | null;
+  /** The backend's label for the job, shown when the request is not known. */
+  label: string;
+}
+
+export interface HistoryEntry {
+  /** The transfer, batch or job id. */
+  id: string;
+  kind: HistoryKind;
+  status: "completed" | "failed" | "cancelled";
+  /** The bucket (a job's source bucket). */
+  bucket: string;
+  /** Object key, or the prefix for folder transfers; a job's source folder (verbatim). */
+  key: string;
+  /** File or folder on this computer; "" for jobs. */
+  localPath: string;
+  /** Bytes transferred or copied; 0 when not known (deletes, tags, restores). */
+  bytes: number;
+  /** Files transferred (1 for single transfers); objects done for jobs. */
+  files: number;
+  /** Display label of the connection it ran on. */
+  connection: string;
+  /** ISO-8601. */
+  finishedAt: string;
+  error: string | null;
+  /** Set when a download fetched an older version of the object. */
+  versionId?: string | null;
+  /** Set for file operations. */
+  job?: HistoryJob | null;
+}
+
+export const HISTORY_STORAGE_KEY = "s3x.transferHistory";
+export const HISTORY_MAX_ENTRIES = 500;

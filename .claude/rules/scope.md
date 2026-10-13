@@ -57,6 +57,9 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     confirmed before it runs; added on request after v0.7.0; see "Edit content type and metadata" in `docs/CONTRACT.md`).
 32. Preview of text files and images in the details panel and a Quick look dialog (`F3`), read into
     memory without a download (added on request after v0.7.0; see "Object preview" in `docs/CONTRACT.md`).
+33. History: finished transfers, folder transfers and file operations (jobs) kept across restarts in a
+    History tab of the Activity panel, with filter chips, search, and open / go-to / re-run (transfers
+    only) actions (added on request after v0.7.0; see "History" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

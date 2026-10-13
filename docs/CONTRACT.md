@@ -1861,3 +1861,91 @@ export const PREVIEW_LIMITS = { textMaxBytes: 262_144, imageMaxBytes: 10_485_760
 #### IAM permissions added in this version
 
 None (`s3:GetObject` is already required).
+
+### History (added on request after v0.7.0)
+
+Finished transfers, folder transfers and file operations (jobs) are remembered across restarts.
+Frontend only; no new commands.
+
+```ts
+type HistoryTransferKind = "download" | "upload" | "folderDownload" | "folderUpload";
+type HistoryJobKind = "copy" | "move" | "rename" | "delete" | "tag" | "restore";
+
+interface HistoryJob {
+  srcBucket: string;
+  srcPrefix: string;           // folder holding the chosen items (verbatim); "" = bucket root
+  destBucket: string | null;   // copy / move / rename only
+  destPrefix: string | null;   // folder the items went to (verbatim)
+  items: number;               // items the user chose (keys or prefixes)
+  first: string;               // the first chosen key or prefix (verbatim)
+  firstTo: string | null;      // where it went (verbatim)
+  objects: number;             // objects covered once folders were expanded (Job.totalItems)
+  done: number; skipped: number; failed: number;
+  firstError: string | null;   // "key: message" of the first per-object failure
+  label: string;               // the backend's Job.label (shown when the request is not known)
+}
+
+interface HistoryEntry {
+  id: string;                  // the transfer, batch or job id
+  kind: HistoryTransferKind | HistoryJobKind;
+  status: "completed" | "failed" | "cancelled";
+  bucket: string;              // a job's source bucket
+  key: string;                 // object key, the prefix for folder transfers, a job's srcPrefix (verbatim)
+  localPath: string;           // file or folder on this computer; "" for jobs
+  bytes: number;               // bytes transferred / copied; 0 for delete, tag, restore (not meaningful)
+  files: number;               // 1 for single transfers; done files / objects otherwise
+  connection: string;          // display label of the connection it ran on
+  finishedAt: string;          // ISO-8601
+  error: string | null;        // the transfer's or job's error, else a job's firstError
+  versionId?: string | null;   // set when a download fetched an older version of the object
+  job?: HistoryJob | null;     // set exactly for the job kinds
+}
+```
+
+- Recorded when a transfer, folder transfer or job reaches a final status (from the existing stores and
+  events: `onTransferFinished` for single transfers, `onBatchUpdate` for batches, `onJobUpdate` for
+  jobs; the per-file transfers of a batch are not recorded on their own). An entry with the same `id`
+  replaces the older one. `bytes` is the transferred bytes (a batch's `doneBytes`, a copy or move job's
+  `doneBytes`), `files` is a batch's `doneFiles` or a job's `doneItems`.
+- A job's items come from the request it was started with (`jobRequest`, known for every job started in
+  this session). A `move` of exactly one item whose destination is in the same bucket and the same
+  folder as the source is recorded as `rename`. Every key and prefix is stored verbatim.
+- Stored in `localStorage` `s3x.transferHistory` as one JSON array (transfers and jobs together),
+  newest first, capped at 500 entries in all; reads and writes never throw (a corrupt or unavailable
+  store reads as empty, malformed entries are dropped). No secrets, no file contents.
+- `versionId` keeps "Download again" of a version download fetching that version, not the current object.
+
+Frontend:
+- The Activity panel gets two tabs: **Now** (what it showed before) and **History**. History lists
+  entries newest first, virtualized, with: icon by kind, name, bucket path muted, size or count, when
+  (relative, exact on hover), status. Filter chips **All**, **Transfers**, **File operations** and a
+  search box (name, key, bucket, local path or a job's source / destination, case-insensitive) narrow it.
+- Job rows read as a sentence per kind: "Moved 12 items to reports/2026/", "Copied a.txt to
+  other-bucket/x/", "Deleted 3 items from images/", "Renamed a.txt to b.txt", "Tagged 4 items in docs/",
+  "Requested restore of b.iso in archive/" (a job that failed or was cancelled uses the imperative:
+  "Move 12 items to …"). The second line is the source → destination, or the error. The size column
+  shows bytes for copy / move / rename, else the objects done, with failed or skipped counts below. The
+  tooltip lists source, destination, counts, the first failure and the connection.
+- Transfer row actions (buttons on hover and the right-click menu / menu key):
+  - **Open file** / **Open folder** and **Show in folder** for completed downloads. Open goes through
+    `open_local`, which only accepts finished downloads the backend still knows (this session); any
+    refusal or a missing file is a calm info toast pointing at Show in folder. Open is hidden for the
+    `OPEN_LOCAL_REFUSED_EXTENSIONS`. Show in folder uses `reveal_local`; failure is a calm toast.
+  - **Go to object** (single transfers, uploads too: navigates to its folder and selects it) /
+    **Go to folder** (folder transfers: opens the prefix). Disabled with "Other connection" when the
+    bucket is not one of the current connection's buckets, as in the Now tab.
+  - **Download again** / **Upload again** re-run the transfer through the existing commands with the
+    usual confirmations: a single download asks for the save path (`start_download`, or
+    `download_object_version` for a version), a single upload starts `start_upload` to the same key
+    from the same local file (as a normal upload does), a folder download opens the folder-download
+    confirmation into the original parent folder, a folder upload opens the folder-upload confirmation
+    with the original local folder. Needs the bucket to be in the current connection.
+  - **Copy key** (single transfers) / **Copy prefix** (folders), **Copy local path**, **Remove from history**.
+- Job row actions: **Go to destination** (copy, move, rename: selects the object for a single object,
+  else opens the destination folder), **Go to folder** (delete: the source folder) or **Go to object** /
+  **Go to folder** (tag, restore: the source), disabled with "Other connection" as above;
+  **Copy source path**, **Copy destination path** (copy, move, rename), **Copy first failure** (when
+  there is one), **Remove from history**. Jobs are never offered again: a stale repeat of a delete or
+  move is unsafe.
+- **Clear history** in the panel bar asks for confirmation, then empties the store.
+- Desktop notifications and the Now tab are unchanged.

@@ -23,18 +23,17 @@ import {
   FolderUp,
   ClipboardCopy,
   ExternalLink,
-  LocateFixed,
 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, Batch, BatchStatus, Job, JobKind, Transfer, TransferStatus } from "../lib/types";
 import { isActive, selectActiveCount, useTransfers } from "../store/transfers";
 import { jobRequest, removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
 import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, useBatches } from "../store/batches";
-import { navigate, revealObject, setTransfersOpen, useApp } from "../store/app";
-import { closeSearch } from "../store/search";
+import { setTransfersOpen, useApp } from "../store/app";
 import { copyText } from "../store/actions";
 import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
-import { toast } from "../store/toasts";
+import { copyKeyItem, copyPathItem, goFolder, goItem, goObject, openLocal, reveal, showItem, useKnownBucket, type KnownBucket } from "./activityItems";
+import { HistoryBar, HistoryList, useActivityTab, useHistoryCount } from "./ActivityHistory";
 import { basename, formatBytes, formatDuration, formatSpeed, refusedToOpen } from "../lib/format";
 import { isJobActive, jobFraction, plural } from "../lib/ops";
 import { shortVersionId, useVersionDownloads } from "../store/versions";
@@ -80,14 +79,6 @@ async function removeTransfers(ids: string[]) {
     }
   }
   remove(removed);
-}
-
-async function reveal(t: Pick<Transfer, "localPath">) {
-  try {
-    await api.revealInFolder(t.localPath);
-  } catch (e) {
-    toast.error("Could not show file", e as AppError);
-  }
 }
 
 const TransferRow = memo(function TransferRow({ id }: { id: string }) {
@@ -463,57 +454,6 @@ function folderOf(keyOrPrefix: string): string {
   return body.slice(0, body.lastIndexOf("/") + 1);
 }
 
-type KnownBucket = (bucket: string | null | undefined) => boolean;
-
-/** Is `bucket` one of the current connection's buckets (listed or added by name)? */
-function useKnownBucket(): KnownBucket {
-  const connected = useApp((s) => !!s.connection);
-  const buckets = useApp((s) => s.buckets);
-  const added = useApp((s) => s.addedBuckets);
-  return useCallback(
-    (bucket) => !!bucket && connected && (buckets.some((b) => b.name === bucket) || added.some((b) => b.name === bucket)),
-    [connected, buckets, added],
-  );
-}
-
-async function openLocal(path: string, what: string) {
-  try {
-    await api.openLocal(path);
-  } catch (e) {
-    toast.error(`Could not open ${what}`, e as AppError);
-  }
-}
-
-/** "Go to …": disabled, with the reason, when the bucket is not in this connection. */
-function goItem(label: string, bucket: string, known: boolean, go: () => void): PopupMenuItem {
-  return known
-    ? { label, icon: <LocateFixed size={14} />, action: go }
-    : {
-        label,
-        icon: <LocateFixed size={14} />,
-        action: () => {},
-        disabled: true,
-        hint: "Other connection",
-        title: `s3://${bucket} is not one of this connection's buckets`,
-      };
-}
-
-const goObject = (bucket: string, key: string) => {
-  closeSearch();
-  revealObject(bucket, key, key.slice(key.lastIndexOf("/") + 1));
-};
-const goFolder = (bucket: string, prefix: string) => {
-  closeSearch();
-  navigate(bucket, prefix);
-};
-
-const copyKeyItem = (key: string): PopupMenuItem => ({ label: "Copy key", icon: <Copy size={14} />, action: () => void copyText(key, "Key") });
-const copyPathItem = (path: string): PopupMenuItem => ({
-  label: "Copy local path",
-  icon: <ClipboardCopy size={14} />,
-  action: () => void copyText(path, "Local path"),
-});
-const showItem = (path: string): PopupMenuItem => ({ label: "Show in folder", icon: <FolderSearch size={14} />, action: () => void reveal({ localPath: path }) });
 const cancelItem = (run: () => void): PopupMenuItem => ({ label: "Cancel", icon: <CircleStop size={14} />, action: run });
 /**
  * "Remove from list" takes the row away: keep the keyboard focus in the panel by moving it to the
@@ -702,6 +642,8 @@ type ActivityRow = { kind: "job" | "transfer" | "batch"; id: string };
 /** Bottom panel: transfers (uploads/downloads) and jobs (delete/copy/move), newest first. */
 export function ActivityPanel() {
   const open = useApp((s) => s.transfersOpen);
+  const tab = useActivityTab((s) => s.tab);
+  const historyCount = useHistoryCount();
   const transferIds = useTransfers((s) => s.ids);
   const jobIds = useJobs((s) => s.ids);
   const batchIds = useBatches((s) => s.ids);
@@ -751,15 +693,33 @@ export function ActivityPanel() {
           )}
           {active === 0 && total > 0 && <span className="muted small">{total} finished</span>}
         </button>
+        {open && (
+          <div className="segmented xtabs" role="tablist" aria-label="Activity view">
+            <button role="tab" aria-selected={tab === "now"} className={tab === "now" ? "active" : ""} onClick={() => useActivityTab.setState({ tab: "now" })}>
+              Now
+            </button>
+            <button
+              role="tab"
+              aria-selected={tab === "history"}
+              className={tab === "history" ? "active" : ""}
+              onClick={() => useActivityTab.setState({ tab: "history" })}
+            >
+              History
+              {historyCount > 0 && <span className="xtab-count">{historyCount}</span>}
+            </button>
+          </div>
+        )}
         <Summary />
         <div className="spacer" />
-        {open && finishedCount > 0 && (
+        {open && tab === "now" && finishedCount > 0 && (
           <button className="link-btn" onClick={clearFinished}>
             Clear finished
           </button>
         )}
+        {open && tab === "history" && <HistoryBar />}
       </div>
-      {open && (
+      {open && tab === "history" && <HistoryList />}
+      {open && tab === "now" && (
         <div className="transfers-body">
           {total === 0 ? (
             <div className="empty-note">Nothing here yet. Uploads, downloads and file operations show their progress here.</div>

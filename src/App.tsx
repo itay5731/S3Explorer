@@ -5,6 +5,7 @@ import { setConnected, useApp } from "./store/app";
 import { startTransferSync } from "./store/transfers";
 import { startJobSync } from "./store/jobs";
 import { startBatchSync } from "./store/batches";
+import { installHistory } from "./store/history";
 import { ConnectScreen } from "./components/ConnectScreen";
 import { Explorer } from "./components/Explorer";
 import { Toasts } from "./components/Toasts";
@@ -23,6 +24,8 @@ export default function App() {
     let stopBatches: (() => void) | null = null;
     let cancelUpdateCheck: (() => void) | null = null;
     let disposed = false;
+    // Before the syncs start, so no finish event is missed; also while disconnected.
+    const stopHistory = installHistory();
     // Settings work while disconnected, so load them independently of the connection.
     void loadSettings().then(() => {
       // Optional silent update check a few seconds after launch; never installs anything.
@@ -50,6 +53,7 @@ export default function App() {
       stopJobs?.();
       stopBatches?.();
       cancelUpdateCheck?.();
+      stopHistory();
     };
   }, []);
 
