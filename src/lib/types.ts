@@ -153,6 +153,8 @@ export interface AppSettings extends TransferSettings {
    */
   downloadLimitKibps: number | null;
   uploadLimitKibps: number | null;
+  /** v0.8.0: load a preview (HEAD + bounded GET) as soon as a single file is selected. Default true. */
+  previewAutomatically: boolean;
 }
 
 /** Range of `downloadLimitKibps` / `uploadLimitKibps` (the backend enforces the same). */
@@ -177,6 +179,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   keybindings: {},
   downloadLimitKibps: null,
   uploadLimitKibps: null,
+  previewAutomatically: true,
 };
 
 // Saved connections

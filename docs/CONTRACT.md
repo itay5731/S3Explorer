@@ -2077,3 +2077,20 @@ Search behaviour itself is unchanged.
 #### IAM permissions added in this version
 
 None.
+
+### Integration decisions (orchestrator, after review of the ten PRs)
+
+- `AppSettings` gains `previewAutomatically: boolean` (default `true`; `update_settings` requires it; a
+  `settings.json` without it loads `true`). When `false`, selecting a file shows a **Preview** button in the
+  details panel instead of fetching; Quick look (`F3`) always fetches. Settings → Behavior holds the toggle
+  "Preview files automatically" with the note that each preview is a HEAD plus a bounded GET.
+- The hidden game from PR #4 has no developer keys in any build; a cheat code typed during the game
+  (`iddqd`, letters in sequence within 2 s) toggles god mode with an on-screen notice, and a run with god
+  mode on never records a best score.
+- Persisted per-connection state (tabs, bookmarks, history) is keyed by one `connectionKey()`: the saved
+  connection id, else kind + profile or access key id + endpoint + region; never the display label alone.
+  Deleting a saved connection forgets all three.
+- Every action the PRs add is registered in the keyboard registry (bound or unbound) so it appears in
+  Settings → Keyboard and the cheat sheet; the defaults table is extended with the final rows.
+- "Later" on the update popup is remembered per version; the details panel stays hidden until a bucket
+  is open; folder sizes are "cleared by changes made in this app", not "never stale".
