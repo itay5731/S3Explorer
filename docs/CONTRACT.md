@@ -1472,6 +1472,14 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `act.restore` | Restore archived | files | (none) |
 | `act.preview` | Quick look (added with "Object preview") | files | `F3` |
 | `act.disconnect` | Disconnect | global | `Mod+Shift+Q` |
+| **v0.8.0** `tab.new` / `tab.close` / `tab.reopen` | New tab / Close tab / Reopen closed tab | global | `Mod+N` / `Mod+W` (macOS `Mod+Shift+W`) / `Mod+Shift+T` |
+| `tab.next` / `tab.prev` | Next / previous tab | global | `Mod+Tab`, `Mod+PageDown` / `Mod+Shift+Tab`, `Mod+PageUp` |
+| `nav.bookmark` | Bookmark this folder | global | `Mod+Shift+D` |
+| `view.history` | Show the history (Activity) | global | `Mod+H` (macOS `Mod+Shift+H`) |
+| `act.preview` | Quick look | files | `F3` |
+| `act.editMetadata` | Edit content type and metadata | files | `Mod+M` (macOS unbound) |
+| `act.folderSize` | Calculate folder size | files | (none) |
+| `act.pauseAll` / `act.resumeAll` | Pause all / Resume all transfers | global | (none) |
 
 `Shift` held with `sel.up/down/pageUp/pageDown/first/last` extends the selection (a fixed rule, not a
 separate binding). **`F5` and `F6` are no longer Copy/Move to other pane**; `F5` refreshes the active pane
@@ -1627,7 +1635,7 @@ export const BOOKMARKS_MAX = 100;   // per connection
   reconnected without a saved id, so the saved id in use is also kept in `sessionStorage` and reused when the
   reconnected `ConnectionInfo` matches it. At most 100 per connection; a bookmark is identified by
   `bucket` + `prefix` (no duplicates). Reads and writes never throw; an unreadable or malformed entry is
-  ignored. Deleting a saved connection also removes its bookmarks (`s3x.bookmarks.<id>`).
+  ignored. Deleting a saved connection also removes its bookmarks (`s3x.bookmarks.saved:<id>`); the key is `connectionKey()` (see "Integration decisions").
 - **Prefixes are used verbatim** (see "Data safety"): the stored prefix is exactly the pane's prefix, and
   opening a bookmark navigates to exactly that prefix.
 - **Path bar.** A star button at the end of the path bar toggles a bookmark for that pane's current folder
@@ -1692,11 +1700,11 @@ Several locations open at once in each pane. Frontend only; no new command, type
 
   | Action id | Label | Defaults |
   |---|---|---|
-  | `tab.new` | New tab (duplicates the current location) | `Mod+Alt+T` |
-  | `tab.close` | Close tab | `Mod+W` |
+  | `tab.new` | New tab (duplicates the current location) | `Mod+N` |
+  | `tab.close` | Close tab | `Mod+W` (macOS `Mod+Shift+W`: Cmd+W closes the window) |
   | `tab.next` | Next tab | `Mod+Tab`, `Mod+PageDown` |
   | `tab.prev` | Previous tab | `Mod+Shift+Tab`, `Mod+PageUp` |
-  | `tab.reopen` | Reopen closed tab | `Mod+Alt+Shift+T` |
+  | `tab.reopen` | Reopen closed tab | `Mod+Shift+T` |
 
   On macOS `Cmd+Tab` / `Cmd+Shift+Tab` belong to the system; `Cmd+PageDown` / `Cmd+PageUp` work there.
   Closing the last tab of a pane does nothing: the pane stays on its location (never an empty pane).
@@ -1711,7 +1719,7 @@ Several locations open at once in each pane. Frontend only; no new command, type
   20-tab cap applies (same toast). A pane with nothing open just opens the place instead of adding a tab.
 - Open tabs are remembered **per connection** in `localStorage` (`s3x.tabs`: per connection, per pane, the
   tabs' bucket and prefix and which one is active; nothing else), and restored on reconnect (the second pane
-  only when the split is on). The connection is identified by its saved-connection id, else by its label,
+  only when the split is on). The connection is identified by `connectionKey()` (the saved-connection id, else kind + profile or access key id + endpoint + region; see "Integration decisions"), never by its label alone,
   endpoint and region. Reads and writes never throw; malformed data is ignored.
 - Everything that acts on "the active pane" acts on the active pane's shown tab. Transfers, jobs and their
   events keep working whichever tab is shown. A job, upload or new folder that changes a folder refreshes
@@ -1912,7 +1920,7 @@ interface HistoryEntry {
   this session). A `move` of exactly one item whose destination is in the same bucket and the same
   folder as the source is recorded as `rename`. Every key and prefix is stored verbatim.
 - Stored in `localStorage` `s3x.transferHistory` as one JSON array (transfers and jobs together),
-  newest first, capped at 500 entries in all; reads and writes never throw (a corrupt or unavailable
+  newest first, capped at 400 transfers and 100 jobs (separately, so a large multi-download cannot evict the jobs); reads and writes never throw (a corrupt or unavailable
   store reads as empty, malformed entries are dropped). No secrets, no file contents.
 - `versionId` keeps "Download again" of a version download fetching that version, not the current object.
 

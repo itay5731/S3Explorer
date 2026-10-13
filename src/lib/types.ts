@@ -619,6 +619,8 @@ export interface HistoryJob {
 }
 
 export interface HistoryEntry {
+  /** `connectionKey()` of the connection the entry was recorded on; "" in entries from before the field existed. */
+  connectionKey: string;
   /** The transfer, batch or job id. */
   id: string;
   kind: HistoryKind;
