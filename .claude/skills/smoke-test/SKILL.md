@@ -6,12 +6,14 @@ description: Integration-test the S3 backend against a local SeaweedFS S3 server
 # Local S3 smoke test (SeaweedFS)
 
 MinIO's download server (dl.min.io) returns 410 Gone since the project was archived, and Docker
-is usually not running here. Use the single-binary SeaweedFS server instead. Keep it in the
-session scratchpad directory, never in the repo.
+is usually not running here. Use the single-binary SeaweedFS server instead. Keep the binary in the
+session scratchpad directory, never in the repo; its data goes under `src-tauri/target/` (git-ignored, on D:).
 
 ## Start SeaweedFS
 ```bash
-SW="$(cygpath -u "$TMP")/claude/s3explorer-seaweed"; mkdir -p "$SW/swdata"
+SW="$(cygpath -u "$TMP")/claude/s3explorer-seaweed"; mkdir -p "$SW"
+# Data on D:, not C: (see below). Absolute path to the repo's target dir.
+SWDATA="/d/Projects/Personal/s3explorer/src-tauri/target/seaweed-data"; mkdir -p "$SWDATA"
 if [ ! -f "$SW/weed.exe" ]; then
   curl -sSL -o "$SW/seaweed.zip" https://github.com/seaweedfs/seaweedfs/releases/latest/download/windows_amd64.zip
   (cd "$SW" && unzip -o -q seaweed.zip)
@@ -19,9 +21,11 @@ fi
 cat > "$SW/s3.json" <<'JSON'
 {"identities":[{"name":"admin","credentials":[{"accessKey":"minioadmin","secretKey":"minioadmin"}],"actions":["Admin","Read","Write","List","Tagging"]}]}
 JSON
-"$SW/weed.exe" server -dir="$SW/swdata" -s3 -s3.port=8333 -s3.config="$SW/s3.json" -ip=127.0.0.1 -master.port=9333 -volume.port=8080 -filer.port=8888 -volume.max=100 -master.volumeSizeLimitMB=1024
+"$SW/weed.exe" server -dir="$SWDATA" -s3 -s3.port=8333 -s3.config="$SW/s3.json" -ip=127.0.0.1 -master.port=9333 -volume.port=8080 -filer.port=8888 -volume.max=100 -master.volumeSizeLimitMB=1024
 ```
-Run the last line with `run_in_background: true`. On macOS/Linux use the `darwin_arm64.tar.gz`
+Run the last line with `run_in_background: true`. Keep the data directory on D: (`src-tauri/target/seaweed-data`):
+C: is nearly full on this machine and SeaweedFS refuses to allocate volumes when its disk has under 1% free.
+The binary can stay in the scratchpad. On macOS/Linux use the `darwin_arm64.tar.gz`
 or `linux_amd64.tar.gz` release asset and `chmod +x weed`. Ready when
 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/` returns 403 (signed request required).
 
@@ -33,7 +37,8 @@ Connection for the app or tests: static credentials `minioadmin` / `minioadmin`,
 cd src-tauri && cargo run --example smoke 2>&1 | tail -40
 ```
 Env overrides: `SMOKE_ENDPOINT` (default `http://127.0.0.1:8333`), `SMOKE_ACCESS_KEY` /
-`SMOKE_SECRET_KEY` (default `minioadmin`), `SMOKE_DIR` (scratch dir), `SMOKE_BIG_MIB` (default 40).
+`SMOKE_SECRET_KEY` (default `minioadmin`), `SMOKE_DIR` (scratch dir), `SMOKE_BIG_MIB` (default 40; at least 15,
+or the pause/resume checks fail on purpose: the transfer must still be running when it is paused).
 It creates a bucket and folder, uploads a large random file (multipart path) and a tiny one
 (PutObject path), lists with paging, heads, downloads (parallel ranged path) and compares
 SHA-256, exercises cancel and a missing-key failure, then deletes the folder with >2,000 keys
@@ -53,9 +58,10 @@ pauses then cancels an upload (no multipart upload or object left behind).
 - `cargo run --example search`: bucket search (v0.6.0): keyword/phrase/exclusion/tag terms, path narrowing and its
   fallback, exact-path hit, limit truncation, cancellation by `searchId` and `cancel_search`, folder markers skipped.
   Run it after any change to `src-tauri/src/search.rs`.
-- `cargo run --example metadata`: editing content type and metadata (copy onto itself). Snapshots the bucket around
-  every scenario: body, storage class, tags and other headers survive; a stale ETag or a metadata-only change by
-  another client writes nothing; invalid input writes nothing. Needs `SMOKE_ENDPOINT`. Run it after any change to
+- `cargo run --example metadata`: editing content type and metadata (copy onto itself, `MetadataDirective=REPLACE`).
+  Snapshots the bucket around every scenario: body, storage class, tags and other headers survive; a stale ETag
+  (`If-Match` answered 412) or a metadata-only change by another client writes nothing; HTTP-token metadata keys and
+  empty values round-trip; GLACIER / DEEP_ARCHIVE objects are refused before any write; invalid input writes nothing. Needs `SMOKE_ENDPOINT`. Run it after any change to
   `src-tauri/src/metadata.rs`.
 - `keychain_check`, `saved_e2e`: saved connections against the real OS keychain using the TEST service name
   `dev.s3explorer.app.test`. `updater_check`: the update check and a failing-signature install against a local server.
