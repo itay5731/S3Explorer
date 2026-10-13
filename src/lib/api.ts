@@ -37,6 +37,7 @@ import {
   type MetadataEdit,
   type ObjectEntry,
   type ObjectMeta,
+  type ObjectPreview,
   type ProfileInfo,
   type RecentListing,
   type RestoreRequest,
@@ -81,6 +82,8 @@ export interface Backend {
   listObjects(bucket: string, prefix: string, continuationToken?: string | null, pageSize?: number): Promise<ListPage>;
   listRecent(bucket: string, prefix: string): Promise<RecentListing>;
   headObject(bucket: string, key: string): Promise<ObjectMeta>;
+  /** What is inside a file, read into memory without a download (see "Object preview" in the contract). */
+  previewObject(bucket: string, key: string): Promise<ObjectPreview>;
   createFolder(bucket: string, prefix: string): Promise<void>;
   // Shared buckets (added by name)
   listAddedBuckets(): Promise<AddedBucket[]>;
@@ -228,6 +231,7 @@ const tauriBackend: Backend = {
     }),
   listRecent: (bucket, prefix) => invoke<RecentListing>("list_recent", { bucket, prefix }),
   headObject: (bucket, key) => invoke<ObjectMeta>("head_object", { bucket, key }),
+  previewObject: (bucket, key) => invoke<ObjectPreview>("preview_object", { bucket, key }),
   createFolder: (bucket, prefix) => invoke<void>("create_folder", { bucket, prefix }),
   listAddedBuckets: () => invoke<AddedBucket[]>("list_added_buckets"),
   addBucket: (input) => invoke<AddedBucket>("add_bucket", { input }),
@@ -401,6 +405,7 @@ export const listObjects = (bucket: string, prefix: string, continuationToken?: 
   call("listObjects", bucket, prefix, continuationToken, pageSize);
 export const listRecent = (bucket: string, prefix: string) => call("listRecent", bucket, prefix);
 export const headObject = (bucket: string, key: string) => call("headObject", bucket, key);
+export const previewObject = (bucket: string, key: string) => call("previewObject", bucket, key);
 export const createFolder = (bucket: string, prefix: string) => call("createFolder", bucket, prefix);
 export const listAddedBuckets = () => call("listAddedBuckets");
 /** `input` is a bucket name, an `s3://` URI or an ARN, as typed (trimmed). */

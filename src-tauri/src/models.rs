@@ -1330,6 +1330,30 @@ pub struct FolderSize {
     pub truncated: bool,
 }
 
+/// What `preview_object` found ("Object preview" in docs/CONTRACT.md).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PreviewKind {
+    Text,
+    Image,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectPreview {
+    pub kind: PreviewKind,
+    /// As stored in S3.
+    pub content_type: Option<String>,
+    /// The object's full size.
+    pub size: u64,
+    /// Text only: just the first `PREVIEW_TEXT_MAX` bytes were read.
+    pub truncated: bool,
+    pub text: Option<String>,
+    pub data_base64: Option<String>,
+    pub reason: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

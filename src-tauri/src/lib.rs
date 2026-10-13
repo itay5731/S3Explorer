@@ -18,6 +18,7 @@ pub mod local_open;
 pub mod metadata;
 pub mod models;
 pub mod ops;
+pub mod preview;
 pub mod profiles;
 pub mod saved;
 pub mod search;
@@ -120,6 +121,7 @@ pub fn run() {
             commands::browse::list_objects,
             commands::browse::list_recent,
             commands::browse::head_object,
+            commands::browse::preview_object,
             commands::folders::create_folder,
             commands::transfers::start_download,
             commands::transfers::start_upload,

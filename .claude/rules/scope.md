@@ -55,6 +55,8 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
     v0.7.0; see "Tabs" in `docs/CONTRACT.md`).
 31. Edit an object's content type, Cache-Control, Content-Disposition and user metadata (a copy onto itself,
     confirmed before it runs; added on request after v0.7.0; see "Edit content type and metadata" in `docs/CONTRACT.md`).
+32. Preview of text files and images in the details panel and a Quick look dialog (`F3`), read into
+    memory without a download (added on request after v0.7.0; see "Object preview" in `docs/CONTRACT.md`).
 
 Explicitly **not** in scope: bucket creation/deletion, presigned URLs, permissions/ACL editing, sync,
 dragging objects out of the app, editing versioning settings, object lock / legal hold.

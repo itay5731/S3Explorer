@@ -22,6 +22,9 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{AppError, AppResult};
 use crate::models::{now_iso, Transfer, TransferKind, TransferSettings, TransferStatus};
 use gate::RunGate;
+// The object preview reads with the same stall and size-scaled bounds as a transfer.
+pub(crate) use download::next_chunk;
+pub(crate) use upload::upload_attempt_timeout;
 
 pub const MIB: u64 = 1024 * 1024;
 const TICK: Duration = Duration::from_millis(100);

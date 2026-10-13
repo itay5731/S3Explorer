@@ -84,6 +84,7 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("act.tags", "Tags", "Act", "files", "Mod+T"),
   a("act.versions", "Show versions", "Act", "files", "Mod+Shift+V"),
   a("act.restore", "Restore archived", "Act", "files"),
+  a("act.preview", "Quick look", "Act", "files", "F3"),
   a("act.disconnect", "Disconnect", "Act", "global", "Mod+Shift+Q"),
 ];
 

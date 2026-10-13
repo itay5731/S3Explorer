@@ -18,6 +18,7 @@ import { displayName, formatBytes, formatExact, formatRelative, formatStorageCla
 import { FileIcon } from "./FileIcon";
 import { FolderSizeField } from "./FolderSize";
 import { MAX_EDIT_BYTES } from "../lib/metadata";
+import { PreviewSection } from "./Preview";
 
 function Field({ label, children, mono, copy }: { label: string; children: ReactNode; mono?: boolean; copy?: string }) {
   return (
@@ -226,6 +227,7 @@ export function DetailsPanel() {
             <div className="muted small">{formatBytes(obj.size)}</div>
           </div>
         </div>
+        <PreviewSection bucket={bucket} object={obj} />
         <div className="dactions">
           <button className="btn" onClick={() => void downloadObjects([obj])} disabled={blocked} title={blocked ? ARCHIVED_REASON : undefined}>
             <Download size={14} /> Download

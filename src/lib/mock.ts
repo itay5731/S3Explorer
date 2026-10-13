@@ -27,6 +27,7 @@ import type {
   MetadataEdit,
   ObjectEntry,
   ObjectMeta,
+  ObjectPreview,
   ProfileInfo,
   RecentListing,
   RestoreRequest,
@@ -41,7 +42,7 @@ import type {
   UpdateProgress,
   VersionListing,
 } from "./types";
-import { BATCH_LIMITS, FOLDER_SIZE_SCAN_LIMIT, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS } from "./types";
+import { BATCH_LIMITS, FOLDER_SIZE_SCAN_LIMIT, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS, PREVIEW_LIMITS } from "./types";
 import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
@@ -2093,6 +2094,66 @@ function folderEntryOf(prefix: string): FolderEntry {
   return { prefix, name: body.slice(body.lastIndexOf("/") + 1) };
 }
 
+// ---- object preview (see "Object preview" in docs/CONTRACT.md) ----
+
+const PREVIEW_IMAGE_EXT = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "svg"];
+const PREVIEW_TEXT_EXT = new Set(
+  "txt md markdown json jsonl csv tsv log xml yaml yml toml ini conf cfg env sql sh bat ps1 py js mjs ts tsx jsx css scss html htm rs go java kt c h cpp cs rb php swift tf hcl properties gitignore dockerfile".split(" "),
+);
+
+/** A made-up picture for an image key: a gradient with the file name, encoded as the key's type. */
+function mockImage(key: string, ext: string): string {
+  const name = key.slice(key.lastIndexOf("/") + 1);
+  const hue = [...key].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 360, 7);
+  if (ext === "svg") {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="320"><rect width="480" height="320" fill="hsl(${hue},55%,45%)"/><circle cx="240" cy="160" r="90" fill="hsl(${(hue + 120) % 360},60%,60%)"/></svg>`;
+    return btoa(svg);
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = 640;
+  canvas.height = 420;
+  const g = canvas.getContext("2d");
+  if (g) {
+    const grad = g.createLinearGradient(0, 0, 640, 420);
+    grad.addColorStop(0, `hsl(${hue}, 60%, 55%)`);
+    grad.addColorStop(1, `hsl(${(hue + 70) % 360}, 55%, 30%)`);
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 640, 420);
+    g.fillStyle = "rgba(255,255,255,0.9)";
+    g.font = "600 28px sans-serif";
+    g.fillText(name.slice(0, 36), 32, 380);
+  }
+  const type = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "webp" ? "image/webp" : "image/png";
+  return canvas.toDataURL(type).split(",")[1] ?? "";
+}
+
+function mockText(key: string, ext: string): string {
+  const name = key.slice(key.lastIndexOf("/") + 1);
+  if (ext === "json") return JSON.stringify({ name, generatedBy: "mock", items: [1, 2, 3].map((i) => ({ id: i, label: `Item ${i}`, ok: i % 2 === 1 })) });
+  if (ext === "csv" || ext === "tsv") {
+    const sep = ext === "tsv" ? "\t" : ",";
+    const rows = [["id", "name", "city", "amount"].join(sep)];
+    for (let i = 1; i <= 240; i++) rows.push([i, `"Customer ${i}"`, ["Lisbon", "Oslo", "Tel Aviv", "Austin"][i % 4], (i * 17.35).toFixed(2)].join(sep));
+    return rows.join("\n");
+  }
+  if (ext === "log") return Array.from({ length: 400 }, (_, i) => `2026-10-12T08:${String(i % 60).padStart(2, "0")}:00Z INFO request ${i} served in ${(i * 7) % 300} ms`).join("\n");
+  return `# ${name}\n\nThis is a preview from the mock backend.\nA very long line follows to show soft wrapping: ${"lorem ipsum dolor sit amet ".repeat(12)}\n`;
+}
+
+function mockPreview(bucket: string, key: string, o: MockObject): ObjectPreview {
+  const p: ObjectPreview = { kind: "unsupported", contentType: o.contentType, size: o.size, truncated: false, text: null, dataBase64: null, reason: null };
+  const ext = key.slice(key.lastIndexOf("/") + 1).toLowerCase().split(".").pop() ?? "";
+  if (needsRestore(bucket, key, o)) return { ...p, reason: "Archived: restore it to preview" };
+  if (PREVIEW_IMAGE_EXT.includes(ext)) {
+    if (o.size > PREVIEW_LIMITS.imageMaxBytes) return { ...p, reason: "Too large to preview" };
+    return { ...p, kind: "image", dataBase64: mockImage(key, ext) };
+  }
+  if (PREVIEW_TEXT_EXT.has(ext) || o.contentType.startsWith("text/")) {
+    return { ...p, kind: "text", text: mockText(key, ext), truncated: o.size > PREVIEW_LIMITS.textMaxBytes };
+  }
+  return { ...p, reason: "Binary file" };
+}
+
 async function mockSearch(query: SearchQuery, searchId: string): Promise<SearchResult> {
   searchCallLog.push({ query: { ...query }, searchId, at: new Date().toISOString() });
   const gen = ++searchSeq;
@@ -2711,6 +2772,14 @@ export const mockBackend: Backend = {
     b.objects.set(edit.key, next);
     b.sorted = null;
     return objectMeta(edit.bucket, edit.key, next);
+  },
+
+  async previewObject(bucket, key): Promise<ObjectPreview> {
+    await latency();
+    const b = requireBucket(bucket);
+    const o = b.objects.get(key);
+    if (!o || key.endsWith("/")) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
+    return mockPreview(bucket, key, o);
   },
 
   async createFolder(bucket, prefix) {
