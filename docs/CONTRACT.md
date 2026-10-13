@@ -1773,8 +1773,10 @@ Rules:
   A mismatch is `Unknown` naming the field ("the edit was written but ..."); a failed read-back is
   `saved_but_unread` (keeps the code). The frontend then reloads the details and never says nothing changed.
 - Refused with `InvalidInput` and a clear message, before anything is written: objects over 5 GiB
-  (single-request copy limit), archived objects that are not restored, objects encrypted with a customer key
-  (SSE-C), an `Expires` header that cannot be parsed back, `) or longer than 128 chars, empty metadata keys
+  (single-request copy limit), objects in GLACIER or DEEP_ARCHIVE whether restored or not (`NotSupported`: the
+  copy would re-archive the data), Intelligent-Tiering archive tiers that are not restored, objects encrypted with a customer key
+  (SSE-C), an `Expires` header that cannot be parsed back, metadata keys that are not lowercase HTTP token
+  characters (regex ``^[a-z0-9!#$%&'*+.^_`|~-]+$``) or longer than 128 chars, empty metadata keys
   (empty values are allowed), values that are not printable ASCII
   (control characters, and non-ASCII, which S3 would store RFC 2047-encoded so the read-back could not match),
   values or header fields with leading or trailing spaces (HTTP trims them), more than 2 KiB of user metadata in
@@ -1895,6 +1897,7 @@ interface HistoryJob {
 }
 
 interface HistoryEntry {
+  connectionKey: string;       // connectionKey() of the connection it was recorded on; "" for older entries
   id: string;                  // the transfer, batch or job id
   kind: HistoryTransferKind | HistoryJobKind;
   status: "completed" | "failed" | "cancelled";
