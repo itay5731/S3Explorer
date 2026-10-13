@@ -1425,7 +1425,7 @@ action). Contexts decide where a chord fires:
 
 | Context | Fires when |
 |---|---|
-| `global` | anywhere in the explorer except inside a text field, unless the chord has `Mod`, `Alt` or is an F-key; never while a dialog, context menu or Settings is open (except `settings.open`, `help.shortcuts` and `escape`) |
+| `global` | anywhere in the explorer except inside a text field, unless the chord has `Mod`, `Alt` or is an F-key; never while a dialog, context menu or Settings is open (except `view.settings`, `help.shortcuts` and `sel.none`) |
 | `files` | focus is in a pane's table or results list (the active pane) |
 | `search` | focus is in the toolbar search box |
 
@@ -1474,9 +1474,7 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `act.disconnect` | Disconnect | global | `Mod+Shift+Q` |
 | **v0.8.0** `tab.new` / `tab.close` / `tab.reopen` | New tab / Close tab / Reopen closed tab | global | `Mod+N` / `Mod+W` (macOS `Mod+Shift+W`) / `Mod+Shift+T` |
 | `tab.next` / `tab.prev` | Next / previous tab | global | `Mod+Tab`, `Mod+PageDown` / `Mod+Shift+Tab`, `Mod+PageUp` |
-| `nav.bookmark` | Bookmark this folder | global | `Mod+Shift+D` |
 | `view.history` | Show the history (Activity) | global | `Mod+H` (macOS `Mod+Shift+H`) |
-| `act.preview` | Quick look | files | `F3` |
 | `act.editMetadata` | Edit content type and metadata | files | `Mod+M` (macOS unbound) |
 | `act.folderSize` | Calculate folder size | files | (none) |
 | `act.pauseAll` / `act.resumeAll` | Pause all / Resume all transfers | global | (none) |
@@ -1985,9 +1983,10 @@ export const BANDWIDTH_LIMITS = { minKibps: 64, maxKibps: 1_048_576 } as const;
   Setting `null` releases every waiter at once.
 - **Never a hang:** waiting on the limiter is not a stall. The download body idle timeout (30 s) covers only
   the wait for the next chunk from the network, never the wait for tokens. While an upload limit is set, the
-  upload attempt timeout assumes the limit is shared by the most requests the settings allow (32 parts ×
-  10 transfers), so a limited healthy link never hits it; without a limit it assumes 32 KiB/s shared by the
-  current parts × transfers. A part already in flight when a limit is switched on keeps the timeout it was
+  upload attempt timeout is computed from the limit itself: base + part length × (the most requests the
+  settings allow, 32 parts × 10 transfers) ÷ the limit in bytes per second, with no 6-hour cap in that case,
+  so a limited healthy link never hits it at any part size; without a limit it assumes 32 KiB/s shared by the
+  current parts × transfers, capped at 6 hours. A part already in flight when a limit is switched on keeps the timeout it was
   sent with. A waiter dropped before its bytes were allowed (cancel, pause, attempt timeout) refunds them,
   capped at one burst, so other transfers never pay for abandoned tickets.
 - Live speed and ETA in Activity reflect the limited speed naturally (they are measured, not computed
