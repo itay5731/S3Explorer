@@ -75,6 +75,8 @@ export interface Transfer {
   error: string | null;
   startedAt: string;
   finishedAt: string | null;
+  /** v0.9.0: the ETag a download was pinned to (If-Match on every part); null for uploads or when the server sent none. */
+  etag?: string | null;
 }
 
 export const TRANSFER_PROGRESS_EVENT = "transfer:progress";
@@ -221,6 +223,8 @@ export interface JobItem {
   from: string;
   to: string | null;
   isPrefix: boolean;
+  /** v0.9.0, delete jobs only: delete the object only if its ETag still matches (If-Match); an object that changed is reported, not deleted. */
+  etag?: string | null;
 }
 
 export interface JobRequest {

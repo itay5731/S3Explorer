@@ -1478,6 +1478,11 @@ Default bindings (the frontend's registry in `src/lib/keys.ts` is the source of 
 | `act.editMetadata` | Edit content type and metadata | files | `Mod+M` (macOS unbound) |
 | `act.folderSize` | Calculate folder size | files | (none) |
 | `act.pauseAll` / `act.resumeAll` | Pause all / Resume all transfers | global | (none) |
+| **v0.9.0** `source.pickLeft` / `source.pickRight` | Choose the left / right pane's source (bucket or local drive) | global | `Alt+F1` / `Alt+F2` |
+| `nav.editPath` | Edit the path | global | `Mod+L` |
+| `nav.syncOther` | Show this location in the other pane | global | `Mod+Shift+ArrowRight`, `Mod+Shift+ArrowLeft` |
+| `local.toggleHidden` | Show hidden files (local pane) | global | `Mod+.` |
+| (preset `commander` differences) `act.copyToOther` / `act.moveToOther` `F5` / `F6`; `act.rename` `Shift+F6`; `nav.refresh` `F2`, `Mod+R`; `nav.focusSearch` `Alt+F7`, `Mod+F`, `/`; `act.tags` `Alt+Shift+T`; `act.folderSize` `Alt+Shift+L`; `tab.new` `Mod+T`, `Mod+N` | | | |
 
 `Shift` held with `sel.up/down/pageUp/pageDown/first/last` extends the selection (a fixed rule, not a
 separate binding). **`F5` and `F6` are no longer Copy/Move to other pane**; `F5` refreshes the active pane
@@ -2133,7 +2138,10 @@ keybindingsPreset: "commander" | "classic";   // the default map that `keybindin
 ```
 
 - `DEFAULT_APP_SETTINGS.keybindingsPreset` is `"commander"`: **new installs get Total Commander keys.**
-- **A `settings.json` without the field loads `"classic"`.** That is the whole upgrade story: an existing
+- **A `settings.json` without the field loads `"classic"`**, and so does a **missing** `settings.json` when the
+  app's config directory already holds any other file (`connections.json`, `added-buckets.json`, …): that is an
+  existing install that never saved settings. Only a truly fresh install (empty or absent config directory)
+  gets `commander`. That is the whole upgrade story: an existing
   user's effective bindings do not change by one key, and their `keybindings` overrides keep meaning what
   they meant. `update_settings` requires the field (strict), like every other field.
 - Settings → Keyboard gets a **Preset** control at the top (Total Commander / Classic) with a one-line
@@ -2153,7 +2161,7 @@ uploads.
 
 ```ts
 type PaneSource = { kind: "s3" } | { kind: "local" };
-interface LocalRoot { path: string; label: string; kind: "drive" | "home" | "folder" }   // C:\, D:\, Home…
+interface LocalRoot { path: string; label: string; kind: "drive" | "home" | "folder" }   // C:\, D:\, Home… ("folder" = a mount under /media, /mnt, /Volumes)
 interface LocalEntry {
   name: string;
   path: string;              // absolute, as the OS returns it
@@ -2172,8 +2180,8 @@ interface LocalListing { dirs: LocalEntry[]; files: LocalEntry[]; truncated: boo
 | `list_local_dir` | `{ path, showHidden }` | `LocalListing`, sorted by name, **capped at 50,000 entries** (`truncated: true` past that), never following symlinks, `InvalidInput` for a relative path, `Io` with the OS message when unreadable (permissions, missing). `parent` is the parent directory or null at a root. |
 | `create_local_dir` | `{ parent, name }` | `void`. Name sanitized with the same rules as download file names; refuses an existing name. |
 | `rename_local` | `{ path, newName }` | `void`. Same directory only; refuses an existing target; never replaces. |
-| `trash_local` | `{ paths: string[] }` | `{ trashed: number; failed: { path: string; message: string }[] }`. Moves to the OS recycle bin / trash (the `trash` crate), **never a permanent delete**; a symlink is trashed as the link, never its target. |
-| `local_dir_size` | `{ path, scanId }` | `{ files, bytes, truncated }`, bounded like folder size (200,000 entries), cancellable by id, never follows symlinks. |
+| `trash_local` | `{ paths: string[] }` | `{ trashed: number; failed: { path: string; message: string }[] }`. Moves to the OS recycle bin / trash (the `trash` crate), **never a permanent delete**: on Windows the volume is determined from the **canonical** parent (junctions and mount points resolved), must be a fixed local disk with a recycle bin that is enabled (no "remove immediately" setting) and large enough for the item, otherwise the path is reported as failed and left in place; a symlink is trashed as the link, never its target. At most 10,000 paths per call. |
+| `local_dir_size` | `{ path, scanId }` | `{ files, bytes, truncated }`, bounded like folder size (200,000 entries), never follows symlinks, holds at most one directory handle at a time (pending directories are kept as paths). A newer call with the same `scanId` cancels the older one, and `cancel_folder_size { id }` cancels a local scan too. |
 
 - **Choosing a source:** `Alt+F1` (left pane) / `Alt+F2` (right pane), the pane's path-bar menu, and the
   sidebar's new "This computer" group (the local roots, discreet: one collapsible group under the buckets)
@@ -2195,12 +2203,18 @@ interface LocalListing { dirs: LocalEntry[]; files: LocalEntry[]; truncated: boo
     then one delete job for **exactly the object keys whose download completed** (single transfers by
     key; for a folder batch, the keys of its per-file transfers that ended `completed`, never the prefix
     itself, so an object added under the folder after the move was planned is never deleted and folder
-    markers are left in place). The existing `delete` job runs it with no extra confirmation beyond the
-    move's own, which lists the items and says they will be deleted from S3 after download. Anything that failed, was cancelled
+    markers are left in place). Each item carries the **ETag the download was pinned to** (`JobItem.etag`), and the delete job deletes
+    conditionally (If-Match, the same mechanism the S3→S3 move uses): an object rewritten during the move is
+    left in place and reported as "changed on S3, not deleted". The existing `delete` job runs it with no
+    extra confirmation beyond the move's own, which lists the items and says they will be deleted from S3
+    after download. Anything that failed, was cancelled
     or was skipped is **not** deleted. Closing the app mid-way deletes nothing.
   - local → S3 **copy**: `start_upload` per file / `start_batch` upload per folder to the S3 pane's
     bucket + prefix (existing conflict preview). **Move**: the same, then `trash_local` for exactly the
-    files/folders whose transfer ended `completed` (to the recycle bin; the confirmation says so).
+    **files** whose transfer ended `completed` (single files by path; for a folder batch, the local paths of its
+    per-file transfers that ended `completed`, never the folder itself, so entries the planner skipped, links,
+    and files created after planning stay where they are; emptied folders are left in place). To the recycle
+    bin; the confirmation says so.
   - local → local: copy/move on disk are **out of scope** (use the OS); the actions are disabled with that
     reason. S3 → S3 is unchanged.
   - The source selection and the destination directory/prefix are captured when the action starts; the
