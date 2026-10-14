@@ -2144,10 +2144,11 @@ keybindingsPreset: "commander" | "classic";   // the default map that `keybindin
   gets `commander`. That is the whole upgrade story: an existing
   user's effective bindings do not change by one key, and their `keybindings` overrides keep meaning what
   they meant. `update_settings` requires the field (strict), like every other field.
-- Settings → Keyboard gets a **Preset** control at the top (Total Commander / Classic) with a one-line
-  description of each. Changing it changes the default map; overrides stay as they are, and the
-  conflict check runs against the new defaults (conflicts are shown as today). "Reset all" resets the
-  overrides, not the preset. The cheat sheet and all tooltips follow the effective map as before.
+- **There is no preset control in the UI** (user decision 2026-10-14). The field is an internal marker of
+  which default map an installation started from: new installs are Total Commander, upgraded installs keep
+  the classic map as their defaults so nothing changes for them. Settings → Keyboard shows only the actions,
+  the chords and Record / Reset / Reset all / Export / Import as before; "Reset all" returns an installation
+  to its own default map. The cheat sheet and tooltips follow the effective map as before.
 - Export files gain `"preset": "commander" | "classic"`; import applies the preset and then the
   bindings. A file without `preset` (v0.8.0 export) imports as full explicit bindings, as today.
 - The always-prevented webview keys (F5, Ctrl+R, …) stay prevented in both presets.
