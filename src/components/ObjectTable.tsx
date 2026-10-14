@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { AlertCircle, ArrowDown, ArrowUp, FolderOpen, Loader2, RefreshCw, Upload } from "lucide-react";
+import { AlertCircle, ArrowDown, ArrowUp, EyeOff, FolderOpen, Link2, Loader2, RefreshCw, Upload } from "lucide-react";
 import {
   getPane,
   loadMore,
@@ -25,6 +25,10 @@ import { useClipboard } from "../store/clipboard";
 import { isDenied, permissionText } from "../store/toasts";
 import { useRowDrag, useRowDragView } from "./RowDrag";
 import { openFolderInNewTab, takeTabScroll } from "../store/tabs";
+import { isLocalPane } from "../store/panes";
+import { openLocalEntry } from "../store/local";
+import type { LocalEntry } from "../lib/types";
+import { LocalSizeCell } from "./LocalPane";
 
 const ROW_H = 28;
 
@@ -44,6 +48,7 @@ const RowView = memo(function RowView({
   cut,
   dragged,
   bucket,
+  local,
 }: {
   row: Row;
   index: number;
@@ -53,14 +58,24 @@ const RowView = memo(function RowView({
   cut: boolean;
   dragged: boolean;
   bucket: string;
+  /** A local pane's row: the listed entry (link badge, hidden). */
+  local?: LocalEntry;
 }) {
   const obj = row.kind === "object" ? row.object : null;
   const sc = obj?.storageClass ?? null;
-  // Folder rows are drop targets for dragged rows (see RowDrag.tsx); the prefix is the server's own.
-  const drop = row.kind === "folder" ? { "data-drop-bucket": bucket, "data-drop-prefix": row.folder.prefix } : {};
+  // Folder rows are drop targets for dragged rows (see RowDrag.tsx); the prefix is the server's own,
+  // a local folder's path the OS's own. A link is no target (it is never followed).
+  const drop =
+    row.kind !== "folder"
+      ? {}
+      : local
+        ? local.isSymlink
+          ? {}
+          : { "data-drop-local": local.path }
+        : { "data-drop-bucket": bucket, "data-drop-prefix": row.folder.prefix };
   return (
     <div
-      className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""} ${cut ? "cut" : ""} ${dragged ? "dragged" : ""}`}
+      className={`trow ${selected ? "selected" : ""} ${focused ? "focused" : ""} ${index % 2 ? "odd" : ""} ${cut ? "cut" : ""} ${dragged ? "dragged" : ""} ${local?.hidden ? "hidden-entry" : ""}`}
       data-index={index}
       data-row-id={row.id}
       role="row"
@@ -71,9 +86,23 @@ const RowView = memo(function RowView({
       <div className="cell col-name" title={row.kind === "folder" ? row.folder.prefix : row.object.key}>
         <FileIcon name={row.name} folder={row.kind === "folder"} />
         <span className="name-text">{displayName(row.name)}</span>
+        {local?.isSymlink && (
+          <span className="link-tag" title="A link (symlink or junction): shown, never followed">
+            <Link2 size={11} /> link
+          </span>
+        )}
+        {local?.hidden && <EyeOff size={11} className="hidden-tag" aria-label="Hidden" />}
         {cut && <span className="cut-tag" title="Cut: will be moved when you paste">cut</span>}
       </div>
-      <div className="cell col-size">{obj ? formatBytes(obj.size) : <FolderSizeCell bucket={bucket} prefix={row.kind === "folder" ? row.folder.prefix : ""} />}</div>
+      <div className="cell col-size">
+        {obj ? (
+          formatBytes(obj.size)
+        ) : local ? (
+          local.isSymlink ? <span className="dim">—</span> : <LocalSizeCell path={local.path} />
+        ) : (
+          <FolderSizeCell bucket={bucket} prefix={row.kind === "folder" ? row.folder.prefix : ""} />
+        )}
+      </div>
       <div className="cell col-modified" title={obj ? formatExact(obj.lastModified) : undefined}>
         {obj ? formatRelative(obj.lastModified) : <span className="dim">—</span>}
       </div>
@@ -93,6 +122,9 @@ export function ObjectTable() {
   const pane = usePaneId();
   const rows = useViewRows();
   const bucket = usePane((s) => s.bucket);
+  // v0.9.0: a local pane uses this same table (its rows are the directory's entries).
+  const localEntries = usePane((s) => (isLocalPane(s) ? s.local.entries : null));
+  const localDir = usePane((s) => s.local?.dir ?? null);
   const prefix = usePane((s) => s.prefix);
   const selection = usePane((s) => s.selection);
   const focus = usePane((s) => s.focus);
@@ -122,7 +154,7 @@ export function ObjectTable() {
   // Reset scroll when the folder or sort order changes.
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
-  }, [bucket, prefix, sort]);
+  }, [bucket, prefix, localDir, sort]);
 
   // Another tab shown: back to where that tab was scrolled (after the reset above).
   useEffect(() => {
@@ -146,6 +178,10 @@ export function ObjectTable() {
 
   const openRow = useCallback(
     (row: Row) => {
+      if (isLocalPane(getPane(pane))) {
+        openLocalEntry(pane, row.id);
+        return;
+      }
       const { bucket } = getPane(pane);
       if (!bucket) return;
       if (row.kind === "folder") navigate(bucket, row.folder.prefix, pane);
@@ -314,12 +350,13 @@ export function ObjectTable() {
     [pane],
   );
 
-  if (!bucket) return <Welcome />;
+  if (!bucket && !localEntries) return <Welcome />;
 
   return (
-    <div className="object-table" role="grid" aria-rowcount={rows.length}>
+    <div className={`object-table ${localEntries ? "local" : ""}`} role="grid" aria-rowcount={rows.length}>
       <div className="thead" role="row">
-        {COLUMNS.map((c) => (
+        {(localEntries ? COLUMNS.filter((c) => c.key !== "class") : COLUMNS).map((c) => (
+
           <button key={c.key} className={`th ${c.className} ${sort.key === c.key ? "sorted" : ""}`} onClick={() => setSort(c.key, pane)} role="columnheader">
             <span>{c.label}</span>
             {sort.key === c.key && (sort.dir === 1 ? <ArrowUp size={12} /> : <ArrowDown size={12} />)}
@@ -357,7 +394,7 @@ export function ObjectTable() {
         ) : error && !hasRows ? (
           <div className="table-empty">
             <AlertCircle size={32} strokeWidth={1.25} className="err-icon" />
-            <div className="empty-title">{isDenied(error) ? `${permissionText("list objects")}` : "Couldn’t list this folder"}</div>
+            <div className="empty-title">{localEntries ? "Couldn’t open this folder" : isDenied(error) ? `${permissionText("list objects")}` : "Couldn’t list this folder"}</div>
             <div className="muted">{error.message}</div>
             <button className="btn" onClick={() => refresh(pane)}>
               <RefreshCw size={14} /> Try again
@@ -367,8 +404,12 @@ export function ObjectTable() {
           <div className="table-empty">
             <FolderOpen size={36} strokeWidth={1.25} />
             <div className="empty-title">{filter ? "No matches" : "This folder is empty"}</div>
-            <div className="muted">{filter ? `Nothing loaded matches “${filter}”.` : "Drop files here or use Upload to add some."}</div>
-            {!filter && (
+            {localEntries ? (
+              <div className="muted">{filter ? `Nothing here matches “${filter}”.` : "Copy files here from an S3 pane (F5), or create a folder."}</div>
+            ) : (
+              <div className="muted">{filter ? `Nothing loaded matches “${filter}”.` : "Drop files here or use Upload to add some."}</div>
+            )}
+            {!filter && !localEntries && (
               <button className="btn" onClick={() => void pickAndUpload()}>
                 <Upload size={14} /> Upload files
               </button>
@@ -389,7 +430,8 @@ export function ObjectTable() {
                     focused={focus === row.id}
                     cut={!!cutIds && cutIds.has(row.id)}
                     dragged={dragIds.has(row.id)}
-                    bucket={bucket}
+                    bucket={bucket ?? ""}
+                    local={localEntries?.get(row.id)}
                   />
                 );
               })}

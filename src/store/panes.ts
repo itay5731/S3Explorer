@@ -8,7 +8,7 @@
 
 import { createContext } from "react";
 import { create } from "zustand";
-import type { AppError, FolderEntry, ObjectEntry, SearchResult } from "../lib/types";
+import type { AppError, FolderEntry, LocalEntry, ObjectEntry, PaneSource, SearchResult } from "../lib/types";
 import { readPref } from "./prefs";
 
 export type PaneId = "a" | "b";
@@ -54,10 +54,26 @@ export interface PaneSearch {
   focus: string | null;
 }
 
-/** One place a pane was at (see "History" in docs/CONTRACT.md). */
+/**
+ * One place a pane was at (see "History" in docs/CONTRACT.md): a bucket and prefix, or (v0.9.0) a
+ * directory of the local computer (`local` set; `bucket` and `prefix` are then "").
+ */
 export interface HistoryEntry {
   bucket: string;
   prefix: string;
+  local?: string;
+}
+
+/** A local pane's directory (v0.9.0, see "Pane sources" in docs/CONTRACT.md). */
+export interface LocalLocation {
+  /** The directory, exactly as the OS returned it (or as typed, for an edited path). */
+  dir: string;
+  /** Its parent directory as `list_local_dir` reported it; null at a root (or before the first listing). */
+  parent: string | null;
+  /** The listing stopped at the 50,000-entry cap. */
+  truncated: boolean;
+  /** The listed entries by path: the link badge, hidden flag and kind of each row. */
+  entries: ReadonlyMap<string, LocalEntry>;
 }
 
 /** A pane's back/forward history: `entries[index]` is where the pane is now. */
@@ -70,8 +86,19 @@ export const HISTORY_CAP = 100;
 export const emptyHistory: PaneHistory = { entries: [], index: -1 };
 
 export interface PaneState {
+  /** v0.9.0: S3 (bucket + prefix) or the local computer (`local`). A local pane has `bucket` null. */
+  source: PaneSource;
+  /** The local directory while `source` is local; null for an S3 pane. */
+  local: LocalLocation | null;
+  /** List hidden files in a local pane (per pane, for the session). */
+  showHidden: boolean;
   bucket: string | null;
   prefix: string;
+  /**
+   * The rows. In a local pane, directories are `folders` (`prefix` = the full path) and files are
+   * `objects` (`key` = the full path, no ETag or storage class): the table, selection, filter and
+   * sort work the same on both sources.
+   */
   listing: Listing;
 
   selection: Set<string>;
@@ -121,6 +148,16 @@ export const emptySearch: PaneSearch = {
 
 export const SORT_KEY = "s3x.sort";
 
+export const S3_SOURCE: PaneSource = { kind: "s3" };
+export const LOCAL_SOURCE: PaneSource = { kind: "local" };
+
+/** Is this pane (or tab state) showing the local computer? */
+export const isLocalPane = (p: Pick<PaneState, "source" | "local">): p is Pick<PaneState, "source"> & { local: LocalLocation } =>
+  p.source.kind === "local" && p.local !== null;
+
+/** Does a pane (or tab state) show anything: a bucket, or a local directory? */
+export const paneHasLocation = (p: Pick<PaneState, "bucket" | "source" | "local">) => p.bucket !== null || isLocalPane(p);
+
 let tabSeq = 0;
 /** A tab id, unique for the session. */
 export const newTabId = () => ++tabSeq;
@@ -128,6 +165,9 @@ export const newTabId = () => ++tabSeq;
 /** A pane with nothing open. The sort order is the saved one (shared by both panes as a default). */
 export function freshPane(sort: SortState = readPref<SortState>(SORT_KEY, { key: "name", dir: 1 })): PaneState {
   return {
+    source: S3_SOURCE,
+    local: null,
+    showHidden: false,
     bucket: null,
     prefix: "",
     listing: emptyListing,

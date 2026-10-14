@@ -82,6 +82,9 @@ export const selectActiveBatchCount = (s: BatchState) => {
  */
 export function upsertBatchFiles(ts: Transfer[]) {
   if (!ts.length) return;
+  // Every terminal file event goes to the listeners (a file can go queued → completed within one
+  // frame and never be seen active here); they de-duplicate by transfer id.
+  if (fileListeners.size) for (const t of ts) if (!(t.status === "running" || t.status === "queued" || t.status === "paused")) fileListeners.forEach((cb) => cb(t));
   // A batch can queue thousands of files in one burst, all delivered in one frame: copy the store
   // and each batch's map at most once per call (copying per event was quadratic and froze the UI).
   const prev = useBatches.getState().files;
@@ -101,6 +104,17 @@ export function upsertBatchFiles(ts: Transfer[]) {
     else delete files[bid][t.id];
   }
   if (files) useBatches.setState({ files });
+}
+
+type FileHandler = (t: Transfer) => void;
+const fileListeners = new Set<FileHandler>();
+/**
+ * v0.9.0: called with each per-file transfer of a batch when an event reports it in a final status
+ * (possibly more than once for the same transfer). A move from S3 collects the completed keys here.
+ */
+export function onBatchFileFinished(cb: FileHandler): () => void {
+  fileListeners.add(cb);
+  return () => fileListeners.delete(cb);
 }
 
 /** The request each batch was started with, by batch id (this session only). */

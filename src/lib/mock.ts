@@ -24,6 +24,11 @@ import type {
   LifecycleConfiguration,
   LifecycleRule,
   ListPage,
+  LocalDirSize,
+  LocalEntry,
+  LocalListing,
+  LocalRoot,
+  TrashResult,
   MetadataEdit,
   ObjectEntry,
   ObjectMeta,
@@ -42,7 +47,7 @@ import type {
   UpdateProgress,
   VersionListing,
 } from "./types";
-import { BATCH_LIMITS, FOLDER_SIZE_SCAN_LIMIT, KEYBINDING_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS, PREVIEW_LIMITS } from "./types";
+import { BATCH_LIMITS, FOLDER_SIZE_SCAN_LIMIT, KEYBINDING_LIMITS, LOCAL_LIMITS, OPEN_LOCAL_REFUSED_EXTENSIONS, RESTORE_DAYS, SEARCH_LIMITS, DEFAULT_APP_SETTINGS, JOB_MAX_ITEMS, SAVED_CONNECTION_NAME_MAX, TAG_LIMITS, PREVIEW_LIMITS } from "./types";
 import { normalizeFileManagerCommand, planParts, validateAppSettings, validateFileManagerCommand } from "./settings";
 import { parseBucketInput } from "./buckets";
 import { isSystemTag, sameTagSet, validateTags } from "./tags";
@@ -838,7 +843,10 @@ function loadMockSettings(): AppSettings {
   try {
     const raw = localStorage.getItem(MOCK_SETTINGS_KEY);
     if (raw) {
-      const merged = { ...DEFAULT_APP_SETTINGS, ...(JSON.parse(raw) as Partial<AppSettings>) };
+      // v0.9.0: a settings file without `keybindingsPreset` (an existing user) loads "classic".
+      const merged = { ...DEFAULT_APP_SETTINGS, keybindingsPreset: "classic" as const, ...(JSON.parse(raw) as Partial<AppSettings>) };
+      // Like the backend: a missing or unknown preset loads "classic".
+      if (merged.keybindingsPreset !== "commander" && merged.keybindingsPreset !== "classic") merged.keybindingsPreset = "classic";
       if (!validateAppSettings(merged)) return merged;
     }
   } catch {
@@ -1030,6 +1038,7 @@ function tick() {
         if (b) put(b, s.t.key, s.t.totalBytes, { ageDays: 0, metadata: { "uploaded-with": "s3explorer" } });
       } else {
         localExisting.add(s.t.localPath.toLowerCase());
+        fsAddDownloaded(s.t.localPath, s.t.totalBytes);
       }
       emit(s.t);
       continue;
@@ -1228,7 +1237,9 @@ function planBatch(req: BatchPlanRequest): BatchPlan {
   if (req.kind === "upload") {
     // Test hook: a dropped folder named "badprefix" gets an InvalidInput that is not "not a folder".
     if (/^badprefix$/i.test(lastSegment(req.localPath))) throw invalid('The destination prefix must be empty or end with "/"');
-    const tree = fakeFolderTree(lastSegment(req.localPath));
+    // A folder of the fake local disk (local panes) is walked as it is; others by name, as before.
+    const fsTree = fsFolderTree(req.localPath);
+    const tree = fsTree === "notdir" ? null : fsTree ?? fakeFolderTree(lastSegment(req.localPath));
     // Exactly the backend's text: the UI tells dropped files from folders by it.
     if (tree === null) throw invalid(`${req.localPath} is not a folder`);
     if (tree === "broken") throw fail("Io", `Could not read the folder “${req.localPath}\\private”: Access is denied. (os error 5)`);
@@ -1279,7 +1290,7 @@ function planBatch(req: BatchPlanRequest): BatchPlan {
       }
       taken.set(lower, key);
       if (localRel !== rest) note(`Renamed for the local disk: “${rest}” is saved as ${local}`);
-      files.push({ rel: rest, key, local, size: o.size, conflict: localExisting.has(lower) });
+      files.push({ rel: rest, key, local, size: o.size, conflict: localExisting.has(lower) || fsNodes.has(fsKey(local)) });
       bytes += o.size;
     }
   }
@@ -1345,7 +1356,7 @@ function batchFailMessage(req: BatchPlanRequest, f: PlanFile): string | undefine
     if (f.rel.includes("fail-upload")) return "Network: connection reset while sending part 1 (after 3 attempts).";
     return bucket?.readOnly ? DENIED_WRITE : undefined;
   }
-  if (f.key.includes("fail-download")) return "Network: the server closed the connection (after 3 attempts).";
+  if (f.key.includes("fail-download") || (transferFailPattern && f.key.includes(transferFailPattern))) return "Network: the server closed the connection (after 3 attempts).";
   const o = bucket?.objects.get(f.key);
   return o && needsRestore(req.bucket, f.key, o) ? ARCHIVED_MESSAGE : undefined;
 }
@@ -2351,7 +2362,9 @@ function mockOpenLocal(path: string) {
   const fromBatch = [...batchSims.values()].some(
     (s) => s.b.kind === "download" && !isBatchActive(s.b) && s.b.doneFiles > 0 && norm(s.b.localPath) === target,
   );
-  if (!fromTransfer && !fromBatch) throw fail("InvalidInput", "Not a finished download.");
+  // v0.9.0: also any file browsed to in a local pane (here: anything on the fake local disk).
+  const browsed = fsNodes.has(fsKey(path));
+  if (!fromTransfer && !fromBatch && !browsed) throw fail("InvalidInput", "Not a finished download.");
   // Like the backend: trailing dots and spaces are ignored, and folders are checked too (x.app).
   const name = lastSegment(path).replace(/[. ]+$/, "");
   const dot = name.lastIndexOf(".");
@@ -2467,6 +2480,389 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   /** What the next import open dialog returns (a path, or null for "cancelled"). */
   setNextImportFile: (path: string | null) => {
     textPick.open = path;
+  },
+});
+
+
+// ---- the local computer (v0.9.0) ----------------------------------------------------------------
+// An in-memory fake file system for local panes (see "Pane sources" in docs/CONTRACT.md), Windows
+// style: drives C:\ and D:\, the home C:\Users\demo with nested folders, sizes and dates, hidden
+// entries (dotfiles and the hidden attribute), symlinks (listed, never followed), an unreadable
+// folder, and D:\many with 60,000 files (past the 50,000 cap). Completed downloads add files here;
+// trash_local removes entries. Upload batches walk a folder that exists here.
+
+interface FsNode {
+  path: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  modified: string;
+  isSymlink: boolean;
+  hidden: boolean;
+  unreadable?: boolean;
+}
+
+/** Lower-cased, `\` separators, no trailing separator except on a drive root ("c:\"). */
+function fsKey(path: string): string {
+  let p = path.replace(/\//g, "\\");
+  if (!/^[A-Za-z]:\\$/.test(p)) p = p.replace(/\\+$/, "");
+  if (/^[A-Za-z]:$/.test(p)) p += "\\";
+  return p.toLowerCase();
+}
+
+/** The parent directory of a path as typed (null at a drive root). */
+function fsParent(path: string): string | null {
+  const p = path.replace(/\//g, "\\").replace(/\\+$/, "");
+  if (/^[A-Za-z]:$/.test(p)) return null;
+  const i = p.lastIndexOf("\\");
+  if (i < 0) return null;
+  const parent = p.slice(0, i);
+  return /^[A-Za-z]:$/.test(parent) ? parent + "\\" : parent;
+}
+
+const fsJoin = (dir: string, name: string) => (dir.endsWith("\\") ? dir + name : `${dir}\\${name}`);
+
+const fsNodes = new Map<string, FsNode>();
+const fsChildren = new Map<string, Set<string>>();
+
+function fsAdd(path: string, opts: { isDir?: boolean; size?: number; ageDays?: number; isSymlink?: boolean; hidden?: boolean; unreadable?: boolean } = {}) {
+  const key = fsKey(path);
+  const name = /^[A-Za-z]:\\?$/.test(path) ? path.slice(0, 2) + "\\" : lastSegment(path);
+  const node: FsNode = {
+    path,
+    name,
+    isDir: opts.isDir ?? false,
+    size: opts.isDir ? 0 : opts.size ?? 0,
+    modified: new Date(NOW - (opts.ageDays ?? 1) * DAY - (hashString(path) % DAY)).toISOString(),
+    isSymlink: opts.isSymlink ?? false,
+    hidden: opts.hidden ?? name.startsWith("."),
+    unreadable: opts.unreadable,
+  };
+  fsNodes.set(key, node);
+  const parent = fsParent(path);
+  if (parent !== null) {
+    const pk = fsKey(parent);
+    if (!fsNodes.has(pk)) fsAdd(parent, { isDir: true });
+    let set = fsChildren.get(pk);
+    if (!set) fsChildren.set(pk, (set = new Set()));
+    set.add(key);
+  }
+  return node;
+}
+
+const fsDir = (path: string, opts: { ageDays?: number; hidden?: boolean; unreadable?: boolean; isSymlink?: boolean } = {}) => fsAdd(path, { ...opts, isDir: true });
+const fsFile = (path: string, size: number, opts: { ageDays?: number; hidden?: boolean; isSymlink?: boolean } = {}) => fsAdd(path, { ...opts, size });
+
+/** Remove a node and everything below it (a symlink has nothing below it: its target is never touched). */
+function fsRemove(key: string) {
+  for (const c of [...(fsChildren.get(key) ?? [])]) fsRemove(c);
+  fsChildren.delete(key);
+  const node = fsNodes.get(key);
+  fsNodes.delete(key);
+  if (node) {
+    const parent = fsParent(node.path);
+    if (parent !== null) fsChildren.get(fsKey(parent))?.delete(key);
+  }
+}
+
+/** A completed download (single or batch file): the file appears, with its missing parent folders. */
+function fsAddDownloaded(path: string, size: number) {
+  const existing = fsNodes.get(fsKey(path));
+  if (existing && !existing.isDir) {
+    existing.size = size;
+    existing.modified = new Date().toISOString();
+    return;
+  }
+  if (!existing) fsAdd(path, { size, ageDays: 0 }).modified = new Date().toISOString();
+}
+
+function seedLocalFs() {
+  const H = "C:\\Users\\demo";
+  fsDir("C:\\", { ageDays: 900 });
+  fsDir("D:\\", { ageDays: 700 });
+  fsDir("C:\\Windows", { ageDays: 400 });
+  fsDir("C:\\Program Files", { ageDays: 300 });
+  fsDir("C:\\System Volume Information", { ageDays: 900, hidden: true, unreadable: true });
+  fsFile("C:\\pagefile.sys", 8 * GB, { hidden: true, ageDays: 1 });
+  fsDir(H, { ageDays: 800 });
+  for (const d of ["Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music"]) fsDir(`${H}\\${d}`, { ageDays: 600 });
+  fsDir(`${H}\\.config`, { ageDays: 200 });
+  fsFile(`${H}\\.config\\settings.toml`, 1_204, { ageDays: 20 });
+  fsDir(`${H}\\AppData`, { ageDays: 800, hidden: true });
+  fsFile(`${H}\\NTUSER.DAT`, 2 * MB, { hidden: true, ageDays: 0 });
+  fsFile(`${H}\\.gitconfig`, 312, { ageDays: 90 });
+  fsFile(`${H}\\notes.txt`, 4_812, { ageDays: 3 });
+  fsFile(`${H}\\todo.md`, 1_090, { ageDays: 1 });
+  // Links are always listed as files (isDir false, size 0), like the backend.
+  fsFile(`${H}\\Shortcut to Documents`, 0, { isSymlink: true, ageDays: 40 });
+  // Documents: nested folders, unicode, a file that fails to upload, a symlinked file, an unreadable folder.
+  const D = `${H}\\Documents`;
+  fsFile(`${D}\\meeting notes.md`, 18_400, { ageDays: 2 });
+  fsFile(`${D}\\budget 2026.xlsx`, 284_000, { ageDays: 12 });
+  fsFile(`${D}\\report final (v2).pdf`, 2_400_000, { ageDays: 5 });
+  fsFile(`${D}\\fail-upload contract.pdf`, 640_000, { ageDays: 8 });
+  fsFile(`${D}\\link to budget.xlsx`, 0, { isSymlink: true, ageDays: 8 });
+  fsFile(`${D}\\Résumé 2026.docx`, 96_000, { ageDays: 30 });
+  fsDir(`${D}\\reports`, { ageDays: 60 });
+  fsFile(`${D}\\reports\\q1.xlsx`, 120_000, { ageDays: 160 });
+  fsFile(`${D}\\reports\\q2.xlsx`, 131_000, { ageDays: 70 });
+  fsDir(`${D}\\reports\\archive`, { ageDays: 300 });
+  fsFile(`${D}\\reports\\archive\\2025-annual.pdf`, 5_800_000, { ageDays: 280 });
+  fsDir(`${D}\\private`, { ageDays: 100, unreadable: true });
+  fsDir(`${D}\\Été 2026`, { ageDays: 20 });
+  fsFile(`${D}\\Été 2026\\carnet.md`, 8_000, { ageDays: 20 });
+  fsFile(`${D}\\Été 2026\\vue sur la mer.jpg`, 3_300_000, { ageDays: 21 });
+  // Downloads: matches the two files the batch mock already treats as existing.
+  const W = `${H}\\Downloads`;
+  fsFile(`${W}\\dataset-2026.parquet`, 48 * MB, { ageDays: 4 });
+  fsFile(`${W}\\setup.exe`, 92 * MB, { ageDays: 9 });
+  fsFile(`${W}\\docs\\pricing.xlsx`, 77_000, { ageDays: 15 });
+  fsFile(`${W}\\docs\\brand guidelines v4.pdf`, 3_100_000, { ageDays: 15 });
+  // Pictures: not "photos" (that name is the folder-upload fixture of the batch mock).
+  fsFile(`${H}\\Pictures\\Été à Nice.jpg`, 4_200_111, { ageDays: 50 });
+  fsDir(`${H}\\Pictures\\holiday 2025`, { ageDays: 120 });
+  for (let i = 1; i <= 6; i++) fsFile(`${H}\\Pictures\\holiday 2025\\IMG_${String(i).padStart(4, "0")}.jpg`, 1_800_000 + i * 113_000, { ageDays: 120 });
+  fsFile(`${H}\\Videos\\product launch 4k.mp4`, 1_300 * MB, { ageDays: 40 });
+  fsFile(`${H}\\Desktop\\quarterly-results.xlsx`, 210_000, { ageDays: 6 });
+  // D:\
+  fsDir("D:\\Backups", { ageDays: 500 });
+  for (let m = 1; m <= 4; m++) fsFile(`D:\\Backups\\backup-2026-0${m}.zip`, (2 + m) * GB, { ageDays: 300 - m * 30 });
+  fsDir("D:\\Media", { ageDays: 400 });
+  fsDir("D:\\many", { ageDays: 30 });
+  fsFile("D:\\Media\\soundtrack.flac", 41 * MB, { ageDays: 380 });
+}
+seedLocalFs();
+
+/** D:\many: 60,000 files, generated on listing only (past the 50,000 cap). */
+const MANY_KEY = "d:\\many";
+const MANY_COUNT = 60_000;
+
+const fsCallLog: { cmd: string; args: unknown; at: string }[] = [];
+const trashLog: string[] = [];
+/** Test hook: transfers whose key (download) or local path (upload) contains this fail. */
+let transferFailPattern: string | null = null;
+const localSizeGen = new Map<string, number>();
+let localSizeSeq = 0;
+let localSizeLimit: number = LOCAL_LIMITS.dirSizeMaxEntries;
+
+/** Paths the backend refuses: relative, UNC, device, "..". Throws `InvalidInput`. */
+function checkLocalPath(path: unknown, what = "The path") {
+  if (typeof path !== "string" || !path) throw invalid(`${what} must not be empty.`);
+  if (/^(\\\\|\/\/)/.test(path)) throw invalid(`${what} must be on a drive of this computer: network and device paths are not supported.`);
+  if (!/^[A-Za-z]:[\\/]/.test(path)) throw invalid(`${what} must be absolute.`);
+  if (path.split(/[\\/]/).includes("..")) throw invalid(`${what} must not contain “..”.`);
+}
+
+/** The path or one of its ancestors is a link (the backend refuses to go through one: InvalidInput). */
+function linkInPath(path: string): boolean {
+  for (let p: string | null = path; p !== null; p = fsParent(p)) if (fsNodes.get(fsKey(p))?.isSymlink) return true;
+  return false;
+}
+
+function toLocalEntry(n: FsNode): LocalEntry {
+  return { name: n.name, path: n.path, isDir: n.isDir, size: n.isDir ? 0 : n.size, modified: n.modified, isSymlink: n.isSymlink, hidden: n.hidden };
+}
+
+const byName = (a: { name: string }, b: { name: string }) => (a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0);
+
+function mockListLocalDir(path: string, showHidden: boolean): LocalListing {
+  checkLocalPath(path);
+  const key = fsKey(path);
+  const node = fsNodes.get(key);
+  if (!node) throw fail("Io", `${path}: The system cannot find the path specified. (os error 3)`);
+  if (!node.isDir) throw fail("Io", `${path}: The directory name is invalid. (os error 267)`);
+  if (linkInPath(path)) throw invalid(`${path} is a link or inside one; links are listed, never followed.`);
+  if (node.unreadable) throw fail("Io", `${path}: Access is denied. (os error 5)`);
+  const dirs: LocalEntry[] = [];
+  const files: LocalEntry[] = [];
+  for (const c of fsChildren.get(key) ?? []) {
+    const n = fsNodes.get(c);
+    if (!n || (!showHidden && n.hidden)) continue;
+    (n.isDir ? dirs : files).push(toLocalEntry(n));
+  }
+  if (key === MANY_KEY) {
+    for (let i = 0; i < MANY_COUNT; i++) {
+      const name = `rec-${String(i).padStart(5, "0")}.json`;
+      files.push({ name, path: fsJoin(node.path, name), isDir: false, size: 2_000 + (i % 7_000), modified: new Date(NOW - (i % 400) * DAY).toISOString(), isSymlink: false, hidden: false });
+    }
+  }
+  dirs.sort(byName);
+  files.sort(byName);
+  const max = LOCAL_LIMITS.maxEntries;
+  const truncated = dirs.length + files.length > max;
+  const keptDirs = dirs.slice(0, max);
+  const keptFiles = files.slice(0, Math.max(0, max - keptDirs.length));
+  return { dirs: keptDirs, files: keptFiles, truncated, parent: fsParent(node.path) };
+}
+
+/** The name rule of create_local_dir / rename_local: one segment, the download sanitizer's result. */
+function checkLocalName(name: unknown): string {
+  if (typeof name !== "string" || !name.trim()) throw invalid("The name must not be empty.");
+  const n = sanitizeFileName(name.trim());
+  if (/[\\/]/.test(name)) throw invalid("The name must not contain \\ or /.");
+  return n;
+}
+
+function mockCreateLocalDir(parent: string, name: string) {
+  checkLocalPath(parent, "The folder");
+  if (linkInPath(parent)) throw invalid(`${parent} is a link or inside one.`);
+  const p = fsNodes.get(fsKey(parent));
+  if (!p || !p.isDir) throw fail("Io", `${parent}: The system cannot find the path specified. (os error 3)`);
+  if (p.unreadable) throw fail("Io", `${parent}: Access is denied. (os error 5)`);
+  const n = checkLocalName(name);
+  const target = fsJoin(p.path, n);
+  if (fsNodes.has(fsKey(target))) throw fail("Conflict", `“${n}” already exists in ${p.path}.`);
+  fsDir(target, { ageDays: 0 }).modified = new Date().toISOString();
+}
+
+function mockRenameLocal(path: string, newName: string) {
+  checkLocalPath(path);
+  const key = fsKey(path);
+  const node = fsNodes.get(key);
+  if (!node) throw fail("Io", `${path}: The system cannot find the file specified. (os error 2)`);
+  const parent = fsParent(node.path);
+  if (parent === null) throw invalid("A drive can't be renamed.");
+  const n = checkLocalName(newName);
+  const target = fsJoin(parent, n);
+  const tk = fsKey(target);
+  // Only the case changes: the same entry, allowed. Anything else that exists is refused.
+  if (tk !== key && fsNodes.has(tk)) throw fail("Conflict", `“${n}” already exists; nothing was replaced.`);
+  // Re-key the node and everything below it.
+  const moved: { node: FsNode; rel: string }[] = [];
+  const collect = (k: string, rel: string) => {
+    const nd = fsNodes.get(k);
+    if (!nd) return;
+    moved.push({ node: nd, rel });
+    for (const c of fsChildren.get(k) ?? []) collect(c, `${rel}\\${fsNodes.get(c)?.name ?? ""}`);
+  };
+  collect(key, "");
+  fsRemove(key);
+  for (const { node: nd, rel } of moved) {
+    const p = target + rel;
+    const added = fsAdd(p, { isDir: nd.isDir, size: nd.size, isSymlink: nd.isSymlink, hidden: rel ? nd.hidden : n.startsWith(".") || (nd.hidden && !nd.name.startsWith(".")), unreadable: nd.unreadable });
+    added.modified = nd.modified;
+  }
+}
+
+function mockTrashLocal(paths: string[]): TrashResult {
+  if (!Array.isArray(paths) || !paths.length) throw invalid("Nothing to move to the recycle bin.");
+  const failed: { path: string; message: string }[] = [];
+  let trashed = 0;
+  for (const path of paths) {
+    try {
+      checkLocalPath(path);
+    } catch (e) {
+      failed.push({ path, message: (e as AppError).message });
+      continue;
+    }
+    const key = fsKey(path);
+    const node = fsNodes.get(key);
+    if (!node) {
+      failed.push({ path, message: "The system cannot find the file specified. (os error 2)" });
+      continue;
+    }
+    if (fsParent(node.path) === null) {
+      failed.push({ path, message: "A drive can't be moved to the recycle bin." });
+      continue;
+    }
+    if (node.unreadable) {
+      failed.push({ path, message: "Access is denied. (os error 5)" });
+      continue;
+    }
+    fsRemove(key);
+    trashLog.push(path);
+    trashed++;
+  }
+  return { trashed, failed };
+}
+
+async function mockLocalDirSize(path: string, scanId: string): Promise<LocalDirSize> {
+  checkLocalPath(path);
+  const node = fsNodes.get(fsKey(path));
+  if (!node) throw fail("Io", `${path}: The system cannot find the path specified. (os error 3)`);
+  if (linkInPath(path)) throw invalid(`${path} is a link or inside one; links are never followed.`);
+  if (!node.isDir) throw invalid(`${path} is not a folder.`);
+  const gen = ++localSizeSeq;
+  localSizeGen.set(scanId, gen);
+  await delay(250 + (hashString(path) % 300));
+  if (localSizeGen.get(scanId) !== gen) throw fail("Cancelled", "Cancelled by a newer scan.");
+  let files = 0;
+  let bytes = 0;
+  let seen = 0;
+  let truncated = false;
+  const walk = (k: string) => {
+    for (const c of fsChildren.get(k) ?? []) {
+      if (truncated) return;
+      if (++seen > localSizeLimit) {
+        truncated = true;
+        return;
+      }
+      const n = fsNodes.get(c);
+      if (!n || n.isSymlink) continue; // links are never followed (nor counted)
+      if (n.isDir) {
+        if (!n.unreadable) walk(c);
+      } else {
+        files++;
+        bytes += n.size;
+      }
+    }
+    if (k === MANY_KEY) {
+      for (let i = 0; i < MANY_COUNT && !truncated; i++) {
+        if (++seen > localSizeLimit) truncated = true;
+        else {
+          files++;
+          bytes += 2_000 + (i % 7_000);
+        }
+      }
+    }
+  };
+  walk(fsKey(path));
+  localSizeGen.delete(scanId);
+  return { files, bytes, truncated };
+}
+
+/** An upload batch of a folder that exists here: its files, "/"-relative (symlinks noted, never followed). */
+function fsFolderTree(path: string): FakeLocalFile[] | "notdir" | null {
+  const node = fsNodes.get(fsKey(path));
+  if (!node) return null;
+  if (!node.isDir || node.isSymlink) return "notdir";
+  const out: FakeLocalFile[] = [];
+  const walk = (k: string, rel: string) => {
+    for (const c of fsChildren.get(k) ?? []) {
+      const n = fsNodes.get(c);
+      if (!n) continue;
+      const r = rel ? `${rel}/${n.name}` : n.name;
+      if (n.isSymlink) out.push({ rel: r, size: 0, symlink: true });
+      else if (n.isDir) {
+        if (n.unreadable) out.push({ rel: `${r}/(unreadable)`, size: 0, unreadable: true });
+        else walk(c, r);
+      } else out.push({ rel: r, size: n.size });
+    }
+  };
+  walk(fsKey(path), "");
+  return out;
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  localCalls: fsCallLog,
+  trashed: trashLog,
+  /** Names in a local folder (hidden included), or null when it doesn't exist. */
+  localList: (path: string) => {
+    const k = fsKey(path);
+    if (!fsNodes.has(k)) return null;
+    return [...(fsChildren.get(k) ?? [])].map((c) => fsNodes.get(c)?.name ?? "").sort();
+  },
+  localNode: (path: string) => {
+    const n = fsNodes.get(fsKey(path));
+    return n ? { ...n } : null;
+  },
+  addLocalFile: (path: string, size: number) => fsFile(path, size, { ageDays: 0 }),
+  /** Transfers whose key (download) or local path (upload) contains this text fail (null: none). */
+  setTransferFailPattern: (s: string | null) => {
+    transferFailPattern = s;
+  },
+  setLocalSizeLimit: (n: number | null) => {
+    localSizeLimit = n ?? LOCAL_LIMITS.dirSizeMaxEntries;
   },
 });
 
@@ -2707,6 +3103,8 @@ export const mockBackend: Backend = {
 
   async cancelFolderSize(id) {
     if (folderSizeGen.has(id)) folderSizeGen.set(id, ++folderSizeSeq);
+    // Like the backend: the same command also cancels a local folder size scan with this id.
+    if (localSizeGen.has(id)) localSizeGen.set(id, ++localSizeSeq);
   },
 
   async openLocal(path) {
@@ -3036,7 +3434,8 @@ export const mockBackend: Backend = {
     const b = requireBucket(bucket);
     const o = b.objects.get(key);
     if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
-    return startSim("download", bucket, key, destPath, o.size, needsRestore(bucket, key, o) ? ARCHIVED_MESSAGE : undefined);
+    const injected = transferFailPattern && key.includes(transferFailPattern) ? "Network: the server closed the connection (after 3 attempts)." : undefined;
+    return startSim("download", bucket, key, destPath, o.size, needsRestore(bucket, key, o) ? ARCHIVED_MESSAGE : injected);
   },
 
   async startUpload(bucket, key, srcPath) {
@@ -3044,7 +3443,13 @@ export const mockBackend: Backend = {
     if (!key || key.endsWith("/")) throw fail("InvalidInput", "Key must name an object, not a folder.");
     const b = requireBucket(bucket);
     // Like S3: the upload is accepted and then fails when PutObject is denied.
-    return startSim("upload", bucket, key, srcPath, fakeSize(srcPath), b.readOnly ? DENIED_WRITE : undefined);
+    // A file of the fake local disk has its own size; one whose name has "fail-upload" fails half way.
+    const node = fsNodes.get(fsKey(srcPath));
+    const failing =
+      (transferFailPattern && srcPath.includes(transferFailPattern)) || /fail-upload/i.test(lastSegment(srcPath))
+        ? "Network: connection reset while sending part 1 (after 3 attempts)."
+        : undefined;
+    return startSim("upload", bucket, key, srcPath, node && !node.isDir ? node.size : fakeSize(srcPath), b.readOnly ? DENIED_WRITE : failing);
   },
 
   async cancelTransfer(id) {
@@ -3159,6 +3564,7 @@ export const mockBackend: Backend = {
       fileManagerCommand: typeof next.fileManagerCommand === "string" ? normalizeFileManagerCommand(next.fileManagerCommand) : next.fileManagerCommand,
       // Like the backend: a missing field is {} (a settings.json without it loads {}).
       keybindings: JSON.parse(JSON.stringify(next.keybindings ?? {})) as Record<string, string[]>,
+      keybindingsPreset: next.keybindingsPreset,
       downloadLimitKibps: next.downloadLimitKibps,
       uploadLimitKibps: next.uploadLimitKibps,
     };
@@ -3168,6 +3574,7 @@ export const mockBackend: Backend = {
     }
     if (candidate.fileManagerCommand === undefined) throw fail("InvalidInput", "fileManagerCommand: required.");
     if (candidate.previewAutomatically === undefined) throw fail("InvalidInput", "previewAutomatically: required.");
+    if (candidate.keybindingsPreset === undefined) throw fail("InvalidInput", "keybindingsPreset: required.");
     const problem = validateAppSettings(candidate);
     if (problem) throw fail("InvalidInput", `${problem.field}: ${problem.message}`);
     settings = candidate;
@@ -3444,6 +3851,45 @@ export const mockBackend: Backend = {
     }
     if (/[\\/][^\\/]*missing[^\\/]*[\\/][^\\/]+$/i.test(path)) throw fail("Io", "The folder does not exist.");
     textFiles.set(path.toLowerCase(), { path, content });
+  },
+
+  async listLocalRoots(): Promise<LocalRoot[]> {
+    await delay(40);
+    fsCallLog.push({ cmd: "list_local_roots", args: {}, at: new Date().toISOString() });
+    return [
+      { path: "C:\\", label: "Local Disk (C:)", kind: "drive" },
+      { path: "D:\\", label: "Data (D:)", kind: "drive" },
+      { path: "C:\\Users\\demo", label: "Home", kind: "home" },
+    ];
+  },
+
+  async listLocalDir(path, showHidden) {
+    await delay(60 + (fsKey(String(path)) === MANY_KEY ? 250 : 0));
+    fsCallLog.push({ cmd: "list_local_dir", args: { path, showHidden }, at: new Date().toISOString() });
+    return mockListLocalDir(path, showHidden);
+  },
+
+  async createLocalDir(parent, name) {
+    await delay(60);
+    fsCallLog.push({ cmd: "create_local_dir", args: { parent, name }, at: new Date().toISOString() });
+    mockCreateLocalDir(parent, name);
+  },
+
+  async renameLocal(path, newName) {
+    await delay(60);
+    fsCallLog.push({ cmd: "rename_local", args: { path, newName }, at: new Date().toISOString() });
+    mockRenameLocal(path, newName);
+  },
+
+  async trashLocal(paths) {
+    await delay(120);
+    fsCallLog.push({ cmd: "trash_local", args: { paths: [...paths] }, at: new Date().toISOString() });
+    return mockTrashLocal(paths);
+  },
+
+  async localDirSize(path, scanId) {
+    fsCallLog.push({ cmd: "local_dir_size", args: { path, scanId }, at: new Date().toISOString() });
+    return mockLocalDirSize(path, scanId);
   },
 
   async readTextFile(path) {

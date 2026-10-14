@@ -2,7 +2,7 @@
 // export/import file. Pure: no React, no stores. See "Keyboard" in docs/CONTRACT.md; the registry
 // below is the source of truth for the default bindings and must match the contract's table.
 
-import { KEYBINDING_LIMITS } from "./types";
+import { KEYBINDING_LIMITS, type KeybindingsPreset } from "./types";
 import { clientOS } from "./api";
 
 // ---- actions ------------------------------------------------------------------------------
@@ -17,7 +17,10 @@ export interface KeyAction {
   label: string;
   group: KeyGroup;
   context: KeyContext;
-  /** Default chords, portable (`Mod` = Ctrl, or Cmd on macOS). At most 4. */
+  /**
+   * Default chords of the `classic` preset, portable (`Mod` = Ctrl, or Cmd on macOS). At most 4.
+   * The defaults in effect depend on the preset: see `presetDefaults`.
+   */
   defaults: readonly string[];
 }
 
@@ -60,6 +63,11 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("nav.focusSearch", "Search", "Navigate", "global", "Mod+F", "/"),
   a("nav.searchScope", "Toggle search scope (this folder / whole bucket)", "Navigate", "global", "Mod+Shift+F"),
   a("nav.bookmark", "Bookmark this folder", "Navigate", "global", "Mod+Shift+D"),
+  a("nav.editPath", "Edit the path", "Navigate", "global", "Mod+L"),
+  a("nav.syncOther", "Show this location in the other pane", "Navigate", "global", "Mod+Shift+ArrowRight", "Mod+Shift+ArrowLeft"),
+  a("source.pickLeft", "Choose the left pane's source", "Navigate", "global", "Alt+F1"),
+  a("source.pickRight", "Choose the right pane's source", "Navigate", "global", "Alt+F2"),
+  a("local.toggleHidden", "Show hidden files (local pane)", "Navigate", "global", "Mod+."),
   a("nav.nextPane", "Next pane", "Navigate", "files", "Tab"),
   a("nav.prevPane", "Previous pane", "Navigate", "files", "Shift+Tab"),
   // Mod+T is "Tags" (since v0.7.0), so a new tab is Mod+N.
@@ -113,6 +121,50 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
 ];
 
 export const ACTIONS_BY_ID: ReadonlyMap<string, KeyAction> = new Map(KEY_ACTIONS.map((x) => [x.id, x]));
+
+// ---- presets (v0.9.0) ----------------------------------------------------------------------
+
+/**
+ * Where the Total Commander layout differs from `classic` (the file attached to issue #13; every
+ * other action, the v0.9.0 actions included, keeps its classic chords).
+ */
+const COMMANDER_CHANGES: Readonly<Record<string, readonly string[]>> = {
+  "nav.refresh": ["F2", "Mod+R"],
+  "nav.focusSearch": ["Alt+F7", "Mod+F", "/"],
+  "tab.new": ["Mod+T", "Mod+N"],
+  "act.rename": ["Shift+F6"],
+  "act.copyToOther": ["F5", "Mod+Shift+C"],
+  "act.moveToOther": ["F6", "Mod+Shift+X"],
+  "act.tags": ["Alt+Shift+T"],
+  "act.folderSize": ["Alt+Shift+L"],
+};
+
+/** The two shipped default maps: every action id to its chords (see "Keybinding presets" in docs/CONTRACT.md). */
+export const PRESETS: Readonly<Record<KeybindingsPreset, Readonly<Record<string, readonly string[]>>>> = {
+  classic: Object.fromEntries(KEY_ACTIONS.map((x) => [x.id, x.defaults])),
+  commander: Object.fromEntries(KEY_ACTIONS.map((x) => [x.id, COMMANDER_CHANGES[x.id] ?? x.defaults])),
+};
+
+export const PRESET_IDS: readonly KeybindingsPreset[] = ["commander", "classic"];
+
+export const PRESET_INFO: Record<KeybindingsPreset, { label: string; description: string }> = {
+  commander: {
+    label: "Total Commander",
+    description: "F5 / F6 copy / move to the other pane, Shift+F6 rename, F2 refresh, Alt+F1 / Alt+F2 choose a pane's source.",
+  },
+  classic: {
+    label: "Classic",
+    description: "The keys of S3 Explorer 0.8 and earlier: F5 refresh, F2 rename, Ctrl+Shift+C / X copy / move to the other pane.",
+  },
+};
+
+/** A preset id from untrusted input (a settings object, an import file); anything else is null. */
+export const asPreset = (v: unknown): KeybindingsPreset | null => (v === "commander" || v === "classic" ? v : null);
+
+/** An action's default chords in a preset. */
+export function presetDefaults(id: string, preset: KeybindingsPreset = "classic"): readonly string[] {
+  return PRESETS[preset]?.[id] ?? ACTIONS_BY_ID.get(id)?.defaults ?? [];
+}
 
 /** Movement actions that `Shift` turns into "extend the selection" (a fixed rule, not a binding). */
 export const EXTENDABLE = new Set(["sel.up", "sel.down", "sel.pageUp", "sel.pageDown", "sel.first", "sel.last"]);
@@ -389,12 +441,12 @@ export function formatPartial(partial: string): string {
 
 export type Bindings = Record<string, string[]>;
 
-/** The chords of every known action: the overrides over the defaults. */
-export function effectiveBindings(overrides: Bindings | null | undefined): Bindings {
+/** The chords of every known action: the overrides over the preset's defaults. */
+export function effectiveBindings(overrides: Bindings | null | undefined, preset: KeybindingsPreset = "classic"): Bindings {
   const out: Bindings = {};
   for (const act of KEY_ACTIONS) {
     const o = overrides?.[act.id];
-    out[act.id] = Array.isArray(o) ? [...o] : [...act.defaults];
+    out[act.id] = Array.isArray(o) ? [...o] : [...presetDefaults(act.id, preset)];
   }
   return out;
 }
@@ -411,7 +463,7 @@ const sameChordList = (x: readonly string[], y: readonly string[]) => {
  * Overrides as saved: only actions whose chords differ from the defaults (an empty list unbinds),
  * chords written in normal form, duplicates dropped. Unknown action ids are kept as they are.
  */
-export function normalizeOverrides(overrides: Bindings): Bindings {
+export function normalizeOverrides(overrides: Bindings, preset: KeybindingsPreset = "classic"): Bindings {
   const out: Bindings = {};
   for (const [id, chords] of Object.entries(overrides)) {
     const act = ACTIONS_BY_ID.get(id);
@@ -428,7 +480,7 @@ export function normalizeOverrides(overrides: Bindings): Bindings {
       seen.add(k);
       list.push(n);
     }
-    if (!sameChordList(list, act.defaults)) out[id] = list;
+    if (!sameChordList(list, presetDefaults(id, preset))) out[id] = list;
   }
   return out;
 }
@@ -537,14 +589,16 @@ export const EXPORT_VERSION = 1;
 export interface KeybindingsFile {
   s3explorer: typeof EXPORT_KIND;
   version: typeof EXPORT_VERSION;
+  /** v0.9.0: the preset the bindings were made against (a v0.8.0 file has none). */
+  preset?: KeybindingsPreset;
   bindings: Bindings;
 }
 
-/** The export file: every known action's chords (and kept unknown overrides), pretty-printed. */
-export function exportBindings(overrides: Bindings): string {
-  const bindings = effectiveBindings(overrides);
+/** The export file: the preset, every known action's chords (and kept unknown overrides), pretty-printed. */
+export function exportBindings(overrides: Bindings, preset: KeybindingsPreset = "classic"): string {
+  const bindings = effectiveBindings(overrides, preset);
   for (const [id, chords] of Object.entries(overrides)) if (!ACTIONS_BY_ID.has(id)) bindings[id] = [...chords];
-  const file: KeybindingsFile = { s3explorer: EXPORT_KIND, version: EXPORT_VERSION, bindings };
+  const file: KeybindingsFile = { s3explorer: EXPORT_KIND, version: EXPORT_VERSION, preset, bindings };
   return JSON.stringify(file, null, 2) + "\n";
 }
 
@@ -560,6 +614,8 @@ export interface ImportChange {
 }
 
 export interface ImportResult {
+  /** The preset the file names (applied before its bindings), or null for a file without one (v0.8.0). */
+  preset: KeybindingsPreset | null;
   /** The bindings the file sets, by action id (normal form for known actions). */
   bindings: Bindings;
   /** Known actions whose chords the file changes, compared with `current`. */
@@ -590,7 +646,7 @@ function checkEntry(id: string, chords: unknown): string[] {
  * Read and validate an export file against the current overrides. Throws an Error with a readable
  * message when the file is not a keybindings file or breaks a limit; nothing is applied then.
  */
-export function parseImport(text: string, currentOverrides: Bindings): ImportResult {
+export function parseImport(text: string, currentOverrides: Bindings, currentPreset: KeybindingsPreset = "classic"): ImportResult {
   if (new TextEncoder().encode(text).length > KEYBINDING_LIMITS.fileMaxBytes) {
     throw new Error(`The file is larger than ${KEYBINDING_LIMITS.fileMaxBytes / 1024} KiB.`);
   }
@@ -608,12 +664,18 @@ export function parseImport(text: string, currentOverrides: Bindings): ImportRes
   if (d.version !== EXPORT_VERSION) throw new Error(`Unknown file format ${d.version}.`);
   const raw = d.bindings;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("The file has no bindings.");
+  let preset: KeybindingsPreset | null = null;
+  if (d.preset !== undefined) {
+    preset = asPreset(d.preset);
+    if (!preset) throw new Error(`Unknown keyboard preset “${String(d.preset).slice(0, 40)}”.`);
+  }
+  const target: KeybindingsPreset = preset ?? currentPreset;
   // Own keys only, including a literal "__proto__" key that JSON.parse creates as an own property.
   const entries = Object.keys(raw as object).map((k) => [k, (raw as Record<string, unknown>)[k]] as const);
   if (entries.length > KEYBINDING_LIMITS.maxActions) {
     throw new Error(`The file binds ${entries.length} actions; at most ${KEYBINDING_LIMITS.maxActions} are allowed.`);
   }
-  const current = effectiveBindings(currentOverrides);
+  const current = effectiveBindings(currentOverrides, currentPreset);
   const bindings: Bindings = Object.create(null) as Bindings;
   const changes: ImportChange[] = [];
   const unknown: string[] = [];
@@ -637,16 +699,32 @@ export function parseImport(text: string, currentOverrides: Bindings): ImportRes
     // elsewhere): they mean "the default" here, not an override. An empty list stays an explicit
     // unbind (it is also what "unbound by default" exports as, so it is ambiguous; unbinding wins).
     const other = OTHER_PLATFORM_DEFAULTS.get(id);
-    const asDefault = other !== undefined && other.length > 0 && sameChordList(norm, other) ? [...act.defaults] : norm;
+    const asDefault = other !== undefined && other.length > 0 && sameChordList(norm, other) ? [...presetDefaults(id, target)] : norm;
     bindings[id] = asDefault;
     if (!sameChordList(asDefault, current[id])) changes.push({ id, label: act.label, from: current[id], to: asDefault });
   }
-  return { bindings, changes, unknown };
+  // A preset change also changes the actions the file does not name and the user has not overridden.
+  if (preset && preset !== currentPreset) {
+    for (const act of KEY_ACTIONS) {
+      if (Object.prototype.hasOwnProperty.call(bindings, act.id) || Object.prototype.hasOwnProperty.call(currentOverrides, act.id)) continue;
+      const to = [...presetDefaults(act.id, preset)];
+      if (!sameChordList(to, current[act.id])) changes.push({ id: act.id, label: act.label, from: current[act.id], to });
+    }
+  }
+  return { preset, bindings, changes, unknown };
 }
 
-/** The overrides after applying an import: the file's bindings over the current overrides. */
-export function applyImport(currentOverrides: Bindings, result: ImportResult): Bindings {
-  return normalizeOverrides({ ...currentOverrides, ...result.bindings });
+/**
+ * The preset and overrides after applying an import: the file's preset (or the current one when the
+ * file has none), then the file's bindings over the current overrides.
+ */
+export function applyImport(
+  currentOverrides: Bindings,
+  result: ImportResult,
+  currentPreset: KeybindingsPreset = "classic",
+): { preset: KeybindingsPreset; overrides: Bindings } {
+  const preset = result.preset ?? currentPreset;
+  return { preset, overrides: normalizeOverrides({ ...currentOverrides, ...result.bindings }, preset) };
 }
 
 /** Validate a saved `keybindings` value as the backend does; the first problem, or null. */

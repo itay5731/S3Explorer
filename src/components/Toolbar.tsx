@@ -29,12 +29,15 @@ import {
   Star,
 } from "lucide-react";
 import { goHistory, navigate, readPref, refresh, setDetailsOpen, setFilter, setSplit, useApp, usePane, usePaneId, writePref } from "../store/app";
-import { otherPane, usePanes } from "../store/panes";
+import { isLocalPane, otherPane, usePanes } from "../store/panes";
+import { crossRefusal, locLabel, transferToOtherPane, type Loc } from "../store/cross";
+import { localUp, openLocalNewFolder, requestLocalRename, requestLocalTrash } from "../store/local";
+import { onPathBarClick, SourceButton } from "./LocalPane";
 import { getSearch, leaveSearch, requestResultsFocus, rerunSearch, runSearch, scheduleSearch, searchScheduled, setSearchScope, usePaneSearch, useSearch } from "../store/search";
 import { focusPaneListSoon, useKeyHint, withKey } from "../store/keyboard";
 import { isBookmarked, toggleBookmark, useBookmarks } from "../store/bookmarks";
 import { clearClipboard, useClipboard } from "../store/clipboard";
-import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "../store/ops";
+import { copySelection, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, useArchiveBlocked } from "../store/archive";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
@@ -123,6 +126,7 @@ function SearchBox() {
   const [focused, setFocused] = useState(false);
   const [hintDismissed, setHintDismissed] = useState(() => readPref<boolean>(HINT_KEY, false));
   const [typingHintDismissed, setTypingHintDismissed] = useState(() => readPref<boolean>(TYPING_HINT_KEY, false));
+  const local = usePane((s) => isLocalPane(s));
   const disabled = !bucket;
   const searchKey = useKeyHint("nav.focusSearch");
 
@@ -155,7 +159,7 @@ function SearchBox() {
           }}
           placeholder={wholeBucket ? "Search the whole bucket · as you type, Enter searches now" : "Search this folder · as you type, Enter searches now"}
           aria-label="Filter loaded items; searches as you type"
-          title={withKey("Search", searchKey)}
+          title={local ? "Search works on S3 panes, not on this computer" : withKey("Search", searchKey)}
           spellCheck={false}
           disabled={disabled}
           onFocus={() => setFocused(true)}
@@ -251,11 +255,20 @@ export function SearchRow() {
 
 /** The other pane's destination when two panes are on screen: its bucket and folder, or null. */
 export function useOtherPaneDest(): { bucket: string; prefix: string } | null {
+  const loc = useOtherPaneLoc();
+  return loc?.kind === "s3" ? { bucket: loc.bucket, prefix: loc.prefix } : null;
+}
+
+/** v0.9.0: the other pane's location when two panes are on screen (S3 or a local directory), or null. */
+export function useOtherPaneLoc(): Loc | null {
   const shown = useApp((s) => s.split && !s.narrow);
   const other = otherPane(useApp((s) => s.activePane));
   const bucket = usePanes((s) => s[other].bucket);
   const prefix = usePanes((s) => s[other].prefix);
-  return shown && bucket ? { bucket, prefix } : null;
+  const dir = usePanes((s) => (isLocalPane(s[other]) ? s[other].local!.dir : null));
+  if (!shown) return null;
+  if (dir !== null) return { kind: "local", dir };
+  return bucket ? { kind: "s3", bucket, prefix } : null;
 }
 
 /** Split / Single: one toggle, pressed while two panes are open (Mod+2 / Mod+1 by default). */
@@ -284,6 +297,8 @@ function SplitButton() {
 
 export function Toolbar() {
   const bucket = usePane((s) => s.bucket);
+  // v0.9.0: the active pane shows this computer. S3-only actions are disabled with the reason.
+  const local = usePane((s) => isLocalPane(s));
   const prefix = usePane((s) => s.prefix);
   const loading = usePane((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
@@ -294,12 +309,16 @@ export function Toolbar() {
   const sel = useSelectionInfo();
   const selCount = sel.folders + sel.objects;
   const clip = useClipboard((s) => s.clip);
-  const disabled = !bucket;
+  const disabled = !bucket && !local;
   // One archived object that isn't restored can't be downloaded, copied, moved or renamed.
   const blocked = useArchiveBlocked(bucket, sel.object);
-  const dest = useOtherPaneDest();
+  const dest = useOtherPaneLoc();
   const splitShown = useApp((s) => s.split && !s.narrow);
-  const destUri = dest ? s3Uri(dest.bucket, dest.prefix) : "";
+  const destUri = dest ? locLabel(dest) : "";
+  // Between this computer and S3: copy = download / upload; two local panes: not here.
+  const otherRefused = dest ? crossRefusal(local ? "local" : "s3", dest.kind) : null;
+  const S3_ONLY = "Works on S3 panes, not on this computer";
+  const CLIP_LOCAL = "The clipboard holds S3 items; use Copy to other pane between S3 and this computer";
   const why = (title: string) => (blocked ? ARCHIVED_REASON : title);
   // Restore is offered only when the selection holds archived objects (folders: context menu).
   const archivedCount = useMemo(
@@ -331,14 +350,19 @@ export function Toolbar() {
     <div className={`toolbar ${dest || splitShown ? "split" : ""}`}>
       <div className="tool-group">
         {/* No folder is in view while search results are open: nothing to upload or create into. */}
-        <UploadButton disabled={disabled || searchOpen} />
-        <button className="btn" disabled={disabled || searchOpen} onClick={() => openNewFolder()} title={searchOpen ? "Go back to a folder to create one" : withKey("New folder", k.newFolder)}>
+        <UploadButton disabled={disabled || searchOpen || local} />
+        <button
+          className="btn"
+          disabled={disabled || searchOpen}
+          onClick={() => (local ? openLocalNewFolder() : openNewFolder())}
+          title={searchOpen ? "Go back to a folder to create one" : withKey("New folder", k.newFolder)}
+        >
           <FolderPlus size={14} />
           <span className="btn-label secondary">New folder</span>
         </button>
         <button
           className="btn"
-          disabled={disabled || sel.objects + sel.folders === 0 || blocked}
+          disabled={disabled || local || sel.objects + sel.folders === 0 || blocked}
           onClick={() => {
             // Objects selected: download those (as before). Only folders: download the folders.
             const { objects, folders } = getSelected();
@@ -346,7 +370,9 @@ export function Toolbar() {
             else void requestDownloadFolders(folders);
           }}
           title={
-            blocked
+            local
+              ? "These files are already on this computer"
+              : blocked
               ? ARCHIVED_REASON
               : sel.objects > 1
               ? `Download ${sel.objects} objects`
@@ -363,27 +389,27 @@ export function Toolbar() {
         <span className="tool-sep" />
         <button
           className="icon-btn lg"
-          disabled={disabled || selCount === 0 || blocked}
+          disabled={disabled || local || selCount === 0 || blocked}
           onClick={() => void copySelection("copy")}
-          title={why(withKey("Copy", k.copy))}
+          title={local ? CLIP_LOCAL : why(withKey("Copy", k.copy))}
           aria-label="Copy"
         >
           <Copy size={15} />
         </button>
         <button
           className="icon-btn lg"
-          disabled={disabled || selCount === 0 || blocked}
+          disabled={disabled || local || selCount === 0 || blocked}
           onClick={() => void copySelection("cut")}
-          title={why(withKey("Cut", k.cut))}
+          title={local ? CLIP_LOCAL : why(withKey("Cut", k.cut))}
           aria-label="Cut"
         >
           <Scissors size={15} />
         </button>
         <button
           className="icon-btn lg"
-          disabled={disabled || !clip || searchOpen}
+          disabled={disabled || local || !clip || searchOpen}
           onClick={() => requestPaste()}
-          title={searchOpen ? "Go back to a folder to paste into it" : clip ? withKey("Paste into this folder", k.paste) : "Paste (clipboard is empty)"}
+          title={local ? CLIP_LOCAL : searchOpen ? "Go back to a folder to paste into it" : clip ? withKey("Paste into this folder", k.paste) : "Paste (clipboard is empty)"}
           aria-label="Paste"
         >
           <ClipboardPaste size={15} />
@@ -391,7 +417,7 @@ export function Toolbar() {
         <button
           className="icon-btn lg"
           disabled={disabled || selCount !== 1 || blocked}
-          onClick={() => void requestRename()}
+          onClick={() => (local ? requestLocalRename() : void requestRename())}
           title={why(withKey("Rename", k.rename))}
           aria-label="Rename"
         >
@@ -401,25 +427,30 @@ export function Toolbar() {
           <>
             <button
               className="icon-btn lg"
-              disabled={disabled || selCount === 0 || blocked}
-              onClick={() => void requestTransferToOther("copy")}
-              title={blocked ? ARCHIVED_REASON : `${withKey("Copy to other pane", k.toOther)}: ${destUri}`}
+              disabled={disabled || selCount === 0 || blocked || !!otherRefused}
+              onClick={() => transferToOtherPane("copy")}
+              title={otherRefused ?? (blocked ? ARCHIVED_REASON : `${withKey(local ? "Upload to other pane" : dest.kind === "local" ? "Download to other pane" : "Copy to other pane", k.toOther)}: ${destUri}`)}
               aria-label="Copy to other pane"
             >
               <CopyPlus size={15} />
             </button>
             <button
               className="icon-btn lg"
-              disabled={disabled || selCount === 0 || blocked}
-              onClick={() => void requestTransferToOther("cut")}
-              title={blocked ? ARCHIVED_REASON : `${withKey("Move to other pane", k.moveOther)}: ${destUri}`}
+              disabled={disabled || selCount === 0 || blocked || !!otherRefused}
+              onClick={() => transferToOtherPane("cut")}
+              title={
+                otherRefused ??
+                (blocked
+                  ? ARCHIVED_REASON
+                  : `${withKey("Move to other pane", k.moveOther)}: ${destUri}${local ? " (then to the recycle bin here)" : dest.kind === "local" ? " (then the downloaded objects are deleted from S3)" : ""}`)
+              }
               aria-label="Move to other pane"
             >
               <FolderInput size={15} />
             </button>
           </>
         )}
-        {archivedCount > 0 && (
+        {archivedCount > 0 && !local && (
           <button
             className="icon-btn lg"
             disabled={disabled}
@@ -433,8 +464,8 @@ export function Toolbar() {
         <button
           className="btn btn-danger-ghost"
           disabled={disabled || selCount === 0}
-          onClick={() => requestDelete()}
-          title={withKey(selCount > 1 ? `Delete ${selCount} items` : "Delete", k.del)}
+          onClick={() => (local ? requestLocalTrash() : requestDelete())}
+          title={local ? withKey("Move to the recycle bin", k.del) : withKey(selCount > 1 ? `Delete ${selCount} items` : "Delete", k.del)}
         >
           <Trash2 size={14} />
           <span className="btn-label secondary">Delete</span>
@@ -448,8 +479,8 @@ export function Toolbar() {
         </button>
         <button
           className="icon-btn lg"
-          disabled={disabled || !prefix}
-          onClick={() => bucket && navigate(bucket, parentPrefix(prefix))}
+          disabled={disabled || (!local && !prefix)}
+          onClick={() => (local ? localUp(paneId) : bucket && navigate(bucket, parentPrefix(prefix)))}
           title={withKey("Up one level", k.up)}
           aria-label="Up one level"
         >
@@ -486,7 +517,7 @@ export function Toolbar() {
           onClick={() => setDetailsOpen(!detailsOpen)}
           disabled={!bucket}
           aria-pressed={detailsShown}
-          title={bucket ? withKey(detailsOpen ? "Hide details" : "Show details", k.details) : "Open a bucket to see details"}
+          title={local ? `Details: ${S3_ONLY.toLowerCase()}` : bucket ? withKey(detailsOpen ? "Hide details" : "Show details", k.details) : "Open a bucket to see details"}
         >
           {detailsShown ? <PanelRightClose size={15} /> : <PanelRightOpen size={15} />}
         </button>
@@ -509,12 +540,14 @@ export function Breadcrumbs() {
   const searchOpen = usePaneSearch((s) => s.open);
   const bookmarked = useBookmarks((s) => !!bucket && isBookmarked(s.items, bucket, prefix));
   const bookmarkKey = useKeyHint("nav.bookmark");
+  const editKey = useKeyHint("nav.editPath");
   if (!bucket) return null;
   const segs = prefixSegments(prefix);
   const selCount = sel.folders + sel.objects;
   return (
-    <div className="breadcrumbs">
+    <div className="breadcrumbs" onClick={onPathBarClick(pane)} title={withKey("Click to type a path", editKey)}>
       <nav className="crumbs" aria-label="Path">
+        <SourceButton pane={pane} />
         <button
           className={`crumb ${segs.length === 0 ? "current" : ""}`}
           onClick={() => navigate(bucket, "", pane)}

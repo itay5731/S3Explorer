@@ -4,7 +4,8 @@
 // Settings → Keyboard have their own flags. The dispatcher itself lives in ./keyActions.ts.
 
 import { create } from "zustand";
-import { effectiveBindings, buildIndex, formatChord, type Bindings, type KeyIndex } from "../lib/keys";
+import { asPreset, effectiveBindings, buildIndex, formatChord, type Bindings, type KeyIndex } from "../lib/keys";
+import type { KeybindingsPreset } from "../lib/types";
 import type { PaneId } from "./panes";
 import { useSettings } from "./settings";
 
@@ -22,22 +23,29 @@ export const setRecording = (recording: boolean) => useKeys.setState({ recording
 
 // ---- effective bindings ------------------------------------------------------------------------
 
-let cache: { overrides: Bindings | undefined; bindings: Bindings; index: KeyIndex } | null = null;
+let cache: { overrides: Bindings | undefined; preset: KeybindingsPreset; bindings: Bindings; index: KeyIndex } | null = null;
 
-/** Every action's chords and the dispatcher's index, from the saved overrides. */
+/** The saved preset; a settings object without one (or none loaded yet) means "classic". */
+export function currentPreset(): KeybindingsPreset {
+  return asPreset(useSettings.getState().settings?.keybindingsPreset) ?? "classic";
+}
+
+/** Every action's chords and the dispatcher's index, from the saved preset and overrides. */
 export function currentKeys(): { bindings: Bindings; index: KeyIndex } {
   const overrides = useSettings.getState().settings?.keybindings;
-  if (!cache || cache.overrides !== overrides) {
-    const bindings = effectiveBindings(overrides);
-    cache = { overrides, bindings, index: buildIndex(bindings) };
+  const preset = currentPreset();
+  if (!cache || cache.overrides !== overrides || cache.preset !== preset) {
+    const bindings = effectiveBindings(overrides, preset);
+    cache = { overrides, preset, bindings, index: buildIndex(bindings) };
   }
   return cache;
 }
 
 /** Hook: the chords bound to an action right now (saved settings). */
 export function useChords(id: string): string[] {
-  // Subscribing re-renders the caller when the bindings are saved.
+  // Subscribing re-renders the caller when the bindings or the preset are saved.
   useSettings((s) => s.settings?.keybindings);
+  useSettings((s) => s.settings?.keybindingsPreset);
   return currentKeys().bindings[id] ?? [];
 }
 

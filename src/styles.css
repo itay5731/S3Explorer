@@ -7540,3 +7540,222 @@ kbd {
 .ql-body .pv-text {
   font-size: 12.5px;
 }
+
+/* ==========================================================================
+   v0.9.0: Commander mode (keybinding presets, local panes, editable path)
+   ========================================================================== */
+.kb-preset {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.kb-preset-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+.kb-preset-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (max-width: 720px) {
+  .kb-preset-options {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.kb-preset-option {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 9px 11px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-elev);
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.kb-preset-option:hover {
+  background: var(--bg-hover);
+}
+.kb-preset-option.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-elev));
+}
+.kb-preset-option input[type="radio"] {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin: 2px 0 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  accent-color: var(--accent);
+}
+.kb-preset-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.kb-preset-label {
+  font-weight: 600;
+}
+.kb-preset-desc {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* The path bar's source button (S3 / this computer). */
+.source-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  height: 24px;
+  padding: 0 4px 0 6px;
+  margin-right: 4px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-elev);
+  color: var(--muted);
+  transition: background 0.1s, color 0.1s, border-color 0.1s;
+}
+.source-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.source-btn.local {
+  color: var(--accent-text);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+}
+.source-caret {
+  opacity: 0.7;
+}
+.context-menu.source-menu {
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+  min-width: 240px;
+}
+.menu-heading {
+  padding: 6px 10px 3px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+/* The editable path (Mod+L, or a click on the path bar's empty area). */
+.breadcrumbs {
+  cursor: text;
+}
+.breadcrumbs .crumbs,
+.breadcrumbs button {
+  cursor: pointer;
+}
+.breadcrumbs.editing {
+  justify-content: flex-start;
+  gap: 4px;
+  cursor: default;
+}
+.path-edit {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+.path-edit-input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12.5px;
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text);
+  outline: none;
+}
+.path-edit.invalid .path-edit-input {
+  border-color: var(--danger);
+}
+.path-edit-spin {
+  flex: none;
+  color: var(--muted);
+}
+.path-edit-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  max-width: 48%;
+  font-size: 12px;
+  color: var(--danger);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Local panes: no storage class column; links and hidden entries are marked. */
+.object-table.local {
+  --cols: minmax(180px, 1fr) 92px 132px;
+}
+.object-table.local .col-class {
+  display: none !important;
+}
+@container pane (max-width: 620px) {
+  .object-table.local {
+    --cols: minmax(140px, 1fr) 84px 112px;
+  }
+}
+.link-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  margin-left: 6px;
+  padding: 0 5px;
+  height: 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  color: var(--muted);
+  font-size: 10.5px;
+}
+.hidden-tag {
+  flex: none;
+  margin-left: 6px;
+  color: var(--dim);
+}
+.trow.hidden-entry .name-text {
+  opacity: 0.66;
+}
+.crumb-hidden.on {
+  color: var(--accent-text);
+}
+.local-bar .crumb:first-of-type svg {
+  color: var(--accent-text);
+}
+
+/* Sidebar: "This computer". */
+.local-roots-head {
+  justify-content: flex-start;
+  gap: 4px;
+  width: 100%;
+  border-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+}
+.local-roots-head:hover .section-title {
+  color: var(--text);
+}
+.modal-icon.warn {
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+}

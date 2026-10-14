@@ -95,6 +95,7 @@ export const sameAppSettings = (a: AppSettings, b: AppSettings) =>
   (a.downloadLimitKibps ?? null) === (b.downloadLimitKibps ?? null) &&
   (a.uploadLimitKibps ?? null) === (b.uploadLimitKibps ?? null) &&
   (a.fileManagerCommand ?? null) === (b.fileManagerCommand ?? null) &&
+  (a.keybindingsPreset ?? "classic") === (b.keybindingsPreset ?? "classic") &&
   sameOverrides(a.keybindings, b.keybindings);
 
 /** The file-manager command as the backend stores it: trimmed, empty becomes null. */
@@ -136,6 +137,9 @@ export function validateAppSettings(s: AppSettings): { field: keyof AppSettings;
   if (fm) return { field: "fileManagerCommand", message: fm };
   const kb = validateKeybindings(s.keybindings);
   if (kb) return { field: "keybindings", message: kb };
+  if (s.keybindingsPreset !== "commander" && s.keybindingsPreset !== "classic") {
+    return { field: "keybindingsPreset", message: "Must be one of commander, classic." };
+  }
   for (const field of ["downloadLimitKibps", "uploadLimitKibps"] as const) {
     const err = validateBandwidthKibps(s[field]);
     if (err) return { field, message: err };

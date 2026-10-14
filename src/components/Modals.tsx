@@ -5,6 +5,7 @@ import type { AppError, ConflictPolicy, JobPreview, JobRequest } from "../lib/ty
 import { BUCKETLESS_MODALS, disconnect, openModal, useApp, usePane, type RenameTarget } from "../store/app";
 import { isDenied, permissionText } from "../store/toasts";
 import { AddBucketModal, RemoveBucketModal } from "./BucketDialogs";
+import { LocalNewFolderModal, LocalRenameModal, LocalTrashModal } from "./LocalPane";
 import { createFolder } from "../store/actions";
 import { startConfirmedJob } from "../store/ops";
 import { joinKey, s3Uri, validateFolderName } from "../lib/format";
@@ -23,6 +24,7 @@ const BulkRestoreModal = lazy(() => import("./RestoreDialogs").then((m) => ({ de
 const MetadataDialog = lazy(() => import("./MetadataDialog").then((m) => ({ default: m.MetadataDialog })));
 const VersionActionModal = lazy(() => import("./VersionDialogs").then((m) => ({ default: m.VersionActionModal })));
 const QuickLookModal = lazy(() => import("./QuickLook").then((m) => ({ default: m.QuickLookModal })));
+const CrossTransferModal = lazy(() => import("./CrossTransferDialog").then((m) => ({ default: m.CrossTransferModal })));
 
 const FOCUSABLE = 'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])';
 
@@ -759,6 +761,14 @@ function ModalSwitch() {
       return bucket ? <QuickLookModal bucket={bucket} /> : null;
     case "newFolder":
       return <NewFolderModal bucket={modal.bucket} prefix={modal.prefix} />;
+    case "localNewFolder":
+      return <LocalNewFolderModal parent={modal.parent} />;
+    case "localRename":
+      return <LocalRenameModal key={modal.path} path={modal.path} name={modal.name} isDir={modal.isDir} />;
+    case "localTrash":
+      return <LocalTrashModal paths={modal.paths} dirs={modal.dirs} />;
+    case "crossTransfer":
+      return <CrossTransferModal key={modal.planId} planId={modal.planId} />;
     case "delete":
       return <DeleteModal request={modal.request} />;
     case "rename":

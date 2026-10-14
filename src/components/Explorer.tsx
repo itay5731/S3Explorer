@@ -2,7 +2,9 @@ import { Fragment, useEffect, useRef, useState, type CSSProperties, type Pointer
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
 import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNarrow, useApp, writePref } from "../store/app";
-import { PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
+import { isLocalPane, PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
+import { installCrossEffects } from "../store/cross";
+import { LocalPathBar, PathEditField, SourceButton, SourceMenu, usePathEditing } from "./LocalPane";
 import { onExplorerKeyDown, onExplorerMouseDown } from "../store/keyActions";
 import { ShortcutsDialog } from "./ShortcutsDialog";
 import { UpdatePill } from "./UpdateDialog";
@@ -117,7 +119,8 @@ function useFileDrop(): PaneId | null {
           const pane = paneAt(e.position) ?? activePane();
           // The pane that receives the drop becomes the active one (its dialogs and toolbar follow).
           if (!useApp.getState().modal) setActivePane(pane);
-          if (getPane(pane).search.open) toast.info("Go back to a folder to upload", "Search results are open; nothing was uploaded.");
+          if (isLocalPane(getPane(pane))) toast.info("Nothing was uploaded", "This pane shows this computer. Drop the files into an S3 pane to upload them.");
+          else if (getPane(pane).search.open) toast.info("Go back to a folder to upload", "Search results are open; nothing was uploaded.");
           else void handleOsDrop(e.paths, pane);
         }
       })
@@ -171,6 +174,9 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
   const searchOpen = usePanes((s) => s[id].search.open) && bucket !== null;
   const split = useApp((s) => s.split && !s.narrow);
   const active = useApp((s) => s.activePane === id);
+  // v0.9.0: a pane can show the local computer; its path bar can be a text field (Mod+L).
+  const local = usePanes((s) => isLocalPane(s[id]));
+  const editing = usePathEditing(id);
 
   return (
     <PaneContext.Provider value={id}>
@@ -183,7 +189,16 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
         onFocusCapture={() => setActivePane(id)}
       >
         <TabStrip pane={id} />
-        {bucket && <Breadcrumbs />}
+        {editing ? (
+          <div className="breadcrumbs editing">
+            <SourceButton pane={id} />
+            <PathEditField pane={id} />
+          </div>
+        ) : local ? (
+          <LocalPathBar />
+        ) : (
+          bucket && <Breadcrumbs />
+        )}
         <div className="table-wrap">
           {searchOpen ? <SearchResults /> : <ObjectTable />}
           {dropping && (
@@ -191,7 +206,13 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
               <div className="drop-card">
                 <UploadCloud size={34} strokeWidth={1.5} />
                 <div className="drop-title">
-                  {!bucket ? "Select a bucket first" : searchOpen ? "Go back to a folder to upload" : "Drop files or a folder to upload"}
+                  {local
+                    ? "This pane shows this computer: drop into an S3 pane to upload"
+                    : !bucket
+                      ? "Select a bucket first"
+                      : searchOpen
+                        ? "Go back to a folder to upload"
+                        : "Drop files or a folder to upload"}
                 </div>
                 {bucket && <div className="muted mono small">s3://{bucket}/{prefix}</div>}
               </div>
@@ -281,6 +302,7 @@ export function Explorer() {
   useEffect(() => installTagEffects(), []);
   useEffect(() => installArchiveEffects(), []);
   useEffect(() => installFolderSizeEffects(), []);
+  useEffect(() => installCrossEffects(), []);
   useToolbarHeightVar(main);
 
   return (
@@ -326,6 +348,7 @@ export function Explorer() {
       </div>
       <ActivityPanel />
       <ContextMenu />
+      <SourceMenu />
       <Modals />
       <ShortcutsDialog />
       <DragBadge />

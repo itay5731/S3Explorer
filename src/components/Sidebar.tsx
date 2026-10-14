@@ -1,6 +1,7 @@
-import { useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, FolderOpen, Info, MoreHorizontal, Plus, RefreshCw, Search, SquarePlus, Tag, Tags, Users, X } from "lucide-react";
-import { activePane, loadAddedBuckets, loadBuckets, navigate, openModal, readPref, useApp, usePane, writePref } from "../store/app";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
+import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, ChevronRight, FolderOpen, HardDrive, Home, Info, MoreHorizontal, Plus, RefreshCw, Search, SquarePlus, Tag, Tags, Users, X } from "lucide-react";
+import { activePane, loadAddedBuckets, loadBuckets, navigate, navigateLocal, openModal, readPref, useApp, usePane, writePref } from "../store/app";
+import { loadLocalRoots, useLocalRoots } from "../store/local";
 import { focusPaneListSoon } from "../store/keyboard";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
@@ -149,6 +150,77 @@ function BucketRow({ b, selected, onMenu }: { b: BucketEntry; selected: boolean;
   );
 }
 
+const LOCAL_OPEN_KEY = "s3x.localRootsOpen";
+
+/**
+ * "This computer" (v0.9.0): the drives and the home folder, one collapsible group under the buckets
+ * (closed until opened once; the choice is remembered). A root opens in the active pane as a local pane.
+ */
+function LocalRootsGroup() {
+  const [open, setOpen] = useState(() => readPref<boolean>(LOCAL_OPEN_KEY, false));
+  const roots = useLocalRoots((s) => s.roots);
+  const loading = useLocalRoots((s) => s.loading);
+  const error = useLocalRoots((s) => s.error);
+  const dir = usePane((s) => s.local?.dir ?? null);
+  useEffect(() => {
+    if (open) void loadLocalRoots();
+  }, [open]);
+  const toggle = () => {
+    setOpen(!open);
+    writePref(LOCAL_OPEN_KEY, !open);
+  };
+  const go = (path: string) => {
+    navigateLocal(path, activePane());
+    focusPaneListSoon(activePane());
+  };
+  // The root the active pane is under (the longest match), shown as selected.
+  const under = dir ? roots.filter((r) => dir.toLowerCase().startsWith(r.path.toLowerCase())).sort((a, b) => b.path.length - a.path.length)[0]?.path : null;
+  return (
+    <div className="local-roots">
+      <button type="button" className="bucket-group-head local-roots-head" onClick={toggle} aria-expanded={open}>
+        <ChevronRight size={12} className={open ? "rot90" : ""} />
+        <span className="section-title">This computer</span>
+      </button>
+      {open && (
+        <>
+          {loading && !roots.length && <div className="bucket-item skeleton" />}
+          {error && (
+            <div className="sidebar-error">
+              {error.message}
+              <button className="link-btn" onClick={() => void loadLocalRoots(true)}>
+                Retry
+              </button>
+            </div>
+          )}
+          {roots.map((r) => (
+            <div
+              key={r.path}
+              role="button"
+              tabIndex={0}
+              className={`bucket-item local-root ${under === r.path ? "selected" : ""}`}
+              title={r.path}
+              data-drop-local={r.path}
+              onClick={() => go(r.path)}
+              onKeyDown={(e) => {
+                if (e.defaultPrevented || e.target !== e.currentTarget || e.ctrlKey || e.altKey || e.metaKey) return;
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  go(r.path);
+                } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key) && !e.shiftKey) {
+                  if (moveInList(e.currentTarget, e.key)) e.preventDefault();
+                }
+              }}
+            >
+              {r.kind === "home" ? <Home size={14} className="bucket-icon" /> : <HardDrive size={14} className="bucket-icon" />}
+              <span className="bucket-name">{r.label}</span>
+            </div>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
 export function Sidebar() {
   const connection = useApp((s) => s.connection);
   const buckets = useApp((s) => s.buckets);
@@ -284,6 +356,7 @@ export function Sidebar() {
               </button>
             )
           )}
+          <LocalRootsGroup />
         </nav>
         <div className="sidebar-foot muted">
           {canList

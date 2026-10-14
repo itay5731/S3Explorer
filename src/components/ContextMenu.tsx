@@ -1,15 +1,19 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArchiveRestore, Bookmark, BookmarkX, Calculator, ClipboardPaste, Copy, CopyPlus, Download, Eye, FolderDown, FolderInput, FolderOpen, FolderPlus, FolderUp, Info, Link, LocateFixed, PencilLine, RefreshCw, Scissors, SquarePlus, Tags, Trash2, Upload } from "lucide-react";
-import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane } from "../store/app";
+import { navigate, openContextMenu, openModal, refresh, revealObject, setDetailsOpen, setSelection, useApp, usePane, usePaneId } from "../store/app";
+import { isLocalPane } from "../store/panes";
+import { transferToOtherPane } from "../store/cross";
+import { useLocalMenuGroups } from "./LocalPane";
 import { usePaneSearch } from "../store/search";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "../store/actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "../store/folders";
 import { getSelected } from "../store/view";
 import { useClipboard } from "../store/clipboard";
-import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "../store/ops";
-import { useOtherPaneDest } from "./Toolbar";
+import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "../store/ops";
+import { useOtherPaneLoc } from "./Toolbar";
 import { ARCHIVED_REASON, archiveId, isArchiveClass, useArchive, useArchiveBlocked } from "../store/archive";
 import { s3Uri } from "../lib/format";
+import { locLabel } from "../store/cross";
 import { plural } from "../lib/ops";
 import { useKeyHint } from "../store/keyboard";
 import { calculateFolderSizes } from "../store/folderSizes";
@@ -40,8 +44,12 @@ export function ContextMenu() {
   const single = current && current.folders.length === 0 && current.objects.length === 1 ? current.objects[0] : null;
   const blocked = useArchiveBlocked(bucket, single);
   const singleInfo = useArchive((s) => (bucket && single ? s.byId[archiveId(bucket, single.key)] : undefined));
-  // Split view: the other pane's folder is a destination for the selection.
-  const dest = useOtherPaneDest();
+  // Split view: the other pane's folder (or local directory, v0.9.0) is a destination for the selection.
+  const dest = useOtherPaneLoc();
+  // v0.9.0: a local pane has its own menu.
+  const paneId = usePaneId();
+  const local = usePane((s) => isLocalPane(s));
+  const localGroups = useLocalMenuGroups(paneId);
   const bookmarks = useBookmarks((s) => s.items);
   const k = {
     open: useKeyHint("nav.open"),
@@ -106,7 +114,9 @@ export function ContextMenu() {
     };
   }, [menu]);
 
-  if (!menu || !bucket) return null;
+  if (!menu) return null;
+  if (local) return <MenuFrame menuRef={ref} pos={pos} at={menu} groups={localGroups} />;
+  if (!bucket) return null;
 
   const { folders, objects } = getSelected();
   const groups: Item[][] = [];
@@ -129,19 +139,19 @@ export function ContextMenu() {
       ...(dest
         ? [
             {
-              label: "Copy to other pane",
+              label: dest.kind === "local" ? "Download to other pane" : "Copy to other pane",
               icon: <CopyPlus size={14} />,
-              action: () => void requestTransferToOther("copy"),
+              action: () => transferToOtherPane("copy"),
               hint: k.toOther,
-              title: `Copy to ${s3Uri(dest.bucket, dest.prefix)}`,
+              title: `Copy to ${locLabel(dest)}`,
               ...why,
             },
             {
               label: "Move to other pane",
               icon: <FolderInput size={14} />,
-              action: () => void requestTransferToOther("cut"),
+              action: () => transferToOtherPane("cut"),
               hint: k.moveOther,
-              title: `Move to ${s3Uri(dest.bucket, dest.prefix)}`,
+              title: dest.kind === "local" ? `Download to ${dest.dir}, then delete the downloaded objects from S3` : `Move to ${locLabel(dest)}`,
               ...why,
             },
           ]
@@ -280,6 +290,21 @@ export function ContextMenu() {
     groups.push([deleteItem(count, false)]);
   }
 
+  return <MenuFrame menuRef={ref} pos={pos} at={menu} groups={groups} />;
+}
+
+/** The menu itself: groups of items at a point (measured, then kept inside the window). */
+function MenuFrame({
+  menuRef: ref,
+  pos,
+  at: menu,
+  groups,
+}: {
+  menuRef: React.RefObject<HTMLDivElement | null>;
+  pos: { x: number; y: number } | null;
+  at: { x: number; y: number };
+  groups: Item[][];
+}) {
   return (
     <div
       ref={ref}

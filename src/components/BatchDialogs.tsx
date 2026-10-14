@@ -25,7 +25,7 @@ const LOADING: PreviewState = { status: "loading" };
  * exact request array they were computed for, so a stale result is never shown for a new request.
  * `seed` is a preview already made for the first request (an OS drop checks the folder that way).
  */
-function useBatchPreviews(
+export function useBatchPreviews(
   requests: BatchPlanRequest[] | null,
   delayMs: number,
   seed?: { request: BatchPlanRequest; preview: BatchPreview },

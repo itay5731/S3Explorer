@@ -12,6 +12,9 @@ import { Ban, CopyPlus, FolderInput } from "lucide-react";
 import { JOB_MAX_ITEMS } from "../lib/types";
 import { plural } from "../lib/ops";
 import { getPane, type PaneId, type PaneState } from "../store/app";
+import { isLocalPane } from "../store/panes";
+import { crossRefusal, LINK_MOVE, locLabel, paneLoc, requestCross, type CrossItem, type Loc } from "../store/cross";
+import { sameLocalPath } from "../store/local";
 import type { ClipItem } from "../store/clipboard";
 import { buildTransferRequest, confirmOrStart, tooMany, withoutArchived } from "../store/ops";
 import { showTab } from "../store/tabs";
@@ -54,9 +57,14 @@ interface Source {
   readonly pane: PaneId;
   /** The tab the rows were dragged from (its folder is no target, even after hovering another tab). */
   readonly tab: number;
+  /** Where the rows come from (v0.9.0: a bucket and prefix, or a local directory). */
+  readonly from: Loc;
+  /** S3 source: its bucket and prefix ("" for a local source). */
   readonly bucket: string;
   readonly prefix: string;
   readonly items: readonly ClipItem[];
+  /** The same items for a transfer between S3 and this computer. */
+  readonly cross: readonly CrossItem[];
   readonly ids: ReadonlySet<string>;
   /** The dragged objects' storage classes as listed when the drag started. */
   readonly classes: ReadonlyMap<string, string | null>;
@@ -64,13 +72,20 @@ interface Source {
 
 interface Hit {
   el: HTMLElement;
-  bucket: string;
-  prefix: string;
+  to: Loc;
   refused: string | null;
 }
 
-/** Why dropping `src` into bucket/prefix is refused (nothing is sent then), or null when it is fine. */
-function refusal(src: Source, bucket: string, prefix: string, copy: boolean): string | null {
+/** Why dropping `src` onto `to` is refused (nothing is sent then), or null when it is fine. */
+function refusal(src: Source, to: Loc, copy: boolean): string | null {
+  const cross = crossRefusal(src.from.kind, to.kind);
+  if (cross) return cross;
+  if (src.from.kind === "local" || to.kind === "local") {
+    // Between S3 and this computer: a move leaves links where they are.
+    if (src.from.kind === "local" && !copy && src.cross.every((i) => (i.kind === "file" || i.kind === "dir") && i.isSymlink)) return LINK_MOVE;
+    return null;
+  }
+  const { bucket, prefix } = to;
   if (bucket !== src.bucket) return null;
   const many = src.items.length > 1;
   if (prefix === src.prefix) return `${many ? "They are" : "It is"} already in this folder.`;
@@ -80,10 +95,23 @@ function refusal(src: Source, bucket: string, prefix: string, copy: boolean): st
   return null;
 }
 
-const targetLabel = (bucket: string, prefix: string) => `${bucket}/${prefix}`;
+const targetLabel = (to: Loc) => (to.kind === "s3" ? `${to.bucket}/${to.prefix}` : locLabel(to));
 
-/** Same drop target: the same bucket and the exact same prefix (or both nothing). */
-const sameTarget = (a: Hit | null, b: Hit | null) => (a && b ? a.bucket === b.bucket && a.prefix === b.prefix : a === b);
+/** Same drop target: the same bucket and the exact same prefix, or the same local directory (or both nothing). */
+const sameLoc = (a: Loc, b: Loc) =>
+  a.kind === "s3" && b.kind === "s3" ? a.bucket === b.bucket && a.prefix === b.prefix : a.kind === "local" && b.kind === "local" ? a.dir === b.dir : false;
+const sameTarget = (a: Hit | null, b: Hit | null) => (a && b ? sameLoc(a.to, b.to) : a === b);
+
+const crossItem = (r: Row, pane: PaneId): CrossItem => {
+  const s = getPane(pane);
+  if (isLocalPane(s)) {
+    const e = s.local.entries.get(r.id);
+    return r.kind === "folder"
+      ? { kind: "dir", path: r.id, name: r.name, isSymlink: !!e?.isSymlink }
+      : { kind: "file", path: r.id, name: r.name, size: r.object.size, isSymlink: !!e?.isSymlink };
+  }
+  return r.kind === "folder" ? { kind: "prefix", key: r.folder.prefix, name: r.folder.name } : { kind: "object", key: r.object.key, name: r.object.name, size: r.object.size };
+};
 
 const clipItem = (r: Row): ClipItem =>
   Object.freeze(
@@ -130,13 +158,18 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
     const hitTest = (): Hit | null => {
       if (!src) return null;
       const under = document.elementFromPoint(pointer.x, pointer.y);
-      const el = under?.closest<HTMLElement>("[data-drop-prefix]") ?? null;
+      const el = under?.closest<HTMLElement>("[data-drop-prefix], [data-drop-local]") ?? null;
       // The tab the rows come from: dropping there changes nothing, so it is no target at all.
       if (el && el.dataset.tabPane === src.pane && Number(el.dataset.tabId) === src.tab) return null;
       if (el) {
-        const bucket = el.dataset.dropBucket ?? src.bucket;
-        const prefix = el.dataset.dropPrefix ?? "";
-        return { el, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
+        if (el.dataset.dropLocal !== undefined) {
+          const to: Loc = { kind: "local", dir: el.dataset.dropLocal };
+          // A local source dropped on its own folder, or a folder onto itself: nothing to do.
+          if (src.from.kind === "local" && (sameLocalPath(src.from.dir, to.dir) || src.ids.has(to.dir))) return null;
+          return { el, to, refused: refusal(src, to, copy) };
+        }
+        const to: Loc = { kind: "s3", bucket: el.dataset.dropBucket ?? src.bucket, prefix: el.dataset.dropPrefix ?? "" };
+        return { el, to, refused: refusal(src, to, copy) };
       }
       // The other pane's table (its empty area or an object row): the folder that pane shows. The
       // pane the drag started in is not a target this way (its own folder is a no-op).
@@ -145,9 +178,9 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
       if (!body || !other) return null;
       // The source pane's table only once another tab is shown there (hovering a tab switches it).
       if (other === src.pane && getPane(other).tab === src.tab) return null;
-      const { bucket, prefix, search } = getPane(other);
-      if (!bucket || search.open) return null;
-      return { el: body, bucket, prefix, refused: refusal(src, bucket, prefix, copy) };
+      const to = paneLoc(other);
+      if (!to || getPane(other).search.open) return null;
+      return { el: body, to, refused: refusal(src, to, copy) };
     };
 
     /** Hovering a tab: show it after a moment (once per hover), then hit-test again. */
@@ -179,7 +212,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
         copy,
         x: pointer.x,
         y: pointer.y,
-        target: next ? { label: targetLabel(next.bucket, next.prefix), refused: next.refused } : null,
+        target: next ? { label: targetLabel(next.to), refused: next.refused } : null,
       });
     };
 
@@ -205,8 +238,10 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
     };
 
     const begin = (): boolean => {
-      const { bucket, prefix, tab } = getPane(pane);
-      if (!bucket || bucket !== pressed.bucket || prefix !== pressed.prefix) return false;
+      const cur = getPane(pane);
+      const { bucket, prefix, tab } = cur;
+      const from = paneLoc(pane);
+      if (!from || bucket !== pressed.bucket || prefix !== pressed.prefix || (cur.local?.dir ?? null) !== pressed.dir) return false;
       const rows = getViewRows(pane);
       // Resolve the pressed row by its id. Gone (the listing changed under the pointer): no drag.
       const row = rows.find((r) => r.id === pressed.rowId);
@@ -224,7 +259,9 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
         return false;
       }
       const classes = new Map(picked.flatMap((r) => (r.kind === "object" ? [[r.object.key, r.object.storageClass] as const] : [])));
-      src = Object.freeze({ pane, tab, bucket, prefix, items, ids: new Set(items.map((i) => i.key)), classes });
+      const ordered = [...picked.filter((r) => r.kind === "folder"), ...picked.filter((r) => r.kind !== "folder")];
+      const cross = Object.freeze(ordered.map((r) => Object.freeze(crossItem(r, pane))));
+      src = Object.freeze({ pane, tab, from, bucket: bucket ?? "", prefix, items, cross, ids: new Set(items.map((i) => i.key)), classes });
       document.body.classList.add("row-dragging");
       window.getSelection()?.removeAllRanges();
       useRowDragView.setState({ ids: src.ids, count: items.length, copy, x: pointer.x, y: pointer.y, target: null });
@@ -286,7 +323,8 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
         toast.info(copy ? "Nothing was copied" : "Nothing was moved", target.refused);
         return;
       }
-      void drop(dragged, target.bucket, target.prefix, copy);
+      if (dragged.from.kind === "s3" && target.to.kind === "s3") void drop(dragged, target.to.bucket, target.to.prefix, copy);
+      else void requestCross({ from: dragged.from, to: target.to, mode: copy ? "copy" : "cut", items: [...dragged.cross], srcPane: dragged.pane });
     };
 
     const onCancel = () => finish();
@@ -328,7 +366,7 @@ export function useRowDrag(scrollRef: RefObject<HTMLDivElement | null>, pane: Pa
   return { onPointerDown, onClickCapture };
 }
 
-const pick = (s: PaneState) => ({ bucket: s.bucket, prefix: s.prefix, selection: s.selection });
+const pick = (s: PaneState) => ({ bucket: s.bucket, prefix: s.prefix, dir: s.local?.dir ?? null, selection: s.selection });
 
 /** A drop: the same request as paste, then the confirmation setting decides whether to ask. */
 async function drop(src: Source, bucket: string, prefix: string, copy: boolean) {

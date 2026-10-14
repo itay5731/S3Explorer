@@ -59,7 +59,8 @@ import { BehaviorTab, type FileManagerDraft } from "./BehaviorTab";
 import { NotificationsTab } from "./NotificationsTab";
 import { UpdatesTab } from "./UpdatesTab";
 import { KeyboardTab } from "./KeyboardTab";
-import { ACTIONS_BY_ID, chordProblem, effectiveBindings, findConflicts, normalizeOverrides, type Bindings } from "../lib/keys";
+import { ACTIONS_BY_ID, asPreset, chordProblem, effectiveBindings, findConflicts, normalizeOverrides, type Bindings } from "../lib/keys";
+import type { KeybindingsPreset } from "../lib/types";
 
 // ---- draft model ------------------------------------------------------------------
 
@@ -98,6 +99,7 @@ interface Draft {
   fileManager: FileManagerDraft;
   /** Overrides only (see "Settings → Keyboard" in docs/CONTRACT.md). */
   keybindings: Bindings;
+  keybindingsPreset: KeybindingsPreset;
 }
 
 type TransferErrors = Record<"partSize" | "parts" | "transfers" | "downLimit" | "upLimit", string | null>;
@@ -147,12 +149,14 @@ const toDraft = (s: AppSettings): Draft => ({
   confirmCopyMove: s.confirmCopyMove,
   previewAutomatically: s.previewAutomatically,
   fileManager: { mode: s.fileManagerCommand ? "program" : "system", command: s.fileManagerCommand ?? "" },
-  keybindings: normalizeOverrides(s.keybindings ?? {}),
+  keybindings: normalizeOverrides(s.keybindings ?? {}, asPreset(s.keybindingsPreset) ?? "classic"),
+  // A settings object without the field (an existing user's) means "classic".
+  keybindingsPreset: asPreset(s.keybindingsPreset) ?? "classic",
 });
 
 /** Problem with the key bindings (a conflict, a chord that can't be bound), or null. */
-function keybindingsError(b: Bindings): string | null {
-  const effective = effectiveBindings(b);
+function keybindingsError(b: Bindings, preset: KeybindingsPreset): string | null {
+  const effective = effectiveBindings(b, preset);
   if (findConflicts(effective).length) return "Two actions share a key.";
   for (const [id, chords] of Object.entries(b)) {
     if (!ACTIONS_BY_ID.has(id)) continue;
@@ -184,7 +188,7 @@ function toSettings(d: Draft): AppSettings | null {
   const errs = transferErrors(t);
   if (errs.partSize || errs.parts || errs.transfers || errs.downLimit || errs.upLimit) return null;
   if (fileManagerError(d.fileManager)) return null;
-  if (keybindingsError(d.keybindings)) return null;
+  if (keybindingsError(d.keybindings, d.keybindingsPreset)) return null;
   return {
     partSizeMib: t.partMode === "auto" ? null : Number(t.partSize),
     maxConcurrentParts: Number(t.parts),
@@ -198,7 +202,8 @@ function toSettings(d: Draft): AppSettings | null {
     confirmCopyMove: d.confirmCopyMove,
     previewAutomatically: d.previewAutomatically,
     fileManagerCommand: d.fileManager.mode === "system" ? null : normalizeFileManagerCommand(d.fileManager.command),
-    keybindings: normalizeOverrides(d.keybindings),
+    keybindings: normalizeOverrides(d.keybindings, d.keybindingsPreset),
+    keybindingsPreset: d.keybindingsPreset,
     downloadLimitKibps: t.downLimit.unlimited ? null : limitKibps(t.downLimit),
     uploadLimitKibps: t.upLimit.unlimited ? null : limitKibps(t.upLimit),
   };
@@ -330,9 +335,15 @@ const TABS: SettingsTab[] = [
     label: "Keyboard",
     icon: Keyboard,
     render: (ctx) => (
-      <KeyboardTab value={ctx.draft.keybindings} disabled={ctx.disabled} onChange={(keybindings) => ctx.update({ ...ctx.draft, keybindings })} />
+      <KeyboardTab
+        value={ctx.draft.keybindings}
+        preset={ctx.draft.keybindingsPreset}
+        disabled={ctx.disabled}
+        onChange={(keybindings, keybindingsPreset = ctx.draft.keybindingsPreset) => ctx.update({ ...ctx.draft, keybindings, keybindingsPreset })}
+      />
     ),
     // Unknown actions (from another version) are kept; only the known ones go back to their defaults.
+    // The preset stays: resetting means "the preset's keys", not "another preset".
     reset: (d) => ({ ...d, keybindings: Object.fromEntries(Object.entries(d.keybindings).filter(([id]) => !ACTIONS_BY_ID.has(id))) }),
     atDefaults: (d) => Object.keys(d.keybindings).every((id) => !ACTIONS_BY_ID.has(id)),
   },

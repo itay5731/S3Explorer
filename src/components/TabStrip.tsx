@@ -8,17 +8,20 @@ import { useShallow } from "zustand/react/shallow";
 import { usePanes, usePaneTabs, type PaneId } from "../store/panes";
 import { closeTab, moveTabToPane, reorderTabs, showTab } from "../store/tabs";
 import { isSplitShown } from "../store/app";
-import { displayName, prefixSegments, s3Uri } from "../lib/format";
+import { basename, displayName, prefixSegments, s3Uri } from "../lib/format";
 import { useTileReorder } from "./useTileReorder";
 
 interface TabView {
   id: number;
   bucket: string | null;
   prefix: string;
+  /** v0.9.0: a local directory (the tab shows this computer). */
+  local: string | null;
 }
 
 /** The folder name of a location, the bucket name at a bucket root. */
 function tabLabel(t: TabView): string {
+  if (t.local) return basename(t.local) || t.local;
   if (!t.bucket) return "Empty";
   const segs = prefixSegments(t.prefix);
   return segs.length ? displayName(segs[segs.length - 1].name) : t.bucket;
@@ -45,16 +48,23 @@ export function TabStrip({ pane }: { pane: PaneId }) {
   const shown = usePanes((s) => s[pane].tab);
   const shownBucket = usePanes((s) => s[pane].bucket);
   const shownPrefix = usePanes((s) => s[pane].prefix);
+  const shownLocal = usePanes((s) => (s[pane].source.kind === "local" ? (s[pane].local?.dir ?? null) : null));
   // Only what the strip draws, so a hidden tab's listing or selection changing doesn't re-render it.
-  const hidden = usePaneTabs(useShallow((s) => s[pane].map((t) => `${t.id}\u0000${t.saved?.bucket ?? ""}\u0000${t.saved?.prefix ?? ""}`)));
+  const hidden = usePaneTabs(
+    useShallow((s) =>
+      s[pane].map((t) => `${t.id}\u0000${t.saved?.bucket ?? ""}\u0000${t.saved?.prefix ?? ""}\u0000${t.saved?.source.kind === "local" ? (t.saved.local?.dir ?? "") : ""}`),
+    ),
+  );
   const tabs = useMemo<TabView[]>(
     () =>
       hidden.map((h) => {
-        const [id, bucket, prefix] = h.split("\u0000");
+        const [id, bucket, prefix, local] = h.split("\u0000");
         const n = Number(id);
-        return n === shown ? { id: n, bucket: shownBucket, prefix: shownPrefix } : { id: n, bucket: bucket || null, prefix };
+        return n === shown
+          ? { id: n, bucket: shownBucket, prefix: shownPrefix, local: shownLocal }
+          : { id: n, bucket: bucket || null, prefix, local: local || null };
       }),
-    [hidden, shown, shownBucket, shownPrefix],
+    [hidden, shown, shownBucket, shownPrefix, shownLocal],
   );
   const reorder = useTileReorder(
     tabs.map((t) => tileId(t.id)),
@@ -102,7 +112,7 @@ export function TabStrip({ pane }: { pane: PaneId }) {
     <div className="tab-strip" role="tablist" aria-label="Tabs" onClickCapture={reorder.onClickCapture}>
       {tabs.map((t) => {
         const active = t.id === shown;
-        const path = t.bucket ? s3Uri(t.bucket, t.prefix) : "No bucket open";
+        const path = t.local ?? (t.bucket ? s3Uri(t.bucket, t.prefix) : "No bucket open");
         return (
           <div
             key={t.id}

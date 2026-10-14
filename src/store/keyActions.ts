@@ -9,7 +9,9 @@ import {
   getPane,
   goHistory,
   isSplitShown,
+  lastLocalDir,
   navigate,
+  navigateLocal,
   openModal,
   refresh,
   requestDisconnect,
@@ -18,14 +20,30 @@ import {
   setFilter,
   setSelection,
   setSplit,
+  setShowHidden,
   setTransfersOpen,
   shownOtherPane,
+  syncOtherPane,
   useApp,
 } from "./app";
-import { otherPane } from "./panes";
+import { isLocalPane, otherPane, paneHasLocation } from "./panes";
+import { otherPaneRefusal, transferToOtherPane } from "./cross";
+import {
+  calculateLocalSizes,
+  copyLocalPaths,
+  defaultLocalDir,
+  localSegments,
+  localUp,
+  openLocalNewFolder,
+  openSourceMenu,
+  requestLocalRename,
+  requestLocalTrash,
+  selectedLocal,
+  startPathEdit,
+} from "./local";
 import { copyText, downloadObjects, openNewFolder, pickAndUpload } from "./actions";
 import { pickAndUploadFolder, requestDownloadFolders } from "./folders";
-import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived, requestTransferToOther } from "./ops";
+import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRename, requestRestoreArchived } from "./ops";
 import { ARCHIVED_REASON, isArchiveClass, needsRestore } from "./archive";
 import { useClipboard } from "./clipboard";
 import { getSelected } from "./view";
@@ -48,6 +66,12 @@ type Outcome = void | boolean | { unavailable: string };
 const no = (unavailable: string) => ({ unavailable });
 
 const OPEN_BUCKET = "Open a bucket first";
+
+/** The active pane shows the local computer (v0.9.0). */
+const local = () => isLocalPane(getPane());
+/** Why an S3-only action does nothing on a local pane. */
+const S3_ONLY = (what: string) => no(`“${what}” works on S3 panes, not on this computer`);
+const COPY_OTHER_HINT = "Use Copy to other pane instead (between S3 and this computer)";
 const SELECT_FIRST = "Select something first";
 const IN_RESULTS = "Go back to a folder first: search results are open";
 
@@ -93,6 +117,7 @@ const withList = (fn: (l: NonNullable<ReturnType<typeof listKeys>>) => void) => 
 const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "nav.open": withList((l) => l.open()),
   "nav.up": () => {
+    if (local()) return localUp(activePane()) || false;
     const { bucket, prefix } = getPane();
     if (!bucket || !prefix) return false;
     navigate(bucket, parentPrefix(prefix));
@@ -100,12 +125,22 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "nav.back": () => goHistory(-1) || undefined,
   "nav.forward": () => goHistory(1) || undefined,
   "nav.root": () => {
+    const lp = getPane();
+    if (isLocalPane(lp)) {
+      const root = localSegments(lp.local.dir)[0];
+      if (root && root.path !== lp.local.dir) navigateLocal(root.path);
+      return;
+    }
     const { bucket, prefix, search } = getPane();
     if (!bucket) return no(OPEN_BUCKET);
     if (prefix || search.open) navigate(bucket, "");
   },
   "nav.refresh": () => {
     const { bucket, search } = getPane();
+    if (local()) {
+      void refresh();
+      return;
+    }
     if (!bucket) return;
     if (search.open) rerunSearch();
     else void refresh();
@@ -117,6 +152,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     if (!focusBuckets()) return no("There are no buckets to choose from");
   },
   "nav.focusSearch": () => {
+    if (local()) return S3_ONLY("Search");
     const input = searchInput();
     if (!input || input.disabled) return no(OPEN_BUCKET);
     input.focus();
@@ -128,9 +164,45 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     toast.info(next === "bucket" ? "Search: the whole bucket" : "Search: this folder");
   },
   "nav.bookmark": () => {
+    if (local()) return S3_ONLY("Bookmarks");
     const { bucket, prefix } = getPane();
     if (!bucket) return no(OPEN_BUCKET);
     toggleBookmark(bucket, prefix);
+  },
+  "nav.editPath": () => {
+    startPathEdit(activePane());
+  },
+  "nav.syncOther": () => {
+    const why = syncOtherPane();
+    if (why) return no(why);
+  },
+  "source.pickLeft": () => {
+    // Single view: the one pane shown; split: the left one.
+    const pane = isSplitShown() ? "a" : activePane();
+    openSourceMenu(pane);
+  },
+  "source.pickRight": () => {
+    if (isSplitShown()) {
+      openSourceMenu("b");
+      return;
+    }
+    if (useApp.getState().split) return no("The window is too narrow for two panes");
+    // Single view: open the split with a local pane on the right.
+    void defaultLocalDir(lastLocalDir()).then((dir) => {
+      if (!dir) {
+        toast.error("Couldn’t list the drives of this computer");
+        return;
+      }
+      setSplit(true);
+      navigateLocal(dir, "b");
+    });
+  },
+  "local.toggleHidden": () => {
+    const pane = activePane();
+    const s = getPane(pane);
+    if (!isLocalPane(s)) return no("Hidden files are a setting of local panes");
+    setShowHidden(pane, !s.showHidden);
+    toast.info(s.showHidden ? "Hidden files hidden" : "Hidden files shown");
   },
   "nav.nextPane": () => {
     const other = shownOtherPane();
@@ -145,7 +217,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     focusPaneList(other);
   },
   "tab.new": () => {
-    if (!getPane().bucket) return no(OPEN_BUCKET);
+    if (!paneHasLocation(getPane())) return no(OPEN_BUCKET);
     afterTabSwitch(() => openTab(activePane(), null, true));
   },
   // Always used, even with nothing to do: the key must never reach the webview.
@@ -165,6 +237,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "view.single": () => setSplit(false),
   "view.split": () => setSplit(true),
   "view.details": () => {
+    if (local()) return S3_ONLY("The details panel");
     if (!getPane().bucket) return no(OPEN_BUCKET);
     setDetailsOpen(!useApp.getState().detailsOpen);
   },
@@ -194,18 +267,21 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "sel.menu": withList((l) => l.menu()),
 
   "act.upload": () => {
+    if (local()) return no(`Upload works into an S3 pane. ${COPY_OTHER_HINT}`);
     const { bucket, search } = getPane();
     if (!bucket) return no(OPEN_BUCKET);
     if (search.open) return no(IN_RESULTS);
     void pickAndUpload();
   },
   "act.uploadFolder": () => {
+    if (local()) return no(`Upload works into an S3 pane. ${COPY_OTHER_HINT}`);
     const { bucket, search } = getPane();
     if (!bucket) return no(OPEN_BUCKET);
     if (search.open) return no(IN_RESULTS);
     void pickAndUploadFolder();
   },
   "act.download": () => {
+    if (local()) return no(`These files are already on this computer. ${COPY_OTHER_HINT}`);
     if (!getPane().bucket) return no(OPEN_BUCKET);
     const { objects, folders, count } = selection();
     if (!count) return no(SELECT_FIRST);
@@ -214,6 +290,10 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     else void requestDownloadFolders(folders);
   },
   "act.newFolder": () => {
+    if (local()) {
+      openLocalNewFolder();
+      return;
+    }
     const { bucket, search } = getPane();
     if (!bucket) return no(OPEN_BUCKET);
     if (search.open) return no("Go back to a folder to create one");
@@ -221,27 +301,36 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   },
   "act.delete": () => {
     if (!selection().count) return no(SELECT_FIRST);
-    requestDelete();
+    // A local pane: to the recycle bin, after the confirmation.
+    if (local()) requestLocalTrash();
+    else requestDelete();
   },
   "act.rename": () => {
     const { count } = selection();
     if (count !== 1) return no(count ? "Select one item to rename" : SELECT_FIRST);
+    if (local()) {
+      requestLocalRename();
+      return;
+    }
     if (blockedSingle()) return no(ARCHIVED_REASON);
     void requestRename();
   },
   "act.copy": () => {
     if (textSelectionWins()) return false;
+    if (local()) return no(`The clipboard holds S3 items. ${COPY_OTHER_HINT}`);
     if (!selection().count) return no(SELECT_FIRST);
     if (blockedSingle()) return no(ARCHIVED_REASON);
     void copySelection("copy");
   },
   "act.cut": () => {
     if (textSelectionWins()) return false;
+    if (local()) return no(`The clipboard holds S3 items. ${COPY_OTHER_HINT}`);
     if (!selection().count) return no(SELECT_FIRST);
     if (blockedSingle()) return no(ARCHIVED_REASON);
     void copySelection("cut");
   },
   "act.paste": () => {
+    if (local()) return no(`The clipboard holds S3 items. ${COPY_OTHER_HINT}`);
     const { bucket, search } = getPane();
     if (!bucket) return no(OPEN_BUCKET);
     if (search.open) return no("Go back to a folder to paste into it");
@@ -252,18 +341,26 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
   "act.moveToOther": () => transferToOther("cut"),
   "act.copyKey": () => {
     if (textSelectionWins()) return false;
+    if (local()) {
+      const paths = selectedLocal().map((e) => e.path);
+      if (!paths.length) return no(SELECT_FIRST);
+      copyLocalPaths(paths);
+      return;
+    }
     const keys = selectedKeys();
     if (!keys.length) return no(SELECT_FIRST);
     void copyText(keys.join("\n"), keys.length > 1 ? "Keys" : "Key");
   },
   "act.copyUri": () => {
     if (textSelectionWins()) return false;
+    if (local()) return S3_ONLY("Copy S3 URI");
     const { bucket } = getPane();
     const keys = selectedKeys();
     if (!bucket || !keys.length) return no(SELECT_FIRST);
     void copyText(keys.map((k) => s3Uri(bucket, k)).join("\n"), keys.length > 1 ? "S3 URIs" : "S3 URI");
   },
   "act.tags": () => {
+    if (local()) return S3_ONLY("Tags");
     const { bucket } = getPane();
     const { folders, objects, count } = selection();
     if (!bucket || !count) return no(SELECT_FIRST);
@@ -271,6 +368,7 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     else requestBulkTags();
   },
   "act.versions": () => {
+    if (local()) return S3_ONLY("Versions");
     const { bucket, search } = getPane();
     const { folders, objects } = selection();
     if (!bucket) return no(OPEN_BUCKET);
@@ -283,18 +381,21 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     requestVersionsOpen(bucket, o.key);
   },
   "act.restore": () => {
+    if (local()) return S3_ONLY("Restore");
     const { folders, objects, count } = selection();
     if (!count) return no(SELECT_FIRST);
     if (!folders.length && !objects.some((o) => isArchiveClass(o.storageClass))) return no("None of the selected objects is archived");
     requestRestoreArchived();
   },
   "act.preview": () => {
+    if (local()) return S3_ONLY("Quick look");
     const { folders, objects } = selection();
     if (!getPane().bucket) return no(OPEN_BUCKET);
     if (folders.length || objects.length !== 1) return no("Select one file to preview it");
     openModal({ kind: "quickLook" });
   },
   "act.editMetadata": () => {
+    if (local()) return S3_ONLY("Editing metadata");
     const { bucket } = getPane();
     const { folders, objects } = selection();
     if (!bucket) return no(OPEN_BUCKET);
@@ -305,6 +406,12 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     openModal({ kind: "editMetadata", bucket, key: objects[0].key });
   },
   "act.folderSize": () => {
+    if (local()) {
+      const dirs = selectedLocal().filter((e) => e.isDir && !e.isSymlink);
+      if (!dirs.length) return no("Select a folder to calculate its size");
+      calculateLocalSizes(dirs.map((e) => e.path));
+      return;
+    }
     const { bucket } = getPane();
     const { folders } = selection();
     if (!bucket) return no(OPEN_BUCKET);
@@ -335,12 +442,12 @@ function selectedKeys(): string[] {
 }
 
 function transferToOther(mode: "copy" | "cut"): Outcome {
-  if (!isSplitShown()) return no(useApp.getState().split ? "The window is too narrow for two panes" : "Open the split view first");
-  if (!getPane().bucket) return no(OPEN_BUCKET);
+  const why = otherPaneRefusal();
+  if (why) return no(why);
   if (!selection().count) return no(SELECT_FIRST);
   if (blockedSingle()) return no(ARCHIVED_REASON);
-  if (!getPane(otherPane(activePane())).bucket) return no("Open a bucket in the other pane first");
-  void requestTransferToOther(mode);
+  if (!paneHasLocation(getPane(otherPane(activePane())))) return no("Open a bucket in the other pane first");
+  transferToOtherPane(mode);
 }
 
 /** Run an action by id (the cheat sheet and tests use this too). Returns what the handler did. */

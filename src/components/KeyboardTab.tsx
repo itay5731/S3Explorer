@@ -5,7 +5,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { AlertTriangle, Download, Info, Loader2, Plus, RotateCcw, Trash2, Upload, X } from "lucide-react";
 import * as api from "../lib/api";
-import type { AppError } from "../lib/types";
+import type { AppError, KeybindingsPreset } from "../lib/types";
 import { KEYBINDING_LIMITS } from "../lib/types";
 import {
   ACTIONS_BY_ID,
@@ -25,6 +25,8 @@ import {
   normalizeOverrides,
   parseImport,
   partialChord,
+  PRESET_IDS,
+  PRESET_INFO,
   type Bindings,
   type ImportResult,
   type KeyAction,
@@ -47,8 +49,19 @@ interface Recording {
   live: string;
 }
 
-export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; disabled: boolean; onChange(next: Bindings): void }) {
-  const bindings = useMemo(() => effectiveBindings(value), [value]);
+export function KeyboardTab({
+  value,
+  preset,
+  disabled,
+  onChange,
+}: {
+  value: Bindings;
+  preset: KeybindingsPreset;
+  disabled: boolean;
+  /** New overrides, and the preset when it changes. */
+  onChange(next: Bindings, preset?: KeybindingsPreset): void;
+}) {
+  const bindings = useMemo(() => effectiveBindings(value, preset), [value, preset]);
   const conflicts = useMemo(() => findConflicts(bindings), [bindings]);
   const unknown = useMemo(() => Object.keys(value).filter((id) => !ACTIONS_BY_ID.has(id)), [value]);
   const [recording, setRec] = useState<Recording | null>(null);
@@ -71,7 +84,7 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
     return m;
   }, [conflicts]);
 
-  const setChords = (id: string, chords: string[]) => onChange(normalizeOverrides({ ...value, [id]: chords }));
+  const setChords = (id: string, chords: string[]) => onChange(normalizeOverrides({ ...value, [id]: chords }, preset));
 
   // Recording: the next chord pressed is added to the action. Escape cancels, a click elsewhere too.
   useEffect(() => {
@@ -105,7 +118,7 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
     /** Add a recorded chord (a key or an extra mouse button) to the action, or say why not. */
     const accept = (chord: string) => {
       const problem = chordProblem(id, chord);
-      const current = effectiveBindings(value)[id] ?? [];
+      const current = effectiveBindings(value, preset)[id] ?? [];
       const k = canonicalChord(chord);
       if (problem) setRowError({ id, message: `${formatChord(chord)}: ${problem}` });
       else if (current.some((c) => canonicalChord(c) === k)) setRowError(null);
@@ -139,7 +152,7 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
       window.removeEventListener("blur", stop);
       setRecording(false);
     };
-  }, [recording?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [recording?.id, preset]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const startRecording = (id: string) => {
     setRowError(null);
@@ -153,7 +166,7 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
       if (!picked) return;
       // Some save dialogs (GTK) return the name as typed, without the extension the filter implies.
       const path = /\.json$/i.test(picked) ? picked : `${picked}.json`;
-      await api.writeTextFile(path, exportBindings(value));
+      await api.writeTextFile(path, exportBindings(value, preset));
       toast.success("Keyboard shortcuts exported", path);
     } catch (e) {
       toast.error("Couldn't export the shortcuts", e as AppError);
@@ -170,7 +183,7 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
       if (!path) return;
       const text = await api.readTextFile(path);
       try {
-        setPreview({ path, result: parseImport(text, value) });
+        setPreview({ path, result: parseImport(text, value, preset) });
       } catch (err) {
         setImportError((err as Error).message);
       }
@@ -186,6 +199,28 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
 
   return (
     <div className="set-panel-body kb-tab">
+      <div className="kb-preset" role="radiogroup" aria-label="Preset">
+        <span className="kb-preset-title">Preset</span>
+        <div className="kb-preset-options">
+          {PRESET_IDS.map((p) => (
+            <label key={p} className={`kb-preset-option ${preset === p ? "selected" : ""}`} data-preset={p}>
+              <input
+                type="radio"
+                name="kb-preset"
+                value={p}
+                checked={preset === p}
+                disabled={disabled}
+                onChange={() => onChange(value, p)}
+              />
+              <span className="kb-preset-text">
+                <span className="kb-preset-label">{PRESET_INFO[p].label}</span>
+                <span className="kb-preset-desc">{PRESET_INFO[p].description}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+        <p className="set-desc small">Your own changes below stay as they are when you switch.</p>
+      </div>
       <div className="kb-toolbar">
         <p className="set-desc grow">
           Click <b>Record</b> and press the keys. Chords with Ctrl, Alt or an F-key also work while typing in a text box.
@@ -201,7 +236,7 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
           className="btn btn-sm"
           disabled={disabled || !anyKnownModified}
           onClick={() => onChange(Object.fromEntries(Object.entries(value).filter(([id]) => !ACTIONS_BY_ID.has(id))))}
-          title="Every action back to its default keys. Changes still need to be saved."
+          title="Every action back to the preset's keys (the preset stays). Changes still need to be saved."
         >
           <RotateCcw size={13} /> Reset all
         </button>
@@ -230,9 +265,11 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
       {preview && (
         <ImportPreview
           preview={preview}
+          currentPreset={preset}
           onCancel={() => setPreview(null)}
           onApply={() => {
-            onChange(applyImport(value, preview.result));
+            const next = applyImport(value, preview.result, preset);
+            onChange(next.overrides, next.preset);
             setPreview(null);
           }}
         />
@@ -378,8 +415,18 @@ export function KeyboardTab({ value, disabled, onChange }: { value: Bindings; di
 }
 
 /** What an import would change, applied on confirm. Esc or Cancel drops it. */
-function ImportPreview({ preview, onApply, onCancel }: { preview: { path: string; result: ImportResult }; onApply(): void; onCancel(): void }) {
-  const { changes, unknown } = preview.result;
+function ImportPreview({
+  preview,
+  currentPreset,
+  onApply,
+  onCancel,
+}: {
+  preview: { path: string; result: ImportResult };
+  currentPreset: KeybindingsPreset;
+  onApply(): void;
+  onCancel(): void;
+}) {
+  const { changes, unknown, preset } = preview.result;
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     ref.current?.querySelector<HTMLButtonElement>(".btn-primary")?.focus();
@@ -391,7 +438,8 @@ function ImportPreview({ preview, onApply, onCancel }: { preview: { path: string
       onCancel();
     }
   };
-  const nothing = !changes.length && !unknown.length;
+  const nothing = !changes.length && !unknown.length && (!preset || preset === currentPreset);
+  const presetLine = preset ? <p className="set-desc">Preset: <b>{PRESET_INFO[preset].label}</b></p> : null;
   return (
     <div ref={ref} className="kb-import" role="dialog" aria-modal="false" aria-labelledby="kb-import-title" onKeyDown={onKeyDown}>
       <div className="kb-import-head">
@@ -401,6 +449,7 @@ function ImportPreview({ preview, onApply, onCancel }: { preview: { path: string
           {preview.path}
         </span>
       </div>
+      {presetLine}
       {nothing ? (
         <p className="set-desc">The file matches your current shortcuts. Nothing changes.</p>
       ) : (

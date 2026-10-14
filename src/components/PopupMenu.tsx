@@ -15,7 +15,25 @@ export interface PopupMenuItem {
   hint?: string;
 }
 
-export function PopupMenu({ x, y, groups, onClose, label }: { x: number; y: number; groups: PopupMenuItem[][]; onClose(): void; label: string }) {
+export function PopupMenu({
+  x,
+  y,
+  groups,
+  onClose,
+  label,
+  className,
+  headings,
+}: {
+  x: number;
+  y: number;
+  groups: PopupMenuItem[][];
+  onClose(): void;
+  label: string;
+  /** An extra class on the menu (its own size). */
+  className?: string;
+  /** A small heading above each group, by group index (empty groups are still skipped). */
+  headings?: string[];
+}) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const closeRef = useRef(onClose);
@@ -72,16 +90,18 @@ export function PopupMenu({ x, y, groups, onClose, label }: { x: number; y: numb
   return (
     <div
       ref={ref}
-      className="context-menu"
+      className={`context-menu ${className ?? ""}`}
       role="menu"
       aria-label={label}
       style={{ left: pos?.x ?? x, top: pos?.y ?? y, visibility: pos ? "visible" : "hidden" }}
       onContextMenu={(e) => e.preventDefault()}
     >
       {groups
-        .filter((g) => g.length)
-        .map((g, gi) => (
+        .map((g, gi) => ({ g, heading: headings?.[gi] }))
+        .filter(({ g }) => g.length)
+        .map(({ g, heading }, gi) => (
           <div key={gi} className="menu-group">
+            {heading && <div className="menu-heading">{heading}</div>}
             {g.map((item) => (
               <button
                 key={item.label}

@@ -24,6 +24,8 @@ import {
 import {
   emptySearch,
   freshPane,
+  isLocalPane,
+  paneHasLocation,
   newTabId,
   PANE_IDS,
   tabEntry,
@@ -97,7 +99,7 @@ export function showTab(pane: PaneId, id: number) {
   useApp.setState({ contextMenu: null });
 
   const s = target.saved;
-  if (!s.bucket) return;
+  if (!s.bucket && !isLocalPane(s)) return;
   const after = () => (target.vanished ? leaveVanishedFolder(pane) : undefined);
   if (s.listing.loading || !s.listedAt || s.listing.error) void refresh(pane).then(after);
   else if (target.stale || Date.now() - s.listedAt > STALE_MS) void refreshInPlace(pane).then(after);
@@ -121,7 +123,7 @@ export function openTab(pane: PaneId, at: Location | null, show: boolean, index?
   }
   let saved: PaneState;
   if (at) saved = stateAt(at, cur.sort);
-  else if (cur.bucket) {
+  else if (paneHasLocation(cur)) {
     saved = {
       ...cur,
       tab: newTabId(),
@@ -132,7 +134,10 @@ export function openTab(pane: PaneId, at: Location | null, show: boolean, index?
       scrollTo: null,
       filter: "",
       search: emptySearch,
-      history: { entries: [{ bucket: cur.bucket, prefix: cur.prefix }], index: 0 },
+      history: {
+        entries: [isLocalPane(cur) ? { bucket: "", prefix: "", local: cur.local.dir } : { bucket: cur.bucket ?? "", prefix: cur.prefix }],
+        index: 0,
+      },
     };
   } else return false;
   const next = tabs.slice();

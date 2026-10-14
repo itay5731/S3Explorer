@@ -1,4 +1,6 @@
-import { useApp } from "../store/app";
+import { useApp, usePaneId } from "../store/app";
+import { openSourceMenu } from "../store/local";
+import { useKeyHint, withKey } from "../store/keyboard";
 import { plural } from "../lib/ops";
 
 /** The main area before a bucket is opened: a large picture, what to do next, and what a bucket offers. */
@@ -7,12 +9,17 @@ export function Welcome() {
   const bucketCount = useApp((s) => s.buckets.length);
   // In split view this is one of two panes: a bucket clicked in the sidebar opens in the active pane.
   const split = useApp((s) => s.split && !s.narrow);
+  const pane = usePaneId();
+  const pickKey = useKeyHint(pane === "a" ? "source.pickLeft" : "source.pickRight");
   if (!connection) return null;
   if (split) {
     return (
       <div className="welcome welcome-pane">
         <h1>Pick a bucket for this pane</h1>
         <p className="welcome-lead">Click here, then choose a bucket on the left. It opens in this pane; the other pane stays where it is.</p>
+        <button type="button" className="link-btn welcome-local" onClick={(e) => openSourceMenu(pane, { x: e.clientX, y: e.clientY + 8 })} title={withKey("Choose a source", pickKey)}>
+          Or open a folder on this computer
+        </button>
       </div>
     );
   }

@@ -4,7 +4,7 @@
 import { useContext } from "react";
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionConfig, ConnectionInfo, FolderEntry, JobItem, JobRequest, ObjectEntry, ObjectVersion } from "../lib/types";
+import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionConfig, ConnectionInfo, FolderEntry, JobItem, JobRequest, LocalEntry, ObjectEntry, ObjectVersion } from "../lib/types";
 import { asFolderPrefix } from "../lib/format";
 import { clearClipboard } from "./clipboard";
 import { selectActiveBatchCount, useBatches } from "./batches";
@@ -14,7 +14,27 @@ import { clearArchive } from "./archive";
 import { clearVersioning } from "./versions";
 import { clearBookmarksConnection, forgetBookmarks, setBookmarksConnection } from "./bookmarks";
 import { selectActiveCount, useTransfers } from "./transfers";
-import { emptyListing, emptySearch, freshPane, HISTORY_CAP, otherPane, PANE_IDS, PaneContext, SORT_KEY, tabEntry, usePanes, usePaneTabs, type PaneId, type PaneState, type SortKey, type SortState } from "./panes";
+import {
+  emptyListing,
+  emptySearch,
+  freshPane,
+  HISTORY_CAP,
+  isLocalPane,
+  LOCAL_SOURCE,
+  otherPane,
+  PANE_IDS,
+  PaneContext,
+  paneHasLocation,
+  S3_SOURCE,
+  SORT_KEY,
+  tabEntry,
+  usePanes,
+  usePaneTabs,
+  type PaneId,
+  type PaneState,
+  type SortKey,
+  type SortState,
+} from "./panes";
 import { readPref, writePref } from "./prefs";
 
 export type { Listing, PaneId, PaneState, SortKey, SortState } from "./panes";
@@ -57,6 +77,14 @@ export type Modal =
   | { kind: "downloadFolders"; bucket: string; folders: FolderEntry[]; dir: string }
   /** Disconnect while transfers or jobs are still running. */
   | { kind: "disconnect"; running: number }
+  /** v0.9.0: create a folder in a local pane's directory (captured when the dialog opened). */
+  | { kind: "localNewFolder"; parent: string }
+  /** v0.9.0: rename one local file or folder (its exact path). */
+  | { kind: "localRename"; path: string; name: string; isDir: boolean }
+  /** v0.9.0: move local files and folders to the recycle bin; `paths` are exactly what is sent. */
+  | { kind: "localTrash"; paths: string[]; dirs: number }
+  /** v0.9.0: copy or move between an S3 pane and a local pane (see store/cross.ts). */
+  | { kind: "crossTransfer"; planId: number }
   /** Restore one archived object (restore_object). */
   | { kind: "restore"; bucket: string; key: string; storageClass: string | null }
   /** Restore the archived objects in a selection (a "restore" job). `items` are exact keys/prefixes. */
@@ -68,7 +96,17 @@ export type Modal =
   | null;
 
 /** Modals that make sense without an open bucket. */
-export const BUCKETLESS_MODALS: ReadonlySet<NonNullable<Modal>["kind"]> = new Set(["addBucket", "removeBucket", "bucketTags", "lifecycle", "disconnect"]);
+export const BUCKETLESS_MODALS: ReadonlySet<NonNullable<Modal>["kind"]> = new Set([
+  "addBucket",
+  "removeBucket",
+  "bucketTags",
+  "lifecycle",
+  "disconnect",
+  "localNewFolder",
+  "localRename",
+  "localTrash",
+  "crossTransfer",
+]);
 
 export interface ContextMenuState {
   x: number;
@@ -214,9 +252,30 @@ export function setSplit(on: boolean) {
   resetPane(other);
   set({ split: on, contextMenu: null });
   if (on) {
-    const { bucket, prefix } = getPane(active);
-    if (bucket) navigate(bucket, prefix, other);
+    const s = getPane(active);
+    // The other pane opens where the active one is: the same bucket and folder, or local directory.
+    if (isLocalPane(s)) navigateLocal(s.local.dir, other);
+    else if (s.bucket) navigate(s.bucket, s.prefix, other);
   }
+}
+
+/**
+ * Sync the other pane (v0.9.0, `nav.syncOther`): it shows the active pane's source and location,
+ * with nothing selected. Opens the split when needed. Returns why it can't, or null.
+ */
+export function syncOtherPane(): string | null {
+  const active = activePane();
+  const s = getPane(active);
+  if (!paneHasLocation(s)) return "Open a bucket or a folder first";
+  if (!get().split) {
+    // Opening the split already shows this location in the other pane.
+    setSplit(true);
+    return null;
+  }
+  const other = otherPane(active);
+  if (isLocalPane(s)) navigateLocal(s.local.dir, other);
+  else navigate(s.bucket!, s.prefix, other);
+  return null;
 }
 
 /** The main area got narrower or wider than two panes need (hides, never closes, the other pane). */
@@ -490,19 +549,23 @@ export function onNavigate(cb: (pane: PaneId) => void): () => void {
   return () => navigateListeners.delete(cb);
 }
 
-/** Record a navigation in a pane's history: drops the forward entries, caps the length. */
-function pushHistory(pane: PaneId, bucket: string, prefix: string, replace = false) {
+/**
+ * Record a navigation in a pane's history: drops the forward entries, caps the length. `local`: a
+ * local directory (bucket and prefix are then "").
+ */
+function pushHistory(pane: PaneId, bucket: string, prefix: string, replace = false, local?: string) {
+  const entry = local !== undefined ? { bucket: "", prefix: "", local } : { bucket, prefix };
   setPane(pane, (s) => {
     const { entries, index } = s.history;
     const cur = entries[index];
-    if (cur && cur.bucket === bucket && cur.prefix === prefix) return {};
+    if (cur && cur.bucket === bucket && cur.prefix === prefix && cur.local === local) return {};
     if (replace && cur) {
       const next = entries.slice(0, index + 1);
-      next[index] = { bucket, prefix };
+      next[index] = entry;
       return { history: { entries: next, index } };
     }
     const next = entries.slice(0, index + 1);
-    next.push({ bucket, prefix });
+    next.push(entry);
     const drop = Math.max(0, next.length - HISTORY_CAP);
     const kept = drop ? next.slice(drop) : next;
     return { history: { entries: kept, index: kept.length - 1 } };
@@ -525,7 +588,8 @@ export function goHistory(delta: -1 | 1, pane: PaneId = activePane()): boolean {
   const entry = h.entries[to];
   if (to < 0 || !entry) return false;
   setPane(pane, { history: { entries: h.entries, index: to } });
-  navigate(entry.bucket, entry.prefix, pane, { fromHistory: true });
+  if (entry.local !== undefined) navigateLocal(entry.local, pane, { fromHistory: true });
+  else navigate(entry.bucket, entry.prefix, pane, { fromHistory: true });
   return true;
 }
 
@@ -545,6 +609,8 @@ export function navigate(
   const p = asFolderPrefix(prefix);
   if (!opts.fromHistory) pushHistory(pane, bucket, p, opts.replaceHistory);
   setPane(pane, {
+    source: S3_SOURCE,
+    local: null,
     bucket,
     prefix: p,
     selection: new Set(),
@@ -559,7 +625,103 @@ export function navigate(
   // the first bucket opened): it opens at the same place, as when the split is opened.
   const other = otherPane(pane);
   // `alone`: the other pane is about to be opened somewhere itself (restoring remembered tabs).
-  if (!opts.alone && isSplitShown() && freshPanes.has(other) && !getPane(other).bucket) navigate(bucket, p, other);
+  if (!opts.alone && isSplitShown() && freshPanes.has(other) && !paneHasLocation(getPane(other))) navigate(bucket, p, other);
+}
+
+// ---- local panes (v0.9.0) ------------------------------------------------------------------------
+
+/** The last local directory a pane showed this session (Alt+F2 in single view opens there). */
+let lastLocal: string | null = null;
+export const lastLocalDir = () => lastLocal;
+
+/**
+ * Show a local directory in a pane (default: the active pane), turning it into a local pane. The
+ * path is used verbatim (as the OS returned it, or as typed for an edited path). `select`: an entry
+ * to select once listed (an edited path that named a file).
+ */
+export function navigateLocal(
+  dir: string,
+  pane: PaneId = activePane(),
+  opts: { fromHistory?: boolean; replaceHistory?: boolean; select?: string } = {},
+) {
+  navigateListeners.forEach((cb) => cb(pane));
+  freshPanes.delete(pane);
+  if (!opts.fromHistory) pushHistory(pane, "", "", opts.replaceHistory, dir);
+  const sel = opts.select ?? null;
+  setPane(pane, (s) => ({
+    source: LOCAL_SOURCE,
+    local: { dir, parent: s.local && s.local.dir === dir ? s.local.parent : null, truncated: false, entries: new Map() },
+    bucket: null,
+    prefix: "",
+    listing: emptyListing,
+    selection: sel ? new Set([sel]) : new Set(),
+    anchor: sel,
+    focus: sel,
+    filter: "",
+    reveal: null,
+  }));
+  lastLocal = dir;
+  set({ contextMenu: null });
+  void loadLocal(pane, !!sel, !!sel);
+}
+
+/** Show or hide hidden files in a local pane (per pane, for the session) and list again. */
+export function setShowHidden(pane: PaneId, showHidden: boolean) {
+  setPane(pane, { showHidden });
+  if (isLocalPane(getPane(pane))) void loadLocal(pane, true);
+}
+
+/**
+ * List a local pane's directory. `keepSelection`: keep the rows that are still there (a refresh);
+ * without it the listing starts empty with the loading state.
+ */
+async function loadLocal(pane: PaneId, keepSelection: boolean, reveal = false) {
+  const s = getPane(pane);
+  if (!isLocalPane(s)) return;
+  const dir = s.local.dir;
+  const seq = ++listSeq[pane];
+  setPane(pane, (cur) => ({ listing: keepSelection ? { ...cur.listing, loading: true, error: null } : { ...emptyListing, loading: true } }));
+  try {
+    const l = await api.listLocalDir(dir, s.showHidden);
+    if (seq !== listSeq[pane]) return;
+    const entries = new Map<string, LocalEntry>();
+    const folders: FolderEntry[] = l.dirs.map((d) => {
+      entries.set(d.path, d);
+      return { prefix: d.path, name: d.name };
+    });
+    const objects: ObjectEntry[] = l.files.map((f) => {
+      entries.set(f.path, f);
+      return { key: f.path, name: f.name, size: f.size, lastModified: f.modified, etag: null, storageClass: null };
+    });
+    setPane(pane, (cur) => {
+      if (!isLocalPane(cur) || cur.local.dir !== dir) return {};
+      const selection = new Set([...cur.selection].filter((id) => entries.has(id)));
+      return {
+        local: { dir, parent: l.parent, truncated: l.truncated, entries },
+        listing: { folders, objects, token: null, truncated: false, loading: false, loadingMore: false, error: null },
+        selection: selection.size === cur.selection.size ? cur.selection : selection,
+        anchor: cur.anchor && entries.has(cur.anchor) ? cur.anchor : null,
+        focus: cur.focus && entries.has(cur.focus) ? cur.focus : null,
+        scrollTo: reveal && cur.focus && entries.has(cur.focus) ? { id: cur.focus, seq: ++scrollSeq } : cur.scrollTo,
+        listedAt: Date.now(),
+      };
+    });
+  } catch (e) {
+    if (seq !== listSeq[pane]) return;
+    setPane(pane, { listing: { ...emptyListing, error: e as AppError } });
+  }
+}
+
+/** Every shown local pane whose directory is `dir` or holds `path` (case-insensitive) lists again. */
+export function refreshLocalPanesAt(path: string) {
+  const norm = (p: string) => p.replace(/[\/]+$/, "").toLowerCase();
+  const target = norm(path);
+  for (const id of PANE_IDS) {
+    const s = getPane(id);
+    if (!isLocalPane(s)) continue;
+    const dir = norm(s.local.dir);
+    if (target === dir || target.startsWith(dir + "\\") || target.startsWith(dir + "/") || (dir.endsWith(":") && target.startsWith(dir))) void loadLocal(id, true);
+  }
 }
 
 let scrollSeq = 0;
@@ -599,6 +761,7 @@ async function continueReveal(pane: PaneId) {
 }
 
 export function refresh(pane: PaneId = activePane()): Promise<void> {
+  if (isLocalPane(getPane(pane))) return loadLocal(pane, true);
   return loadFirstPage(pane, true);
 }
 
@@ -664,6 +827,7 @@ export function refreshInPlace(pane: PaneId = activePane()): Promise<void> {
 }
 
 async function reloadKeepingPosition(pane: PaneId) {
+  if (isLocalPane(getPane(pane))) return loadLocal(pane, true);
   const { bucket, prefix, listing } = getPane(pane);
   if (!bucket || listing.loading) return;
   const want = Math.max(1, listing.folders.length + listing.objects.length);

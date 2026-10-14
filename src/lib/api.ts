@@ -32,6 +32,10 @@ import {
   type JobPreview,
   type JobRequest,
   type LifecycleConfiguration,
+  type LocalDirSize,
+  type LocalListing,
+  type LocalRoot,
+  type TrashResult,
   type LifecycleIssue,
   type ListPage,
   type MetadataEdit,
@@ -185,6 +189,13 @@ export interface Backend {
   pickImportFile(): Promise<string | null>;
   writeTextFile(path: string, content: string): Promise<void>;
   readTextFile(path: string): Promise<string>;
+  // The local computer (v0.9.0, see "Pane sources" in docs/CONTRACT.md)
+  listLocalRoots(): Promise<LocalRoot[]>;
+  listLocalDir(path: string, showHidden: boolean): Promise<LocalListing>;
+  createLocalDir(parent: string, name: string): Promise<void>;
+  renameLocal(path: string, newName: string): Promise<void>;
+  trashLocal(paths: string[]): Promise<TrashResult>;
+  localDirSize(path: string, scanId: string): Promise<LocalDirSize>;
 }
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -359,6 +370,12 @@ const tauriBackend: Backend = {
   },
   writeTextFile: (path, content) => invoke<void>("write_text_file", { path, content }),
   readTextFile: (path) => invoke<string>("read_text_file", { path }),
+  listLocalRoots: () => invoke<LocalRoot[]>("list_local_roots"),
+  listLocalDir: (path, showHidden) => invoke<LocalListing>("list_local_dir", { path, showHidden }),
+  createLocalDir: (parent, name) => invoke<void>("create_local_dir", { parent, name }),
+  renameLocal: (path, newName) => invoke<void>("rename_local", { path, newName }),
+  trashLocal: (paths) => invoke<TrashResult>("trash_local", { paths }),
+  localDirSize: (path, scanId) => invoke<LocalDirSize>("local_dir_size", { path, scanId }),
   onFileDrop: (cb) =>
     getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload;
@@ -454,8 +471,9 @@ export const folderSize = (id: string, bucket: string, prefix: string) => call("
 export const cancelFolderSize = (id: string) => call("cancelFolderSize", id);
 /**
  * Open a finished download with the OS default application (a file) or the file manager (a
- * folder). The backend accepts only the local path of a completed download or finished folder
- * download; it refuses files that could run as a program (`NotSupported`).
+ * folder). The backend accepts the local path of a completed download or finished folder
+ * download, and (v0.9.0) a file browsed to in a local pane; it refuses files that could run as a
+ * program (`NotSupported`).
  */
 export const openLocal = (path: string) => call("openLocal", path);
 export const previewJob = (request: JobRequest) => call("previewJob", request);
@@ -564,3 +582,17 @@ export const pickExportPath = (defaultName: string) => call("pickExportPath", de
 export const pickImportFile = () => call("pickImportFile");
 export const writeTextFile = (path: string, content: string) => call("writeTextFile", path, content);
 export const readTextFile = (path: string) => call("readTextFile", path);
+
+// ---- the local computer (v0.9.0) ---------------------------------------------------------------
+/** The drives and the home folder a local pane can start from. */
+export const listLocalRoots = () => call("listLocalRoots");
+/** One directory, sorted by name, at most 50,000 entries (`truncated` past that); never follows links. */
+export const listLocalDir = (path: string, showHidden: boolean) => call("listLocalDir", path, showHidden);
+/** Create `name` (sanitized by the backend) in `parent`; refuses an existing name. */
+export const createLocalDir = (parent: string, name: string) => call("createLocalDir", parent, name);
+/** Rename in the same directory; refuses an existing target, never replaces. */
+export const renameLocal = (path: string, newName: string) => call("renameLocal", path, newName);
+/** Move to the OS recycle bin / trash (never a permanent delete); a link is trashed as the link. */
+export const trashLocal = (paths: string[]) => call("trashLocal", paths);
+/** Files and bytes under a local folder, bounded (200,000 entries); a newer call with the same id cancels. */
+export const localDirSize = (path: string, scanId: string) => call("localDirSize", path, scanId);
