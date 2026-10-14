@@ -15,7 +15,7 @@ import {
   type SortKey,
 } from "../store/app";
 import { findJump, registerListKeys, type ListKeys } from "../store/keyboard";
-import { getViewRows, useViewRows, type Row } from "../store/view";
+import { getViewRows, rowIndex, rowNames, useViewRows, type Row } from "../store/view";
 import { formatBytes, formatExact, formatRelative, formatStorageClass, displayName } from "../lib/format";
 import { FolderSizeCell } from "./FolderSize";
 import { FileIcon } from "./FileIcon";
@@ -165,7 +165,7 @@ export function ObjectTable() {
   // Bring a revealed row (a newest file opened from the sidebar) into view once it is loaded.
   useEffect(() => {
     if (!scrollTo) return;
-    const index = getViewRows(pane).findIndex((r) => r.id === scrollTo.id);
+    const index = rowIndex(getViewRows(pane), scrollTo.id);
     if (index >= 0) requestAnimationFrame(() => virtualizer.scrollToIndex(index, { align: "center" }));
   }, [scrollTo, virtualizer, pane]);
 
@@ -207,7 +207,7 @@ export function ObjectTable() {
         else next.add(row.id);
         select(next, row.id, row.id);
       } else if (mode === "range" || mode === "range-add") {
-        const a = anchor ? rows.findIndex((r) => r.id === anchor) : -1;
+        const a = rowIndex(rows, anchor);
         const from = a < 0 ? index : Math.min(a, index);
         const to = a < 0 ? index : Math.max(a, index);
         const next = mode === "range-add" ? new Set(selection) : new Set<string>();
@@ -271,7 +271,7 @@ export function ObjectTable() {
     const rows = getViewRows(pane);
     if (!rows.length) return;
     const { focus } = getPane(pane);
-    const cur = focus ? rows.findIndex((r) => r.id === focus) : -1;
+    const cur = rowIndex(rows, focus);
     let next: number;
     if (delta === "home") next = 0;
     else if (delta === "end") next = rows.length - 1;
@@ -291,7 +291,7 @@ export function ObjectTable() {
     toggle() {
       const rows = getViewRows(pane);
       const { focus } = getPane(pane);
-      const i = focus ? rows.findIndex((r) => r.id === focus) : -1;
+      const i = rowIndex(rows, focus);
       if (i >= 0) selectIndex(i, "toggle");
       else if (rows.length) selectIndex(0, "single");
     },
@@ -299,7 +299,7 @@ export function ObjectTable() {
       const rows = getViewRows(pane);
       if (!rows.length) return;
       const { focus } = getPane(pane);
-      const i = focus ? rows.findIndex((r) => r.id === focus) : -1;
+      const i = rowIndex(rows, focus);
       if (i < 0) {
         selectIndex(0, "toggle");
         return;
@@ -328,7 +328,7 @@ export function ObjectTable() {
     menu() {
       const rows = getViewRows(pane);
       const { focus, selection } = getPane(pane);
-      const index = focus ? rows.findIndex((r) => r.id === focus) : -1;
+      const index = rowIndex(rows, focus);
       if (index >= 0 && !selection.has(rows[index].id)) selectIndex(index, "single");
       const el = index >= 0 ? scrollRef.current?.querySelector<HTMLElement>(`[data-index="${index}"]`) : null;
       const r = el?.getBoundingClientRect() ?? scrollRef.current?.getBoundingClientRect();
@@ -338,7 +338,7 @@ export function ObjectTable() {
     jump(prefix) {
       const rows = getViewRows(pane);
       const { focus } = getPane(pane);
-      const i = findJump(rows.map((r) => r.name), prefix, focus ? rows.findIndex((r) => r.id === focus) : -1);
+      const i = findJump(rowNames(rows), prefix, rowIndex(rows, focus));
       if (i < 0) return false;
       selectIndex(i, "single");
       virtualizer.scrollToIndex(i, { align: "auto" });

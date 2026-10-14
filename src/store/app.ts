@@ -1,7 +1,7 @@
 // Session + UI state, and the actions on the explorer panes (their state lives in ./panes.ts).
 // Transfers live in ./transfers.ts.
 
-import { useContext } from "react";
+import { useContext, useSyncExternalStore } from "react";
 import { create } from "zustand";
 import * as api from "../lib/api";
 import type { AddedBucket, AppError, BatchPreview, Bucket, ConnectionConfig, ConnectionInfo, FolderEntry, JobItem, JobRequest, LocalEntry, ObjectEntry, ObjectVersion } from "../lib/types";
@@ -25,6 +25,9 @@ import {
   PANE_IDS,
   PaneContext,
   paneHasLocation,
+  entryIndex,
+  folderId,
+  objectId,
   DEFAULT_SORT,
   S3_SOURCE,
   tabEntry,
@@ -199,14 +202,30 @@ export function setActivePane(id: PaneId) {
 /** The pane a component renders in, or the active pane outside one. */
 export function usePaneId(): PaneId {
   const ctx = useContext(PaneContext);
-  const active = useApp((s) => s.activePane);
-  return ctx ?? active;
+  // Inside a pane the id never changes: no subscription to the active pane (switching panes must
+  // not re-render every component of both panes, see "Performance budget" in docs/CONTRACT.md).
+  return useApp((s) => ctx ?? s.activePane);
 }
 
-/** Subscribe to a slice of this component's pane (see usePaneId). */
+const subscribePanes = (cb: () => void) => usePanes.subscribe(cb);
+const subscribePanesAndActive = (cb: () => void) => {
+  const offPanes = usePanes.subscribe(cb);
+  const offApp = useApp.subscribe(cb);
+  return () => {
+    offPanes();
+    offApp();
+  };
+};
+
+/**
+ * Subscribe to a slice of this component's pane (see usePaneId). Outside a pane the slice is read
+ * from the active pane, and the component re-renders only when the slice itself changes (not on
+ * every switch of the active pane). The selector must return a stable value, as with any store hook.
+ */
 export function usePane<T>(selector: (p: PaneState) => T): T {
-  const id = usePaneId();
-  return usePanes((s) => selector(s[id]));
+  const ctx = useContext(PaneContext);
+  const snapshot = () => selector(usePanes.getState()[ctx ?? get().activePane]);
+  return useSyncExternalStore(ctx ? subscribePanes : subscribePanesAndActive, snapshot, snapshot);
 }
 
 const listSeq: Record<PaneId, number> = { a: 0, b: 0 };
@@ -965,15 +984,21 @@ export function matchesFilter(name: string, filter: string): boolean {
 export function setFilter(filter: string, pane: PaneId = activePane()) {
   setPane(pane, (s) => {
     if (!s.selection.size && !s.anchor && !s.focus) return { filter };
-    const visible = new Set<string>();
-    for (const f of s.listing.folders) if (matchesFilter(f.name, filter)) visible.add(f.prefix);
-    for (const o of s.listing.objects) if (matchesFilter(o.name, filter)) visible.add(o.key);
-    const selection = new Set([...s.selection].filter((id) => visible.has(id)));
+    // Selection-sized: only the selected ids (and the anchor and focus) are looked up by name.
+    const folders = entryIndex(s.listing.folders, folderId);
+    const objects = entryIndex(s.listing.objects, objectId);
+    const visible = (id: string) => {
+      const f = folders.get(id);
+      if (f !== undefined && matchesFilter(s.listing.folders[f].name, filter)) return true;
+      const o = objects.get(id);
+      return o !== undefined && matchesFilter(s.listing.objects[o].name, filter);
+    };
+    const selection = new Set([...s.selection].filter(visible));
     return {
       filter,
       selection: selection.size === s.selection.size ? s.selection : selection,
-      anchor: s.anchor && visible.has(s.anchor) ? s.anchor : null,
-      focus: s.focus && visible.has(s.focus) ? s.focus : null,
+      anchor: s.anchor && visible(s.anchor) ? s.anchor : null,
+      focus: s.focus && visible(s.focus) ? s.focus : null,
     };
   });
 }

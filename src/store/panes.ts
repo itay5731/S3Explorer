@@ -248,3 +248,27 @@ export function markHiddenTabsStale(test: (bucket: string, prefix: string) => bo
 
 /** The pane a component is rendered in; null outside a pane (it then follows the active pane). */
 export const PaneContext = createContext<PaneId | null>(null);
+
+// ---- listing lookups -----------------------------------------------------------------------
+
+export const folderId = (f: FolderEntry) => f.prefix;
+export const objectId = (o: ObjectEntry) => o.key;
+
+const entryIndexes = new WeakMap<readonly unknown[], Map<string, number>>();
+
+/**
+ * Where each entry of a listing array is, by id (a folder's prefix, an object's key; the first one
+ * wins). Built once per array, so selection-sized work never scans the whole listing again.
+ */
+export function entryIndex<T>(entries: readonly T[], id: (t: T) => string): Map<string, number> {
+  let m = entryIndexes.get(entries);
+  if (!m) {
+    m = new Map();
+    for (let i = 0; i < entries.length; i++) {
+      const k = id(entries[i]);
+      if (!m.has(k)) m.set(k, i);
+    }
+    entryIndexes.set(entries, m);
+  }
+  return m;
+}

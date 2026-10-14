@@ -46,8 +46,8 @@ export async function pickAndUpload() {
   }
 }
 
-export async function downloadObjects(selected: ObjectEntry[]) {
-  const { bucket } = getPane();
+/** Download objects of `bucket` (default: the active pane's; the newest files name theirs). */
+export async function downloadObjects(selected: ObjectEntry[], bucket: string | null = getPane().bucket) {
   if (!bucket || !selected.length) return;
   // Archived objects that aren't restored can't be read: left out, with the reason.
   const { readable: objects, blocked } = await splitReadable(bucket, selected);

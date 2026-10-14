@@ -302,8 +302,8 @@ export function Toolbar() {
   const prefix = usePane((s) => s.prefix);
   const loading = usePane((s) => s.listing.loading);
   const detailsOpen = useApp((s) => s.detailsOpen);
-  // What the explorer shows: the panel only while the active pane has a bucket open (Explorer.tsx).
-  const detailsShown = detailsOpen && !!bucket;
+  // What the explorer shows: the panel while the active pane has a bucket or a local folder open (Explorer.tsx).
+  const detailsShown = detailsOpen && (!!bucket || local);
   const searchOpen = usePaneSearch((s) => s.open);
   const searching = usePaneSearch((s) => s.loading);
   const sel = useSelectionInfo();

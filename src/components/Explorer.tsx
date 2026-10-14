@@ -1,8 +1,8 @@
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { Fragment, memo, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { ChevronDown, Globe, LogOut, MapPin, UploadCloud } from "lucide-react";
 import * as api from "../lib/api";
-import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNarrow, useApp, writePref } from "../store/app";
-import { isLocalPane, PaneContext, PANE_IDS, usePanes, type PaneId } from "../store/panes";
+import { activePane, getPane, readPref, requestDisconnect, setActivePane, setNarrow, useApp, usePane, writePref } from "../store/app";
+import { isLocalPane, PaneContext, PANE_IDS, paneHasLocation, usePanes, type PaneId } from "../store/panes";
 import { installCrossEffects } from "../store/cross";
 import { LocalPathBar, PathEditField, SourceButton, SourceMenu, usePathEditing } from "./LocalPane";
 import { onExplorerKeyDown, onExplorerMouseDown } from "../store/keyActions";
@@ -167,8 +167,21 @@ function useKeyDispatcher() {
   }, []);
 }
 
-/** One explorer pane: its tab strip, its path bar and its table (or search results), and the OS-drop overlay. */
-function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
+// The pane's parts, memoised: they read their own state, so a re-render of the pane shell (it marks
+// itself active or inactive) never reaches the table, the path bar or the tab strip.
+const TabStripM = memo(TabStrip);
+const SourceButtonM = memo(SourceButton);
+const PathEditFieldM = memo(PathEditField);
+const LocalPathBarM = memo(LocalPathBar);
+const BreadcrumbsM = memo(Breadcrumbs);
+const SearchResultsM = memo(SearchResults);
+const ObjectTableM = memo(ObjectTable);
+
+/**
+ * One explorer pane: its tab strip, its path bar and its table (or search results), and the OS-drop
+ * overlay. Memoised, and so are its children: switching the active pane re-renders this shell only.
+ */
+const Pane = memo(function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
   const bucket = usePanes((s) => s[id].bucket);
   const prefix = usePanes((s) => s[id].prefix);
   const searchOpen = usePanes((s) => s[id].search.open) && bucket !== null;
@@ -188,19 +201,19 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
         onPointerDownCapture={() => setActivePane(id)}
         onFocusCapture={() => setActivePane(id)}
       >
-        <TabStrip pane={id} />
+        <TabStripM pane={id} />
         {editing ? (
           <div className="breadcrumbs editing">
-            <SourceButton pane={id} />
-            <PathEditField pane={id} />
+            <SourceButtonM pane={id} />
+            <PathEditFieldM pane={id} />
           </div>
         ) : local ? (
-          <LocalPathBar />
+          <LocalPathBarM />
         ) : (
-          bucket && <Breadcrumbs />
+          bucket && <BreadcrumbsM />
         )}
         <div className="table-wrap">
-          {searchOpen ? <SearchResults /> : <ObjectTable />}
+          {searchOpen ? <SearchResultsM /> : <ObjectTableM />}
           {dropping && (
             <div className={`drop-overlay ${bucket ? "" : "disabled"}`}>
               <div className="drop-card">
@@ -222,7 +235,7 @@ function Pane({ id, dropping }: { id: PaneId; dropping: boolean }) {
       </section>
     </PaneContext.Provider>
   );
-}
+});
 
 const SIDEBAR_WIDTH_KEY = "s3x.sidebarWidth";
 const SIDEBAR_MIN = 200;
@@ -284,17 +297,21 @@ function useToolbarHeightVar(main: RefObject<HTMLElement | null>) {
 }
 
 export function Explorer() {
-  const active = useApp((s) => s.activePane);
-  const shown = useApp((s) => s.split && !s.narrow);
-  // The details panel waits for an open bucket (the toolbar and search row are there from the start).
-  const bucket = usePanes((s) => s[active].bucket);
-  const detailsOpen = useApp((s) => s.detailsOpen) && bucket !== null;
+  // The active pane matters here only in single view (which pane is shown): in split view switching
+  // panes must not re-render the whole explorer.
+  const single = useApp((s) => (s.split && !s.narrow ? null : s.activePane));
+  const shown = single === null;
+  // The details panel waits for an open bucket or local folder (the toolbar and search row are there
+  // from the start). It stays mounted for a local pane (it says details are for S3 panes), so
+  // switching between an S3 and a local pane never reflows the workspace.
+  const located = usePane((s) => paneHasLocation(s));
+  const detailsOpen = useApp((s) => s.detailsOpen) && located;
   const dropTarget = useFileDrop();
   const sidebar = useSidebarResize();
   const main = useNarrowWatch();
   useKeyDispatcher();
   // Two panes side by side, or only the active one.
-  const panes = shown ? PANE_IDS : [active];
+  const panes = single === null ? PANE_IDS : [single];
 
   useEffect(() => installTransferEffects(), []);
   useEffect(() => installJobEffects(), []);

@@ -2124,7 +2124,7 @@ input[type="checkbox"] {
   display: flex;
   flex-direction: column;
   gap: 1px;
-  /* Every file the scan returned (up to 200) is listed; the list fills the section and scrolls. */
+  /* The first rows of the scan (up to 200) are listed, more on "Show more"; the list fills the section and scrolls. */
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -2132,6 +2132,11 @@ input[type="checkbox"] {
 .recent-row {
   position: relative;
   flex: none;
+}
+.recent-more {
+  flex: none;
+  padding: 4px 8px 6px;
+  font-size: 12px;
 }
 .recent-item {
   display: flex;
@@ -6852,9 +6857,6 @@ mark.hl {
   container-name: pane;
   outline: none;
 }
-.panes.split .pane .breadcrumbs {
-  transition: background 0.12s, box-shadow 0.12s;
-}
 .panes.split .pane.active .breadcrumbs {
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   box-shadow: inset 0 2px 0 var(--accent);
@@ -6867,9 +6869,9 @@ mark.hl {
   pointer-events: none;
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
 }
+/* Static dimming, no transition: switching panes (Tab) shows the new state on the next frame. */
 .panes.split .pane.inactive > * {
   opacity: 0.78;
-  transition: opacity 0.12s;
 }
 .panes.split .pane.inactive:hover > * {
   opacity: 0.9;

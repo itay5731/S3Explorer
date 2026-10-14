@@ -3,8 +3,8 @@
 import { useMemo } from "react";
 import { create } from "zustand";
 import type { FolderEntry, ObjectEntry, SearchHit } from "../lib/types";
-import { activePane, getPane, matchesFilter, usePaneId, type PaneId, type SortState } from "./app";
-import { isLocalPane, usePanes, type PaneState } from "./panes";
+import { activePane, getPane, usePaneId, type PaneId, type SortState } from "./app";
+import { entryIndex, folderId, isLocalPane, objectId, usePanes, type PaneState } from "./panes";
 import { hitId, usePaneSearch } from "./search";
 import { folderSizeId, useFolderSizes } from "./folderSizes";
 import { localSizeKey, useLocalSizes } from "./localSizes";
@@ -43,31 +43,25 @@ export type Row =
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
-interface RowsCache {
+// ---- rows: sorted once per listing and order, then filtered --------------------------------------
+// Sorting is the expensive part (a collator compare per comparison), so a listing is sorted once per
+// sort order and the sorted rows are kept with the listing (keyed by its `objects` array, so a listing
+// that is replaced lets its rows go). The quick filter then only scans the sorted rows: typing in the
+// search box, or showing a tab whose listing was sorted before, never sorts again.
+
+interface SortedRows {
   folders: FolderEntry[];
-  objects: ObjectEntry[];
-  filter: string;
-  sort: SortState;
   /** The sizes' version the rows were sorted with (only matters for the Size sort). */
   sizes: number;
   rows: Row[];
+  /** The rows' names, lower-cased, for the filter. */
+  lower: string[];
 }
 
-/** One cache per pane, so two panes never evict each other's rows. */
-const caches: Record<PaneId, RowsCache | null> = { a: null, b: null };
+const sortedByListing = new WeakMap<ObjectEntry[], Map<string, SortedRows>>();
 
-export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filter: string, sort: SortState, pane: PaneId): Row[] {
-  const cache = caches[pane];
-  const sizes = sort.key === "size" ? useSizesVersion.getState().v : -1;
-  if (cache && cache.folders === folders && cache.objects === objects && cache.filter === filter && cache.sort === sort && cache.sizes === sizes) {
-    return cache.rows;
-  }
-  const match = (name: string) => matchesFilter(name, filter);
-  const fr: Row[] = [];
-  for (const folder of folders) if (match(folder.name)) fr.push({ kind: "folder", id: folder.prefix, name: folder.name, folder });
-  const or: Row[] = [];
-  for (const object of objects) if (match(object.name)) or.push({ kind: "object", id: object.key, name: object.name, object });
-
+function sortRows(folders: FolderEntry[], objects: ObjectEntry[], sort: SortState, pane: PaneId): Row[] {
+  const fr: Row[] = folders.map((folder) => ({ kind: "folder", id: folder.prefix, name: folder.name, folder }));
   const dir = sort.dir;
   const byName = (a: Row, b: Row) => collator.compare(a.name, b.name);
   if (sort.key === "size") {
@@ -85,32 +79,87 @@ export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filt
     // Folders have no date or class: they sort by name.
     fr.sort((a, b) => (sort.key === "name" ? dir : 1) * byName(a, b));
   }
-  const val = (r: Row): number | string => {
-    if (r.kind !== "object") return 0;
-    switch (sort.key) {
-      case "size":
-        return r.object.size;
-      case "modified":
-        return r.object.lastModified ? Date.parse(r.object.lastModified) : 0;
-      case "class":
-        return r.object.storageClass ?? "";
-      default:
-        return 0;
-    }
-  };
+  let or: Row[];
   if (sort.key === "name") {
+    or = objects.map((object) => ({ kind: "object", id: object.key, name: object.name, object }));
     or.sort((a, b) => dir * byName(a, b));
   } else {
-    or.sort((a, b) => {
-      const va = val(a);
-      const vb = val(b);
+    // Each row's sort value is computed once (a date is parsed once, not in every comparison).
+    const val = (o: ObjectEntry): number | string => {
+      switch (sort.key) {
+        case "size":
+          return o.size;
+        case "modified":
+          return o.lastModified ? Date.parse(o.lastModified) : 0;
+        case "class":
+          return o.storageClass ?? "";
+        default:
+          return 0;
+      }
+    };
+    const items = objects.map((object) => ({ row: { kind: "object", id: object.key, name: object.name, object } as Row, v: val(object) }));
+    items.sort((a, b) => {
+      const va = a.v;
+      const vb = b.v;
       const c = typeof va === "number" && typeof vb === "number" ? va - vb : collator.compare(String(va), String(vb));
-      return c !== 0 ? dir * c : byName(a, b);
+      return c !== 0 ? dir * c : byName(a.row, b.row);
     });
+    or = items.map((x) => x.row);
   }
-  const rows = fr.concat(or);
-  caches[pane] = { folders, objects, filter, sort, sizes, rows };
+  return fr.concat(or);
+}
+
+/** A listing's rows in a sort order, sorted on first use and kept with the listing. */
+function sortedRows(folders: FolderEntry[], objects: ObjectEntry[], sort: SortState, pane: PaneId): SortedRows {
+  const sizes = sort.key === "size" ? useSizesVersion.getState().v : -1;
+  const order = sort.key + ":" + sort.dir;
+  let byOrder = sortedByListing.get(objects);
+  if (!byOrder) sortedByListing.set(objects, (byOrder = new Map()));
+  const hit = byOrder.get(order);
+  if (hit && hit.folders === folders && hit.sizes === sizes) return hit;
+  const rows = sortRows(folders, objects, sort, pane);
+  const entry: SortedRows = { folders, sizes, rows, lower: rows.map((r) => r.name.toLowerCase()) };
+  byOrder.set(order, entry);
+  return entry;
+}
+
+/** The filtered rows of each pane, so an unchanged view returns the same array (stable for React). */
+const filtered: Record<PaneId, { base: Row[]; filter: string; rows: Row[] } | null> = { a: null, b: null };
+
+export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filter: string, sort: SortState, pane: PaneId): Row[] {
+  const base = sortedRows(folders, objects, sort, pane);
+  // The same rule as matchesFilter (app.ts): a case-insensitive substring of the name.
+  const f = filter.trim().toLowerCase();
+  if (!f) return base.rows;
+  const cache = filtered[pane];
+  if (cache && cache.base === base.rows && cache.filter === f) return cache.rows;
+  const rows: Row[] = [];
+  for (let i = 0; i < base.rows.length; i++) if (base.lower[i].includes(f)) rows.push(base.rows[i]);
+  filtered[pane] = { base: base.rows, filter: f, rows };
   return rows;
+}
+
+const rowIndexes = new WeakMap<Row[], Map<string, number>>();
+
+/** The index of a row by id in a rows array (as returned by computeRows), or -1. Built once per array. */
+export function rowIndex(rows: Row[], id: string | null | undefined): number {
+  if (id === null || id === undefined) return -1;
+  let m = rowIndexes.get(rows);
+  if (!m) {
+    m = new Map();
+    for (let i = 0; i < rows.length; i++) if (!m.has(rows[i].id)) m.set(rows[i].id, i);
+    rowIndexes.set(rows, m);
+  }
+  return m.get(id) ?? -1;
+}
+
+const rowNameLists = new WeakMap<Row[], string[]>();
+
+/** The rows' names (for type-to-jump), built once per rows array. */
+export function rowNames(rows: Row[]): string[] {
+  let names = rowNameLists.get(rows);
+  if (!names) rowNameLists.set(rows, (names = rows.map((r) => r.name)));
+  return names;
 }
 
 /** Hook: the rows of a pane (default: this component's pane, see usePaneId). */
@@ -155,11 +204,23 @@ export function getSelected(pane: PaneId = activePane()): { folders: FolderEntry
   const { selection, listing, search } = getPane(pane);
   if (search.open) return selectedHits(search.selection, search.result?.hits ?? []);
   if (!selection.size) return { folders: [], objects: [] };
-  const visible = new Set(getViewRows(pane).map((r) => r.id));
-  return {
-    folders: listing.folders.filter((f) => selection.has(f.prefix) && visible.has(f.prefix)),
-    objects: listing.objects.filter((o) => selection.has(o.key) && visible.has(o.key)),
-  };
+  // Selection-sized: each selected id is looked up (a visible row, its place in the listing), then
+  // the entries are put back in listing order.
+  const rows = getViewRows(pane);
+  const fIdx = entryIndex(listing.folders, folderId);
+  const oIdx = entryIndex(listing.objects, objectId);
+  const fi: number[] = [];
+  const oi: number[] = [];
+  for (const id of selection) {
+    if (rowIndex(rows, id) < 0) continue;
+    const f = fIdx.get(id);
+    if (f !== undefined) fi.push(f);
+    const o = oIdx.get(id);
+    if (o !== undefined) oi.push(o);
+  }
+  fi.sort((x, y) => x - y);
+  oi.sort((x, y) => x - y);
+  return { folders: fi.map((i) => listing.folders[i]), objects: oi.map((i) => listing.objects[i]) };
 }
 
 /** Hook: counts of selected visible folders/objects (same rule as getSelected, results included). */
@@ -211,7 +272,15 @@ function summarize(selection: Set<string>, rows: Row[]) {
   let singleFolder: FolderEntry | null = null;
   let singleObject: ObjectEntry | null = null;
   if (selection.size) {
-    for (const r of rows) {
+    // Loop over the smaller of the two: a few selected rows of a big listing are looked up by id.
+    const picked: Row[] = [];
+    if (selection.size < rows.length) {
+      for (const id of selection) {
+        const i = rowIndex(rows, id);
+        if (i >= 0) picked.push(rows[i]);
+      }
+    }
+    for (const r of selection.size < rows.length ? picked : rows) {
       if (!selection.has(r.id)) continue;
       if (r.kind === "folder") {
         folders++;

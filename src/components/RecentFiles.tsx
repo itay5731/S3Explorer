@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Download, RefreshCw, Search, X } from "lucide-react";
 import type { ObjectEntry } from "../lib/types";
 import { extension, formatExact, formatRelative } from "../lib/format";
 import { downloadObjects } from "../store/actions";
-import { readPref, revealObject, useApp, usePane, writePref } from "../store/app";
+import { onBucketForgotten, readPref, revealObject, useApp, usePane, writePref } from "../store/app";
+import { isLocalPane } from "../store/panes";
 import { onJobUpdate } from "../store/jobs";
 import { isBatchActive, onBatchUpdate } from "../store/batches";
 import { forgetRecent, loadRecent, showRecent, useRecent } from "../store/recent";
@@ -24,13 +25,33 @@ type RangeId = (typeof RANGES)[number]["id"];
 const DEFAULT_RANGE: RangeId = "day";
 /** How long to wait after an upload finishes before scanning again (ms). */
 const RESCAN_DELAY_MS = 800;
+/** Rows rendered at first (and added by each "Show more"): the list holds up to 200. */
+const PAGE_ROWS = 40;
 
 /**
  * The lower part of the sidebar: the files most recently added to the open bucket, wherever they
  * are in it, so a fresh upload or build can be reached without browsing down to it.
  */
 export function RecentFiles() {
-  const bucket = usePane((s) => s.bucket);
+  const paneBucket = usePane((s) => s.bucket);
+  const paneLocal = usePane((s) => isLocalPane(s));
+  // While the active pane shows this computer, the list stays on the last S3 bucket shown (switching
+  // between a local and an S3 pane must not tear the list down and build it again).
+  const connection = useApp((s) => s.connection);
+  const kept = useRef<{ connection: unknown; bucket: string | null }>({ connection, bucket: null });
+  if (kept.current.connection !== connection) kept.current = { connection, bucket: null };
+  if (paneBucket) kept.current.bucket = paneBucket;
+  const bucket = paneBucket ?? (paneLocal ? kept.current.bucket : null);
+  const [, forceRender] = useReducer((n: number) => n + 1, 0);
+  useEffect(
+    () =>
+      onBucketForgotten((b) => {
+        if (kept.current.bucket !== b) return;
+        kept.current.bucket = null;
+        forceRender();
+      }),
+    [],
+  );
   const recent = useRecent();
   const [filter, setFilter] = useState("");
   const [rangeId, setRangeId] = useState(() => readPref<RangeId | null>(RANGE_KEY, DEFAULT_RANGE));
@@ -52,7 +73,6 @@ export function RecentFiles() {
     return () => void filters.current.set(bucket, latest.current);
   }, [bucket]);
   // A new connection starts over.
-  const connection = useApp((s) => s.connection);
   useEffect(() => filters.current.clear(), [connection]);
 
   // An upload into the open bucket is new by definition, and a copy, move, delete or tag job there
@@ -107,20 +127,75 @@ export function RecentFiles() {
   const wanted = filter.trim().toLowerCase();
   // No range chosen (or a saved id from an older build that no longer exists) means no time limit.
   const range = RANGES.find((r) => r.id === rangeId) ?? null;
-  const since = range ? Date.now() - range.hours * HOUR_MS : null;
-  // A file without a date cannot be placed in a time range, so it shows only without one.
-  const inRange = recent.objects.filter(
-    (o) => since === null || (o.lastModified !== null && Date.parse(o.lastModified) >= since),
+  // Recomputed only when the scan, the range (checked once a minute) or the filters change.
+  const minute = Math.floor(Date.now() / 60_000);
+  const inRange = useMemo(() => {
+    const since = range ? Date.now() - range.hours * HOUR_MS : null;
+    // A file without a date cannot be placed in a time range, so it shows only without one.
+    return recent.objects.filter((o) => since === null || (o.lastModified !== null && Date.parse(o.lastModified) >= since));
+    // `minute` moves the range forward as time passes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recent.objects, range, minute]);
+  const shown = useMemo(
+    () => inRange.filter((o) => (!wanted || o.key.toLowerCase().includes(wanted)) && (types.size === 0 || types.has(extension(o.name)))),
+    [inRange, wanted, types],
   );
-  const shown = inRange.filter(
-    (o) => (!wanted || o.key.toLowerCase().includes(wanted)) && (types.size === 0 || types.has(extension(o.name))),
-  );
+  // The first rows only (the sidebar shows a handful at a time); "Show more" adds a page. Starts over
+  // with another bucket, search, type or range.
+  const [limit, setLimit] = useState(PAGE_ROWS);
+  useEffect(() => setLimit(PAGE_ROWS), [bucket, wanted, types, rangeId]);
   /**
    * For the type filter: how many files in the chosen time range have each extension. A chosen
    * type stays listed with 0 when the range has none of it, so it can still be unticked.
    */
-  const typeCounts = new Map<string, number>([...types].map((ext) => [ext, 0]));
-  for (const o of inRange) typeCounts.set(extension(o.name), (typeCounts.get(extension(o.name)) ?? 0) + 1);
+  const typeCounts = useMemo(() => {
+    const counts = new Map<string, number>([...types].map((ext) => [ext, 0]));
+    for (const o of inRange) counts.set(extension(o.name), (counts.get(extension(o.name)) ?? 0) + 1);
+    return counts;
+  }, [inRange, types]);
+
+  // The rows are built only when what they show changes (not on every switch of the active pane).
+  const list = useMemo(
+    () => (
+      <ul className="recent-list">
+        {shown.slice(0, limit).map((o) => (
+          <li key={o.key} className="recent-row">
+            <button
+              className="recent-item"
+              onClick={() => show(o)}
+              title={`${o.key}\n${formatExact(o.lastModified)}`}
+            >
+              <FileIcon name={o.name} size={14} />
+              <span className="recent-text">
+                <span className="recent-name">{o.name}</span>
+                {/* The folder the file is in: its key without the file name. */}
+                <span className="recent-path">{o.key.slice(0, o.key.length - o.name.length) || "Top of the bucket"}</span>
+              </span>
+              <span className="recent-when">{formatRelative(o.lastModified)}</span>
+            </button>
+            <button
+              className="icon-btn recent-download"
+              onClick={() => void downloadObjects([o], bucket)}
+              aria-label={`Download ${o.name}`}
+              title="Download"
+            >
+              <Download size={13} />
+            </button>
+          </li>
+        ))}
+        {shown.length > limit && (
+          <li className="recent-more">
+            <button type="button" className="link-btn" onClick={() => setLimit((n) => n + PAGE_ROWS)}>
+              Show more ({shown.length - limit} more)
+            </button>
+          </li>
+        )}
+      </ul>
+    ),
+    // `show` and the download read only `bucket`.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [shown, limit, bucket],
+  );
 
   return (
     <section className="recent">
@@ -186,33 +261,7 @@ export function RecentFiles() {
           {range ? ` in the last ${range.label}.` : "."}
         </p>
       ) : (
-        <ul className="recent-list">
-          {shown.map((o) => (
-            <li key={o.key} className="recent-row">
-              <button
-                className="recent-item"
-                onClick={() => show(o)}
-                title={`${o.key}\n${formatExact(o.lastModified)}`}
-              >
-                <FileIcon name={o.name} size={14} />
-                <span className="recent-text">
-                  <span className="recent-name">{o.name}</span>
-                  {/* The folder the file is in: its key without the file name. */}
-                  <span className="recent-path">{o.key.slice(0, o.key.length - o.name.length) || "Top of the bucket"}</span>
-                </span>
-                <span className="recent-when">{formatRelative(o.lastModified)}</span>
-              </button>
-              <button
-                className="icon-btn recent-download"
-                onClick={() => void downloadObjects([o])}
-                aria-label={`Download ${o.name}`}
-                title="Download"
-              >
-                <Download size={13} />
-              </button>
-            </li>
-          ))}
-        </ul>
+        list
       )}
       {current && recent.truncated && (
         <p className="recent-note">Only the first 20,000 files were checked, so newer ones may be missing.</p>

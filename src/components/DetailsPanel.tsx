@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { ArchiveRestore, ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, RefreshCw, Snowflake, Trash2, X, Files, AlertCircle, Tags, FileCog } from "lucide-react";
+import { ArchiveRestore, ChevronRight, Copy, Download, FolderDown, FolderOpen, Loader2, MousePointerClick, HardDrive, RefreshCw, Snowflake, Trash2, X, Files, AlertCircle, Tags, FileCog } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ObjectMeta } from "../lib/types";
 import { navigate, openModal, setDetailsOpen, usePane } from "../store/app";
+import { isLocalPane } from "../store/panes";
 import { requestBulkTags, requestDelete, requestRestoreArchived } from "../store/ops";
 import { ARCHIVED_REASON, isArchiveClass, rememberArchiveMeta, useArchiveBlocked } from "../store/archive";
 import { bumpObject, useObjectRev } from "../store/versions";
@@ -141,46 +142,43 @@ function ObjectTagsSection({ bucket, objKey }: { bucket: string; objKey: string 
 export function DetailsPanel() {
   const bucket = usePane((s) => s.bucket);
   const prefix = usePane((s) => s.prefix);
+  // v0.9.0: the panel stays in place for a local pane (no reflow when switching panes); it has no details there.
+  const local = usePane((s) => isLocalPane(s));
   const sel = useSelectionInfo();
   const obj = sel.object;
-  const [meta, setMeta] = useState<ObjectMeta | null>(null);
-  const [metaError, setMetaError] = useState<AppError | null>(null);
-  const [loading, setLoading] = useState(false);
   // The technical fields (storage class, ETag, metadata…) stay folded until asked for.
   const [showMore, setShowMore] = useState(false);
 
   const objKey = obj?.key ?? null;
   // Bumped after a version is restored or deleted, or a restore is requested: read the metadata again.
   const rev = useObjectRev(bucket ?? "", objKey ?? "");
-  const shownFor = useRef<string | null>(null);
+  const objId = bucket && objKey ? `${bucket}/${objKey}` : null;
+  // The last HeadObject answer and what it was for. Derived, not reset in an effect: showing another
+  // object (another row, or switching panes) costs one render, not a second one to clear the state.
+  // A new object shows nothing until its read answers; the same object being read again (a new
+  // revision) keeps its old metadata meanwhile.
+  const [read, setRead] = useState<{ id: string | null; rev: number; meta: ObjectMeta | null; error: AppError | null }>({ id: null, rev: -1, meta: null, error: null });
+  const meta = read.id === objId ? read.meta : null;
+  const metaError = read.id === objId ? read.error : null;
+  const loading = objId !== null && (read.id !== objId || read.rev !== rev);
   useEffect(() => {
-    const id = bucket && objKey ? `${bucket}/${objKey}` : null;
-    // A new object starts empty; the same object being read again keeps its old metadata meanwhile.
-    if (shownFor.current !== id) {
-      setMeta(null);
-      setMetaError(null);
-      shownFor.current = id;
-    }
     if (!bucket || !objKey) return;
+    const id = `${bucket}/${objKey}`;
     let cancelled = false;
-    setLoading(true);
     const t = setTimeout(() => {
       api
         .headObject(bucket, objKey)
         .then((m) => {
           rememberArchiveMeta(bucket, m);
-          if (!cancelled) {
-            setMeta(m);
-            setMetaError(null);
-          }
+          if (!cancelled) setRead({ id, rev, meta: m, error: null });
         })
-        .catch((e: AppError) => !cancelled && setMetaError(e))
-        .finally(() => !cancelled && setLoading(false));
+        .catch((e: AppError) => {
+          if (!cancelled) setRead((prev) => ({ id, rev, meta: prev.id === id ? prev.meta : null, error: e }));
+        });
     }, 120); // debounce while arrowing through rows
     return () => {
       cancelled = true;
       clearTimeout(t);
-      setLoading(false);
     };
   }, [bucket, objKey, rev]);
   const blocked = useArchiveBlocked(bucket, obj);
@@ -196,7 +194,15 @@ export function DetailsPanel() {
   );
 
   let body: ReactNode;
-  if (!bucket) {
+  if (local) {
+    body = (
+      <div className="dempty">
+        <HardDrive size={28} strokeWidth={1.25} />
+        <div>Details are for S3 panes</div>
+        <div className="muted small">This pane shows this computer.</div>
+      </div>
+    );
+  } else if (!bucket) {
     body = (
       <div className="dempty">
         <MousePointerClick size={28} strokeWidth={1.25} />
