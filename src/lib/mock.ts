@@ -1062,7 +1062,7 @@ function startSim(
   localPath: string,
   size: number,
   failMessage?: string,
-  opts: { batchId?: string; durationMs?: number } = {},
+  opts: { batchId?: string; durationMs?: number; etag?: string | null } = {},
 ): string {
   const id = `mock-${++idSeq}-${hex(6)}`;
   const { partBytes: partSize, parts } = planParts(kind, settings.partSizeMib, size);
@@ -1082,6 +1082,8 @@ function startSim(
     error: null,
     startedAt: new Date().toISOString(),
     finishedAt: null,
+    // v0.9.0: the ETag a download is pinned to.
+    etag: kind === "download" ? (opts.etag ?? null) : null,
   };
   sims.set(id, {
     t,
@@ -1435,7 +1437,8 @@ function batchTick() {
     while (sim.active.size < settings.maxConcurrentTransfers && sim.pos < files.length) {
       const f = files[sim.pos++];
       const durationMs = Math.min(8000, 350 + (f.size / (40 * MB)) * 1000);
-      const tid = startSim(sim.req.kind, sim.req.bucket, f.key, f.local, f.size, batchFailMessage(sim.req, f), { batchId: b.id, durationMs });
+      const etag = sim.req.kind === "download" ? (buckets.get(sim.req.bucket)?.objects.get(f.key)?.etag ?? null) : null;
+      const tid = startSim(sim.req.kind, sim.req.bucket, f.key, f.local, f.size, batchFailMessage(sim.req, f), { batchId: b.id, durationMs, etag });
       sim.active.set(tid, f);
       sim.transferIds.push(tid);
     }
@@ -1541,6 +1544,8 @@ const JOB_LIST_PER_TICK = 700; // keys "listed" per 100 ms while in the listing 
 interface JobWork {
   src: string;
   dest: string | null;
+  /** v0.9.0, delete jobs: delete only while the object's ETag still matches (If-Match). */
+  etag?: string | null;
 }
 
 interface JobSim {
@@ -1888,7 +1893,7 @@ function listStep(sim: JobSim, budget: number): boolean {
   const add = (it: JobItem, key: string) => {
     if (sim.seenSrc.has(key)) return;
     sim.seenSrc.add(key);
-    sim.work.push({ src: key, dest: destKeyOf(it, key) });
+    sim.work.push({ src: key, dest: destKeyOf(it, key), etag: !it.isPrefix ? (it.etag ?? null) : null });
     sim.job.totalItems++;
     // A tag job moves no data: its byte counters stay 0.
     if (sim.req.kind !== "tag" && sim.req.kind !== "restore") sim.job.totalBytes += src.objects.get(key)?.size ?? 0;
@@ -1942,6 +1947,11 @@ function workOne(sim: JobSim, w: JobWork) {
   if (sim.req.kind === "delete") {
     if (src.readOnly) {
       jobError(sim, w.src, DENIED_WRITE);
+      return;
+    }
+    // Conditional delete (a move from S3 to this computer): an object rewritten meanwhile stays.
+    if (w.etag && w.etag.replace(/"/g, "") !== o.etag) {
+      jobError(sim, w.src, "PreconditionFailed: changed on S3, not deleted (it no longer matches the downloaded copy).");
       return;
     }
     recordDelete(src, w.src);
@@ -2670,7 +2680,7 @@ function mockListLocalDir(path: string, showHidden: boolean): LocalListing {
   const key = fsKey(path);
   const node = fsNodes.get(key);
   if (!node) throw fail("Io", `${path}: The system cannot find the path specified. (os error 3)`);
-  if (!node.isDir) throw fail("Io", `${path}: The directory name is invalid. (os error 267)`);
+  if (!node.isDir) throw invalid(`${path} is not a folder.`);
   if (linkInPath(path)) throw invalid(`${path} is a link or inside one; links are listed, never followed.`);
   if (node.unreadable) throw fail("Io", `${path}: Access is denied. (os error 5)`);
   const dirs: LocalEntry[] = [];
@@ -2857,6 +2867,8 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
     return n ? { ...n } : null;
   },
   addLocalFile: (path: string, size: number) => fsFile(path, size, { ageDays: 0 }),
+  /** A symlink / junction entry (listed as a file, never followed). */
+  addLocalLink: (path: string) => fsFile(path, 0, { ageDays: 0, isSymlink: true }),
   /** Transfers whose key (download) or local path (upload) contains this text fail (null: none). */
   setTransferFailPattern: (s: string | null) => {
     transferFailPattern = s;
@@ -3267,7 +3279,12 @@ export const mockBackend: Backend = {
     // Same checks as planning; the plan itself is redone in the batch's planning phase.
     validateBatchRequest(request);
     requireBucket(request.bucket);
-    if (request.kind === "upload" && fakeFolderTree(lastSegment(request.localPath)) === null) throw invalid(`${request.localPath} is not a folder`);
+    if (request.kind === "upload") {
+      // A folder of the fake local disk (local panes), else the named fixtures, as planBatch does.
+      const fsTree = fsFolderTree(request.localPath);
+      const tree = fsTree === "notdir" ? null : fsTree ?? fakeFolderTree(lastSegment(request.localPath));
+      if (tree === null) throw invalid(`${request.localPath} is not a folder`);
+    }
     if (request.kind === "upload" && /^huge$/i.test(lastSegment(request.localPath))) {
       throw invalid(
         `This folder has more than ${BATCH_LIMITS.maxFiles.toLocaleString()} files (60,000 found). A folder transfer can include at most ${BATCH_LIMITS.maxFiles.toLocaleString()} files and 1 TiB.`,
@@ -3435,7 +3452,7 @@ export const mockBackend: Backend = {
     const o = b.objects.get(key);
     if (!o) throw fail("NoSuchKey", `The key “${key}” does not exist.`);
     const injected = transferFailPattern && key.includes(transferFailPattern) ? "Network: the server closed the connection (after 3 attempts)." : undefined;
-    return startSim("download", bucket, key, destPath, o.size, needsRestore(bucket, key, o) ? ARCHIVED_MESSAGE : injected);
+    return startSim("download", bucket, key, destPath, o.size, needsRestore(bucket, key, o) ? ARCHIVED_MESSAGE : injected, { etag: o.etag });
   },
 
   async startUpload(bucket, key, srcPath) {

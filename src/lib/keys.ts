@@ -145,19 +145,6 @@ export const PRESETS: Readonly<Record<KeybindingsPreset, Readonly<Record<string,
   commander: Object.fromEntries(KEY_ACTIONS.map((x) => [x.id, COMMANDER_CHANGES[x.id] ?? x.defaults])),
 };
 
-export const PRESET_IDS: readonly KeybindingsPreset[] = ["commander", "classic"];
-
-export const PRESET_INFO: Record<KeybindingsPreset, { label: string; description: string }> = {
-  commander: {
-    label: "Total Commander",
-    description: "F5 / F6 copy / move to the other pane, Shift+F6 rename, F2 refresh, Alt+F1 / Alt+F2 choose a pane's source.",
-  },
-  classic: {
-    label: "Classic",
-    description: "The keys of S3 Explorer 0.8 and earlier: F5 refresh, F2 rename, Ctrl+Shift+C / X copy / move to the other pane.",
-  },
-};
-
 /** A preset id from untrusted input (a settings object, an import file); anything else is null. */
 export const asPreset = (v: unknown): KeybindingsPreset | null => (v === "commander" || v === "classic" ? v : null);
 

@@ -521,6 +521,9 @@ export function LocalRenameModal({ path, name: current, isDir }: { path: string;
   );
 }
 
+/** At most this many paths are listed in the recycle-bin confirmation (all of them are sent). */
+const TRASH_LIST_MAX = 200;
+
 /** Confirm moving exactly `paths` to the recycle bin (never a permanent delete). */
 export function LocalTrashModal({ paths, dirs }: { paths: string[]; dirs: number }) {
   const [busy, setBusy] = useState(false);
@@ -549,11 +552,12 @@ export function LocalTrashModal({ paths, dirs }: { paths: string[]; dirs: number
           <span>These exact paths go to the recycle bin</span>
         </div>
         <ol className="key-list mono" aria-label="Paths to move to the recycle bin">
-          {paths.map((p) => (
+          {paths.slice(0, TRASH_LIST_MAX).map((p) => (
             <li key={p}>
               <span className="key-text">{p}</span>
             </li>
           ))}
+          {n > TRASH_LIST_MAX && <li className="muted">… and {(n - TRASH_LIST_MAX).toLocaleString()} more</li>}
         </ol>
       </div>
       {dirs > 0 && (

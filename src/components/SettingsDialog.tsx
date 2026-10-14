@@ -343,7 +343,7 @@ const TABS: SettingsTab[] = [
       />
     ),
     // Unknown actions (from another version) are kept; only the known ones go back to their defaults.
-    // The preset stays: resetting means "the preset's keys", not "another preset".
+    // The installation's defaults (its internal preset) stay: resetting never changes them.
     reset: (d) => ({ ...d, keybindings: Object.fromEntries(Object.entries(d.keybindings).filter(([id]) => !ACTIONS_BY_ID.has(id))) }),
     atDefaults: (d) => Object.keys(d.keybindings).every((id) => !ACTIONS_BY_ID.has(id)),
   },

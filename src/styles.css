@@ -7544,68 +7544,6 @@ kbd {
 /* ==========================================================================
    v0.9.0: Commander mode (keybinding presets, local panes, editable path)
    ========================================================================== */
-.kb-preset {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.kb-preset-title {
-  font-weight: 600;
-  font-size: 13px;
-}
-.kb-preset-options {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-@media (max-width: 720px) {
-  .kb-preset-options {
-    grid-template-columns: minmax(0, 1fr);
-  }
-}
-.kb-preset-option {
-  display: flex;
-  gap: 9px;
-  align-items: flex-start;
-  padding: 9px 11px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border-strong);
-  background: var(--bg-elev);
-  cursor: pointer;
-  transition: border-color 0.12s, background 0.12s;
-}
-.kb-preset-option:hover {
-  background: var(--bg-hover);
-}
-.kb-preset-option.selected {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 9%, var(--bg-elev));
-}
-.kb-preset-option input[type="radio"] {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  margin: 2px 0 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  box-shadow: none;
-  accent-color: var(--accent);
-}
-.kb-preset-text {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-}
-.kb-preset-label {
-  font-weight: 600;
-}
-.kb-preset-desc {
-  color: var(--muted);
-  font-size: 12px;
-}
-
 /* The path bar's source button (S3 / this computer). */
 .source-btn {
   display: inline-flex;

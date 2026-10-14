@@ -168,12 +168,13 @@ export function CrossTransferModal({ planId }: { planId: number }) {
               <>
                 <strong>The downloaded objects will be deleted from S3 after the download finishes (only the ones that complete).</strong> For a folder,
                 that is each of its objects that was downloaded; the folder itself, anything added to it meanwhile, and anything that fails, is
-                cancelled or skipped stay in the bucket.
+                cancelled or skipped stay in the bucket. Cancelling the move later still deletes the objects whose download had already completed.
               </>
             ) : (
               <>
-                <strong>Moved to the recycle bin after upload:</strong> each file or folder above goes to the recycle bin of this computer once its upload
-                completes. Anything that fails, is cancelled or skipped stays where it is.
+                <strong>Moved to the recycle bin after upload:</strong> each file above, and each uploaded file of a folder above, goes to the recycle bin of this computer once its upload
+                completes (a folder's own files one by one; the folder itself stays). Anything that fails, is cancelled or skipped stays where it is.
+                Cancelling the move later still moves the files that had already been uploaded.
               </>
             )}
           </span>

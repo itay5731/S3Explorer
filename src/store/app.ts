@@ -714,7 +714,7 @@ async function loadLocal(pane: PaneId, keepSelection: boolean, reveal = false) {
 
 /** Every shown local pane whose directory is `dir` or holds `path` (case-insensitive) lists again. */
 export function refreshLocalPanesAt(path: string) {
-  const norm = (p: string) => p.replace(/[\/]+$/, "").toLowerCase();
+  const norm = (p: string) => p.replace(/[\\/]+$/, "").toLowerCase();
   const target = norm(path);
   for (const id of PANE_IDS) {
     const s = getPane(id);

@@ -15,6 +15,7 @@ import { isLocalPane, usePanes, type PaneId } from "./panes";
 import { getSelected } from "./view";
 import { toast } from "./toasts";
 import { copyText } from "./actions";
+import { tooMany } from "./ops";
 
 // ---- paths ---------------------------------------------------------------------------------------
 
@@ -228,6 +229,8 @@ export async function renameLocalEntry(path: string, newName: string): Promise<b
 export function requestLocalTrash(pane: PaneId = activePane()) {
   const sel = selectedLocal(pane);
   if (!sel.length) return;
+  // The same limit as a delete job: at most 10,000 paths in one go.
+  if (tooMany(sel.length, "move to the recycle bin")) return;
   openModal({ kind: "localTrash", paths: sel.map((e) => e.path), dirs: sel.filter((e) => e.isDir && !e.isSymlink).length });
 }
 
@@ -443,8 +446,9 @@ async function goToLocal(pane: PaneId, path: string): Promise<string | null> {
     return null;
   } catch (e) {
     const err = e as AppError;
-    // A relative, UNC or device path: the backend's own words.
-    if (err.code === "InvalidInput") return err.message;
+    // A UNC or device path, or one with "..": the backend's own words. Any other InvalidInput (a
+    // file is "not a directory" there, or a link) still tries the parent with the file selected.
+    if (err.code === "InvalidInput" && (/^(\\\\|\/\/)/.test(path) || path.split(/[\\/]/).includes(".."))) return err.message;
     // A file: open its folder with the file selected.
     const parent = typedParent(path);
     if (!parent) return err.message;

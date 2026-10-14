@@ -25,8 +25,6 @@ import {
   normalizeOverrides,
   parseImport,
   partialChord,
-  PRESET_IDS,
-  PRESET_INFO,
   type Bindings,
   type ImportResult,
   type KeyAction,
@@ -58,7 +56,7 @@ export function KeyboardTab({
   value: Bindings;
   preset: KeybindingsPreset;
   disabled: boolean;
-  /** New overrides, and the preset when it changes. */
+  /** New overrides, and the defaults' preset when an import names one (there is no preset control). */
   onChange(next: Bindings, preset?: KeybindingsPreset): void;
 }) {
   const bindings = useMemo(() => effectiveBindings(value, preset), [value, preset]);
@@ -199,28 +197,6 @@ export function KeyboardTab({
 
   return (
     <div className="set-panel-body kb-tab">
-      <div className="kb-preset" role="radiogroup" aria-label="Preset">
-        <span className="kb-preset-title">Preset</span>
-        <div className="kb-preset-options">
-          {PRESET_IDS.map((p) => (
-            <label key={p} className={`kb-preset-option ${preset === p ? "selected" : ""}`} data-preset={p}>
-              <input
-                type="radio"
-                name="kb-preset"
-                value={p}
-                checked={preset === p}
-                disabled={disabled}
-                onChange={() => onChange(value, p)}
-              />
-              <span className="kb-preset-text">
-                <span className="kb-preset-label">{PRESET_INFO[p].label}</span>
-                <span className="kb-preset-desc">{PRESET_INFO[p].description}</span>
-              </span>
-            </label>
-          ))}
-        </div>
-        <p className="set-desc small">Your own changes below stay as they are when you switch.</p>
-      </div>
       <div className="kb-toolbar">
         <p className="set-desc grow">
           Click <b>Record</b> and press the keys. Chords with Ctrl, Alt or an F-key also work while typing in a text box.
@@ -236,7 +212,7 @@ export function KeyboardTab({
           className="btn btn-sm"
           disabled={disabled || !anyKnownModified}
           onClick={() => onChange(Object.fromEntries(Object.entries(value).filter(([id]) => !ACTIONS_BY_ID.has(id))))}
-          title="Every action back to the preset's keys (the preset stays). Changes still need to be saved."
+          title="Every action back to its default keys. Changes still need to be saved."
         >
           <RotateCcw size={13} /> Reset all
         </button>
@@ -439,7 +415,6 @@ function ImportPreview({
     }
   };
   const nothing = !changes.length && !unknown.length && (!preset || preset === currentPreset);
-  const presetLine = preset ? <p className="set-desc">Preset: <b>{PRESET_INFO[preset].label}</b></p> : null;
   return (
     <div ref={ref} className="kb-import" role="dialog" aria-modal="false" aria-labelledby="kb-import-title" onKeyDown={onKeyDown}>
       <div className="kb-import-head">
@@ -449,7 +424,6 @@ function ImportPreview({
           {preview.path}
         </span>
       </div>
-      {presetLine}
       {nothing ? (
         <p className="set-desc">The file matches your current shortcuts. Nothing changes.</p>
       ) : (

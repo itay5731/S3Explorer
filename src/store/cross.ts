@@ -288,13 +288,20 @@ export async function planTargets(plan: CrossPlan): Promise<CrossTarget[]> {
 
 // ---- starting, and the pending deletes of a move -------------------------------------------------
 
-/** One started transfer or batch of a move, and the exact source to delete once it completes. */
+/** One started transfer or batch of a move. */
 interface Tracked {
   kind: "transfer" | "batch";
   id: string;
-  /** Download: the key or prefix on S3. Upload: the local path. */
+}
+
+/**
+ * One source to remove once its copy completed: an S3 object key (download; with the ETag the
+ * download was pinned to, so the delete is conditional) or a local file path (upload). Never a
+ * prefix or a folder: a folder's files are listed one by one from its batch's completed transfers.
+ */
+interface Done {
   source: string;
-  isPrefix: boolean;
+  etag: string | null;
 }
 
 interface PendingMove {
@@ -302,20 +309,20 @@ interface PendingMove {
   direction: "download" | "upload";
   bucket: string;
   label: string;
-  /** Tracked items still running, by transfer / batch id. */
+  /** Tracked transfers and batches still running, by id. */
   waiting: Map<string, Tracked>;
-  completed: Tracked[];
+  completed: Done[];
   /** Items that ended otherwise (failed, cancelled, skipped, or never started). */
   kept: number;
   /** Still starting: don't finish before every item was started. */
   starting: boolean;
   /**
-   * Download batches of this move: the keys of their per-file transfers that ended `completed`
-   * (by batch id). Only these keys are deleted, never the folder's prefix.
+   * Fallback only (when `list_transfers` can't be read): the completed per-file transfers of this
+   * move's batches seen in events, by batch id.
    */
-  batchKeys: Map<string, Set<string>>;
-  /** Batches that finished but whose last file events may still be on their way (by batch id). */
-  batchClosing: Map<string, { batch: Batch; timer: ReturnType<typeof setTimeout> }>;
+  batchFiles: Map<string, Map<string, Done>>;
+  /** Batches that finished and are being closed (their completed files being read), by id. */
+  batchClosing: Map<string, { batch: Batch; timer: ReturnType<typeof setTimeout> | null }>;
 }
 
 const pending = new Set<PendingMove>();
@@ -323,6 +330,10 @@ let moveSeq = 0;
 
 /** Pending moves (test and debugging aid; nothing outside reads it to decide). */
 export const pendingMoveCount = () => pending.size;
+
+/** The source of a completed transfer of a move: the key on S3 (download) or the local path (upload). */
+const doneOf = (direction: PendingMove["direction"], t: Transfer): Done =>
+  direction === "download" ? { source: t.key, etag: t.etag ?? null } : { source: t.localPath, etag: null };
 
 /**
  * Start a confirmed plan: exactly its targets, minus the blocked ones and (with `skip`) the
@@ -340,7 +351,7 @@ export async function startPlan(plan: CrossPlan, targets: CrossTarget[], onConfl
           completed: [],
           kept: 0,
           starting: true,
-          batchKeys: new Map(),
+          batchFiles: new Map(),
           batchClosing: new Map(),
         }
       : null;
@@ -356,22 +367,18 @@ export async function startPlan(plan: CrossPlan, targets: CrossTarget[], onConfl
       let tracked: Tracked;
       const it = t.item;
       if (it.kind === "object") {
-        const id = await api.startDownload(plan.bucket, it.key, t.dest);
-        tracked = { kind: "transfer", id, source: it.key, isPrefix: false };
+        tracked = { kind: "transfer", id: await api.startDownload(plan.bucket, it.key, t.dest) };
       } else if (it.kind === "prefix") {
-        const id = await startBatch({ kind: "download", bucket: plan.bucket, prefix: it.key, localPath: t.dest, onConflict });
-        tracked = { kind: "batch", id, source: it.key, isPrefix: true };
+        tracked = { kind: "batch", id: await startBatch({ kind: "download", bucket: plan.bucket, prefix: it.key, localPath: t.dest, onConflict }) };
       } else if (it.kind === "file") {
-        const id = await api.startUpload(plan.bucket, t.dest, it.path);
-        tracked = { kind: "transfer", id, source: it.path, isPrefix: false };
+        tracked = { kind: "transfer", id: await api.startUpload(plan.bucket, t.dest, it.path) };
       } else {
-        const id = await startBatch({ kind: "upload", bucket: plan.bucket, prefix: t.dest, localPath: it.path, onConflict });
-        tracked = { kind: "batch", id, source: it.path, isPrefix: true };
+        tracked = { kind: "batch", id: await startBatch({ kind: "upload", bucket: plan.bucket, prefix: t.dest, localPath: it.path, onConflict }) };
       }
       started++;
       if (move) {
         move.waiting.set(tracked.id, tracked);
-        if (tracked.kind === "batch" && plan.direction === "download") move.batchKeys.set(tracked.id, new Set());
+        if (tracked.kind === "batch") move.batchFiles.set(tracked.id, new Map());
         // It may have finished before it was registered here.
         settleIfFinished(move, tracked);
       }
@@ -400,69 +407,67 @@ export async function startPlan(plan: CrossPlan, targets: CrossTarget[], onConfl
   return started;
 }
 
-/** Did this batch transfer everything (nothing failed or skipped)? Only then is its source deleted. */
-const batchFullyDone = (b: Batch) => b.status === "completed" && b.failedFiles === 0 && b.skippedFiles === 0 && b.errors.length === 0;
-
 function settleIfFinished(move: PendingMove, t: Tracked) {
   if (t.kind === "transfer") {
     const cur = useTransfers.getState().byId[t.id];
-    if (cur && !isActive(cur)) settle(move, t.id, cur.status === "completed");
+    if (cur && !isActive(cur)) settleTransfer(move, cur);
   } else {
     const cur = useBatches.getState().byId[t.id];
     if (cur && !isBatchActive(cur)) settleBatch(move, cur);
   }
 }
 
-/** A tracked batch finished: a download batch closes once its completed files are all known. */
-function settleBatch(move: PendingMove, b: Batch) {
-  if (!move.waiting.has(b.id)) return;
-  if (!move.batchKeys.has(b.id)) {
-    // An upload batch: its local folder goes to the recycle bin only when every file was uploaded.
-    settle(move, b.id, batchFullyDone(b));
-    return;
-  }
-  if (move.batchClosing.has(b.id)) return;
-  // The batch event can arrive before the events of its last files: wait for them (bounded).
-  const timer = setTimeout(() => closeBatch(move, b.id), BATCH_FILES_WAIT_MS);
-  move.batchClosing.set(b.id, { batch: b, timer });
-  maybeCloseBatch(move, b.id);
-}
-
-/** How long a finished download batch waits for the events of its last files. */
-const BATCH_FILES_WAIT_MS = 3000;
-
-function maybeCloseBatch(move: PendingMove, id: string) {
-  const closing = move.batchClosing.get(id);
-  const keys = move.batchKeys.get(id);
-  if (closing && keys && keys.size >= closing.batch.doneFiles) closeBatch(move, id);
-}
-
-/**
- * Close a download batch of a move: exactly the keys of its files that completed are deleted (as
- * single objects); its prefix and folder markers, anything added under it, and every file that
- * failed, was skipped or cancelled stay.
- */
-function closeBatch(move: PendingMove, id: string) {
-  const closing = move.batchClosing.get(id);
-  if (!closing || !move.waiting.has(id)) return;
-  clearTimeout(closing.timer);
-  move.batchClosing.delete(id);
-  move.waiting.delete(id);
-  const keys = move.batchKeys.get(id) ?? new Set<string>();
-  move.batchKeys.delete(id);
-  for (const key of keys) move.completed.push({ kind: "transfer", id, source: key, isPrefix: false });
-  const b = closing.batch;
-  const notDone = Math.max(0, b.totalFiles - keys.size);
-  move.kept += keys.size ? notDone : Math.max(1, notDone);
+/** A single transfer of a move ended: only `completed` counts. */
+function settleTransfer(move: PendingMove, t: Transfer) {
+  if (!move.waiting.has(t.id)) return;
+  move.waiting.delete(t.id);
+  if (t.status === "completed") move.completed.push(doneOf(move.direction, t));
+  else move.kept++;
   maybeFinish(move);
 }
 
-function settle(move: PendingMove, id: string, completed: boolean) {
-  const t = move.waiting.get(id);
-  if (!t) return;
+/** How long a finished batch waits for its last file events, when `list_transfers` can't be read. */
+const BATCH_FILES_WAIT_MS = 3000;
+
+/**
+ * A batch of a move finished: its sources are exactly the per-file transfers that ended
+ * `completed`, read from `list_transfers` (by batch id). Never the prefix or the folder: folder
+ * markers, entries the planner skipped, links, files added after planning and emptied folders stay.
+ */
+function settleBatch(move: PendingMove, b: Batch) {
+  if (!move.waiting.has(b.id) || move.batchClosing.has(b.id)) return;
+  move.batchClosing.set(b.id, { batch: b, timer: null });
+  void api
+    .listTransfers()
+    .then((all) => {
+      const done = all.filter((t) => t.batchId === b.id && t.status === "completed").map((t) => doneOf(move.direction, t));
+      closeBatch(move, b.id, done);
+    })
+    .catch(() => {
+      // Fallback: the completed files seen in events, once as many as the batch reports done arrived (bounded wait).
+      const closing = move.batchClosing.get(b.id);
+      if (!closing) return;
+      closing.timer = setTimeout(() => closeBatch(move, b.id, [...(move.batchFiles.get(b.id)?.values() ?? [])]), BATCH_FILES_WAIT_MS);
+      maybeCloseFromEvents(move, b.id);
+    });
+}
+
+function maybeCloseFromEvents(move: PendingMove, id: string) {
+  const closing = move.batchClosing.get(id);
+  const files = move.batchFiles.get(id);
+  if (closing?.timer && files && files.size >= closing.batch.doneFiles) closeBatch(move, id, [...files.values()]);
+}
+
+function closeBatch(move: PendingMove, id: string, done: Done[]) {
+  const closing = move.batchClosing.get(id);
+  if (!closing || !move.waiting.has(id)) return;
+  if (closing.timer) clearTimeout(closing.timer);
+  move.batchClosing.delete(id);
+  move.batchFiles.delete(id);
   move.waiting.delete(id);
-  if (completed) move.completed.push(t);
-  else move.kept++;
+  move.completed.push(...done);
+  const notDone = Math.max(0, closing.batch.totalFiles - done.length);
+  move.kept += done.length ? notDone : Math.max(1, notDone);
   maybeFinish(move);
 }
 
@@ -477,24 +482,25 @@ function maybeFinish(move: PendingMove) {
   }
   const partial = move.kept > 0 ? ` ${plural(move.kept, "item")} that didn’t finish ${move.kept === 1 ? "stays" : "stay"} where ${move.kept === 1 ? "it is" : "they are"}.` : "";
   if (move.direction === "download") {
-    // Exactly the object keys whose download completed, verbatim, never a prefix: one delete job
-    // (one per 10,000 keys, the job limit, for a very large folder).
-    const keys = done.filter((t) => !t.isPrefix);
-    for (let i = 0; i < keys.length; i += JOB_MAX_ITEMS) {
+    // Exactly the object keys whose download completed, verbatim, never a prefix, each with the ETag
+    // its download was pinned to: the delete is conditional, so an object rewritten meanwhile stays
+    // (the job reports it). One job (one per 10,000 keys, the job limit, for a very large folder).
+    for (let i = 0; i < done.length; i += JOB_MAX_ITEMS) {
       const request: JobRequest = {
         kind: "delete",
         srcBucket: move.bucket,
         destBucket: null,
-        items: keys.slice(i, i + JOB_MAX_ITEMS).map((t) => ({ from: t.source, to: null, isPrefix: false })),
+        items: done.slice(i, i + JOB_MAX_ITEMS).map((d) => ({ from: d.source, to: null, isPrefix: false, etag: d.etag })),
         onConflict: "skip",
       };
       void startConfirmedJob(request, { openPanel: false }).then((id) => {
-        if (id && i === 0) toast.info(`Moved ${plural(keys.length, "object")} ${move.label}`, `Deleting ${keys.length === 1 ? "it" : "them"} from S3 now.${partial}`);
+        if (id && i === 0) toast.info(`Moved ${plural(done.length, "object")} ${move.label}`, `Deleting ${done.length === 1 ? "it" : "them"} from S3 now.${partial}`);
       });
     }
   } else {
-    const paths = done.map((t) => t.source);
-    void trashLocalPaths(paths, `Moved ${plural(done.length, "item")} ${move.label}`).then(() => {
+    // Exactly the local files whose upload completed (a folder's own files one by one, never the folder).
+    const paths = done.map((d) => d.source);
+    void trashLocalPaths(paths, `Moved ${plural(done.length, "file")} ${move.label}`).then(() => {
       if (partial) toast.info("Some items were not moved", partial.trim());
     });
   }
@@ -503,7 +509,7 @@ function maybeFinish(move: PendingMove) {
 /** Install once (Explorer): settle pending moves from transfer / batch events, refresh local panes after downloads. */
 export function installCrossEffects(): () => void {
   const offT = onTransferFinished((t: Transfer) => {
-    for (const m of [...pending]) if (m.waiting.has(t.id)) settle(m, t.id, t.status === "completed");
+    for (const m of [...pending]) if (m.waiting.has(t.id)) settleTransfer(m, t);
     if (t.kind === "download" && t.status === "completed") localChanged(typedParent(t.localPath) ?? t.localPath);
   });
   const offB = onBatchUpdate((b: Batch, prev) => {
@@ -511,21 +517,21 @@ export function installCrossEffects(): () => void {
     if (finished) for (const m of [...pending]) if (m.waiting.has(b.id)) settleBatch(m, b);
     if (b.kind === "download" && (finished || (prev && prev.doneFiles !== b.doneFiles))) localChanged(b.localPath);
   });
-  // The files of a download batch of a move: remember the keys that completed.
+  // The files of a batch of a move, for the fallback above.
   const offF = onBatchFileFinished((t: Transfer) => {
     if (t.status !== "completed" || !t.batchId) return;
     for (const m of pending) {
-      const keys = m.batchKeys.get(t.batchId);
-      if (!keys) continue;
-      keys.add(t.key);
-      maybeCloseBatch(m, t.batchId);
+      const files = m.batchFiles.get(t.batchId);
+      if (!files) continue;
+      files.set(t.id, doneOf(m.direction, t));
+      maybeCloseFromEvents(m, t.batchId);
     }
   });
   // A new connection or a disconnect: a delete must never reach another connection's bucket.
   const offC = onConnectionChange((key) => {
     if (key !== null || !pending.size) return;
     const n = pending.size;
-    for (const m of pending) for (const c of m.batchClosing.values()) clearTimeout(c.timer);
+    for (const m of pending) for (const c of m.batchClosing.values()) if (c.timer) clearTimeout(c.timer);
     pending.clear();
     toast.info(n === 1 ? "A move was stopped" : `${n} moves were stopped`, "Nothing more is deleted for them; their sources are kept.");
   });
