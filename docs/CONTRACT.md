@@ -2332,6 +2332,17 @@ bound costs no store writes and no DOM queries beyond the focused element. Trans
 render tables, path bars, tab strips or the sidebar. Measured with the browser harness (CDP Performance
 profile) and asserted in the suite.
 
+Settled by the v0.9.0 performance pass (behaviour changes that follow from the budget):
+
+- **Newest files** renders at most 40 rows and a "Show more (N more)" row; it keeps showing the last S3
+  bucket's list while a local pane is active (reset on a connection change or when that bucket is removed).
+- **The details column stays mounted** when the active pane is local, with the body "Details are for S3
+  panes", so switching panes never relayouts the workspace or restarts metadata reads.
+- **No transitions on pane switch**: the inactive pane is dimmed statically; breadcrumbs have no hover
+  transition.
+- Rows are sorted once per listing and sort key (dates parsed once, names lower-cased once) and filtered
+  afterwards; `getSelected`, selection summaries and the filter prune loop over the selection, not the rows.
+
 ### Scope note
 
 The local pane makes "dragging objects out of the app" partly unnecessary (copy to a local pane instead);
