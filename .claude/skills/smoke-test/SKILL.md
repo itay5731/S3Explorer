@@ -67,6 +67,15 @@ pauses then cancels an upload (no multipart upload or object left behind).
   `dev.s3explorer.app.test`. `updater_check`: the update check and a failing-signature install against a local server.
 - Linking can fail with "paging file is too small (os error 1455)" or a spurious `E0463`; rerun with `-j 2`.
 
+## Building on this machine (memory is short)
+- Run dev builds (`cargo build`/`test`/`run --example`, `npm run tauri dev`) with
+  `CARGO_PROFILE_DEV_DEBUG=1 CARGO_PROFILE_DEV_CODEGEN_UNITS=16 CARGO_BUILD_JOBS=2` in the environment. Without
+  them the compiler crashed during v0.9.0 with `STATUS_STACK_BUFFER_OVERRUN`, `E0463` (can't find crate) or
+  "invalid metadata" errors when memory ran short. These are not code errors; rerun with the variables set.
+- The local-pane trash tests (`local_fs.rs`, `cargo test`) move scratch files into the **real Recycle Bin**
+  of the drive they live on (D:, under the target dir). They fail if D:'s recycle bin is disabled, set to
+  "remove files immediately", or too small. Empty the bin of those scratch entries afterwards if you care.
+
 ## Lessons from v0.5.x
 - Assert the painted state of progress bars (the fill's rendered width via getBoundingClientRect), not only
   DOM attributes or store state. The v0.5.0 end-to-end run saw byte counts update beside bars whose fill had

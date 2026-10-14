@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/Windows%20%7C%20macOS%20%7C%20Linux-18181b?style=for-the-badge" alt="Windows, macOS and Linux">
 </p>
 
-<h3 align="center">A fast desktop file manager for Amazon S3 and S3-compatible storage, with whole-folder transfers, object versions, archive restores, and a proper editor for lifecycle rules and tags.<br>One small native executable, no Electron, no subscription.</h3>
+<h3 align="center">A fast desktop file manager for Amazon S3 and S3-compatible storage, with two panes in the Total Commander style (one of them can be your own computer), whole-folder transfers, object versions, archive restores, and a proper editor for lifecycle rules and tags.<br>One small native executable, no Electron, no subscription.</h3>
 
 <p align="center"><a href="../../releases/latest"><strong>Download the latest release</strong></a></p>
 
@@ -34,16 +34,18 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Browse folders and objects** in a virtualized table that stays smooth with thousands of rows. Size, last modified, storage class, ETag, content type and user metadata are all there.
 - **Look inside a file without downloading it.** Selecting a text file or an image shows a preview in the details panel: JSON pretty-printed, CSV and TSV as a table, images fitted to the panel. `F3` (Quick look) opens a big view you can flip through with the arrow keys. Only the start of a large text file is read, and a setting turns automatic previews off.
 - **Folder sizes on demand.** Calculate how many objects and bytes a folder (or several) holds. S3 keeps no folder totals, so this is a cancellable scan that stops at 200,000 keys and says "at least" when it does.
-- **Search a bucket.** Start typing in the search row under the toolbar (or just type in the file list) and results appear as you type: words, `"a phrase"`, `-not`, `tag:key=value` and a `folder/part` path all combine, over the current folder or the whole bucket. Folders and objects both show up, you can paste a full path or an `s3://` address to jump straight to it, and the results can be downloaded, deleted, tagged or moved like any other rows. S3 has no search of its own, so this is a bounded scan that tells you when it stopped early.
-- **Two panes.** Split the window into two explorer panes, each on its own folder or bucket, and copy or move between them by dragging rows across, with `Ctrl+Shift+C` / `Ctrl+Shift+X`, or from the right-click menu. Same previews and confirmations as everywhere else.
-- **Tabs** in each pane. Middle-click a folder or press `Ctrl+N` for a new tab, `Ctrl+W` to close one, `Ctrl+Tab` to switch and `Ctrl+Shift+T` to bring back the last one you closed. Each tab keeps its own selection, filter, search results and history, and when you had more than one tab open they come back the next time you connect to the same account.
+- **Search a bucket.** Press `Ctrl+F` (or `/`, or `Alt+F7`), start typing in the search row under the toolbar, and results appear as you type: words, `"a phrase"`, `-not`, `tag:key=value` and a `folder/part` path all combine, over the current folder or the whole bucket. Folders and objects both show up, you can paste a full path or an `s3://` address to jump straight to it, and the results can be downloaded, deleted, tagged or moved like any other rows. S3 has no search of its own, so this is a bounded scan that tells you when it stopped early.
+- **Two panes.** Split the window into two explorer panes, each on its own folder or bucket, and copy or move between them by dragging rows across, with `F5` / `F6` (or `Ctrl+Shift+C` / `Ctrl+Shift+X`), or from the right-click menu. Same previews and confirmations as everywhere else. `Ctrl+Shift+Right` / `Ctrl+Shift+Left` make the other pane show the same place as this one.
+- **Your computer in a pane.** `Alt+F1` / `Alt+F2` (or "This computer" in the sidebar) turn either pane into a view of a drive or folder on your machine. Copy from a bucket into it to download, from it into a bucket to upload; Move then removes only the originals that finished transferring. New folder, rename, folder sizes and delete work there too, and a local delete always goes to the recycle bin.
+- **Edit the path.** `Ctrl+L` turns the path bar into a text field: paste an `s3://` address or a local path and press Enter.
+- **Tabs** in each pane. Middle-click a folder or press `Ctrl+T` or `Ctrl+N` for a new tab, `Ctrl+W` to close one, `Ctrl+Tab` to switch and `Ctrl+Shift+T` to bring back the last one you closed. Each tab keeps its own selection, filter, search results and history, and when you had more than one tab open they come back the next time you connect to the same account.
 - **Bookmarks bar.** Star a folder in the path bar (or press `Ctrl+Shift+D`) and it becomes a chip under the toolbar, one click away. Bookmarks are kept per connection and can be renamed and reordered.
-- **Keyboard for everything.** Every action has a shortcut (`F1` shows the list), the bucket list and file list are fully keyboard-navigable, `Alt+Left` / `Alt+Right` and the mouse's back and forward buttons walk each pane's history, and Settings → Keyboard lets you rebind any of it and export or import your bindings as a file.
+- **Keyboard for everything,** with the Total Commander layout by default: `F5` copy, `F6` move, `Shift+F6` rename, `F7` new folder, `F8` delete, `F2` refresh. If you used an earlier version your own keys are kept, and Reset all in Settings → Keyboard switches to the Total Commander layout. `F1` shows the layout that currently applies, typing a name in a file list jumps to the first row that starts with it, the bucket list and file list are fully keyboard-navigable, `Alt+Left` / `Alt+Right` and the mouse's back and forward buttons walk each pane's history, and Settings → Keyboard lets you rebind any of it and export or import your bindings as a file.
 - **Download in parallel parts.** Large objects are split into byte ranges and fetched over several connections at once.
 - **Upload** with multipart for large files, by button or by dragging files onto the window.
 - **Whole folders in and out.** Upload a folder (or drop one from your desktop) and download folders into a directory. You see how many files, how much data and what already exists before anything moves; existing files are skipped unless you choose Overwrite; file names are made safe for your disk and a transfer never writes outside the folder you chose.
-- **Delete, rename, copy and move** objects and folders, within a bucket or between buckets, from the right-click menu, the toolbar, the keyboard (`Delete`, `F2`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`) or by **dragging** them onto a folder, the path bar or a bucket (hold Ctrl to copy). Every delete, move or overwrite shows you the exact keys and how much is affected before it happens, unless you turn the copy/move confirmation off for the cases where nothing is in the way.
-- **Create folders.**
+- **Delete, rename, copy and move** objects and folders, within a bucket or between buckets, from the right-click menu, the toolbar, the keyboard (`Delete` or `F8`, `Shift+F6`, `Ctrl+C`, `Ctrl+X`, `Ctrl+V`) or by **dragging** them onto a folder, the path bar or a bucket (hold Ctrl to copy). Every delete, move or overwrite shows you the exact keys and how much is affected before it happens, unless you turn the copy/move confirmation off for the cases where nothing is in the way.
+- **Create folders** (`F7`).
 - **Versions.** On a versioned bucket, see every version of an object, download one, restore one as the current version, remove a delete marker to bring an object back, or permanently delete a version behind its own confirmation.
 - **Restore archived objects** from Glacier and Deep Archive, one at a time or many as a background job, with the retrieval tier and how long the restored copy stays. Archived objects show their restore state, and actions that need the data are disabled until it is back.
 - **Tags** on objects and buckets: view, edit, and change them on many objects at once.
@@ -55,7 +57,8 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 - **Newest files** of the open bucket in the sidebar, wherever they are, filtered by age, type or search.
 - **Desktop notifications** when a transfer or operation finishes while the app is in the background.
 - **Settings** for part size, parallel parts per transfer and simultaneous transfers, with a live estimate of connections and memory before you save, and optional download and upload speed limits shared by every transfer. "Show in folder" can open a file manager of your choice instead of the system one.
-- **Light, dark or system theme**, four accent colours, and size and text-weight sliders.
+- **Light, dark or system theme**, four accent colours (the window and taskbar icon follow the accent too), and size and text-weight sliders.
+- **Open it from the command line** at a local folder or a bucket path; a second launch hands the location to the window that is already open. See [From the command line](#from-the-command-line).
 - **Updates from inside the app.** When a new version is out, a window at startup shows its patch notes with Install and Later; after updating, the first launch shows what's new. Only updates signed by this project are installed, and nothing is installed until you click Install.
 
 <p align="center">
@@ -93,7 +96,7 @@ I didn't want to pay for an S3 explorer tool. So I vibe coded one. :)
 
 ### What it does not do (yet)
 
-Creating or deleting buckets, presigned URLs, permissions and ACLs, sync, turning versioning on or off, object lock, and dragging objects out of the app to the desktop. It is scoped small on purpose.
+Creating or deleting buckets, presigned URLs, permissions and ACLs, sync ("sync the other pane" only navigates, it never copies anything), turning versioning on or off, object lock, copying or moving between two folders on your own computer (your file manager does that), and dragging objects out of the app to the desktop (copy them into a local pane instead). It is scoped small on purpose.
 
 ## How move, rename, delete, lifecycle and folder transfers stay safe
 
@@ -131,6 +134,12 @@ And the newer features:
 - History never re-runs anything by itself: "Download again" or "Go to object" goes through the usual dialogs, and only on the connection the entry was recorded on.
 - The hidden games on the start screen never touch your buckets or files.
 
+Your own disk, in a local pane:
+
+- Deleting a local file or folder always sends it to the recycle bin (or the trash), never a permanent delete. A drive whose recycle bin is turned off, too small, or not a local disk is refused, and the file stays where it is.
+- A move from a bucket to your computer deletes from the bucket only the objects whose download completed, and only if each is still exactly the version that was downloaded; an object changed in the meantime is left in place and reported. A folder move deletes the downloaded keys one by one, never the folder as a whole, so anything added to it since is kept. A move from your computer to a bucket sends to the recycle bin only the files whose upload completed.
+- A local pane never follows links or junctions: they are shown with a badge, a move refuses them as sources, and a delete removes the link, not what it points to. Listings and folder sizes are bounded, and network and device paths typed by hand are refused.
+
 ## How downloads are split
 
 With the default settings:
@@ -160,6 +169,15 @@ npm run tauri build
 
 The executable lands in `src-tauri/target/release/`, with installers under `src-tauri/target/release/bundle/`.
 
+### From the command line
+
+```text
+s3explorer [--connection <name>] [<path or s3://bucket/prefix>]
+s3explorer --help
+```
+
+Opens the app at a local folder (or a file, selected in its folder) or at a bucket and folder, connecting with the saved connection you name, or the one you used last. Relative paths are taken from the shell's current directory. Only one copy of the app runs at a time: launching it again while it is open hands the location to the existing window and brings it to the front.
+
 ## IAM permissions
 
 S3 Explorer only does what your credentials allow. It needs no permissions outside S3, never creates or changes IAM resources, and makes no calls to other AWS services. Grant only the rows you want to use:
@@ -180,6 +198,7 @@ S3 Explorer only does what your credentials allow. It needs no permissions outsi
 | View and edit lifecycle rules | `GetBucketLifecycleConfiguration`, `PutBucketLifecycleConfiguration`, `DeleteBucketLifecycle`, `GetBucketVersioning` | `s3:GetLifecycleConfiguration`, `s3:PutLifecycleConfiguration`, `s3:GetBucketVersioning` on the bucket |
 | Upload or download a folder | The same calls as single uploads and downloads, plus `ListObjectsV2` to check what exists | Nothing beyond the rows above |
 | Pause, resume, limit speed, history, bookmarks, tabs | The same calls as the transfers and browsing they apply to | Nothing beyond the rows above |
+| Copy or move between a bucket and your computer (a local pane) | The download or upload calls above; a move from a bucket then deletes the downloaded objects with `DeleteObject(s)`, conditional on the ETag that was downloaded | Nothing beyond the download, upload and Delete rows (a move from a bucket needs `s3:DeleteObject`); browsing your own disk calls nothing in S3 |
 | See and download versions | `ListObjectVersions`, `HeadObject` and `GetObject` with a version id | `s3:ListBucketVersions` on the bucket, `s3:GetObjectVersion` on the objects |
 | Restore a version as current | `CopyObject` (or multipart copy) from a version | `s3:GetObjectVersion` and `s3:PutObject` on the objects (plus the tagging permissions to carry tags) |
 | Permanently delete a version | `DeleteObject` with a version id | `s3:DeleteObjectVersion` on the objects |
@@ -281,7 +300,7 @@ The app remembers no more than it must: saved connections keep the secret key in
 
 ## Should you trust it?
 
-Honest status, as of `v0.8.0`:
+Honest status, as of `v0.9.0`:
 
 | | |
 |---|---|
@@ -295,6 +314,9 @@ Honest status, as of `v0.8.0`:
 | Connecting with a profile signed in through `aws login` tested against a real session | **not yet** |
 | The v0.8.0 features (tabs, bookmarks, folder sizes, preview, metadata editing, history, speed limits, pause and resume, the update popup) tested against the mock backend and the local S3 server | yes |
 | The same v0.8.0 features tested against real AWS S3 | **not yet** |
+| The v0.9.0 features (Total Commander keys and keeping existing keys, the local computer in a pane, edit path, sync the other pane, the command line, the window icon, type to jump) tested against the mock backend and the local S3 server | yes |
+| The same v0.9.0 features tested against real AWS S3 | **not yet** |
+| The local-pane and recycle-bin code on macOS and Linux | **compiled in CI only, never run** |
 | Restoring from Glacier tested against a server that supports it (the local test server does not) | **unit tests only** |
 | Lifecycle storage-class transitions tested against any server (the local test server refuses them) | **unit tests only** |
 | In-app update installed for real on any platform | **not yet** |
@@ -309,7 +331,7 @@ Some things were done carefully because this tool can delete data and write to y
 - Lifecycle configurations are never saved over one that changed since you loaded it, and every data-deleting rule is called out before you save.
 - File names coming from S3 are sanitized before they become local paths, so a hostile key can't write outside the folder you picked.
 - The webview runs under a restrictive content security policy and all S3 traffic goes through the Rust side.
-- "Open file" opens only a file this app finished downloading, never a program, and a file manager you configure is started directly with the path as one argument, never through a shell.
+- "Open file" opens only a file this app finished downloading or one you browsed to in a local pane, never a program, and a file manager you configure is started directly with the path as one argument, never through a shell.
 
 Still: it is young, AI-written software. Try it on a bucket you can afford to lose before trusting it with one you can't, and prefer credentials that only have the permissions you need.
 

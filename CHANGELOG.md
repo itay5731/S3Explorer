@@ -7,10 +7,28 @@ The section for a version becomes the text of its GitHub Release.
 
 ### New
 
-- **Total Commander keys by default.** New installs start with the Total Commander layout: `F5` copies and `F6` moves to the other pane, `Shift+F6` renames, `F2` refreshes, `Alt+F7` searches. If you already use S3 Explorer nothing changes: your keys stay exactly as they were, and you can rebind anything in Settings → Keyboard as before (the shortcut list on `F1` always shows what applies to you). Thanks to EthanLerner1 for the request (#13).
-- **The local computer in a pane.** `Alt+F1` / `Alt+F2` (or the new "This computer" group in the sidebar) turn the left or right pane into a view of a drive or folder on your machine. Copy from S3 to it to download, from it to S3 to upload; Move does the same and then removes the source, deleting from S3 only what finished downloading and sending local files to the recycle bin, never a permanent delete. New folder, rename, delete (to the recycle bin) and folder sizes work on the local side too.
-- **Edit the path.** `Mod+L` turns the path bar into a text field: paste an `s3://` address or a local path and press Enter.
-- **Sync the other pane.** `Ctrl+Shift+Right` / `Ctrl+Shift+Left` make the other pane show what this one shows.
+- **Total Commander keys by default.** `F5` copies and `F6` moves to the other pane, `Shift+F6` renames, `F7` creates a folder, `F8` or `Delete` deletes, `F2` refreshes, `Alt+F7` searches and `Ctrl+T` opens a new tab (on macOS, `Cmd` wherever this says `Ctrl`). If you already use S3 Explorer, nothing changes: your keys are kept exactly as they were, and a one-time message tells you so. **Reset all** in Settings → Keyboard switches you to the Total Commander layout. `F1` always shows the keys that apply to you. Thanks to EthanLerner1 for the request (#13).
+- **Your computer in a pane.** `Alt+F1` / `Alt+F2`, or the new "This computer" group in the sidebar, turn the left or right pane into a view of a drive or folder on your machine. Copying from a bucket into it downloads, copying from it into a bucket uploads, with the usual preview and conflict choice. Move does the same and then removes the originals, but only the ones that finished transferring: an object in S3 is deleted only if it is still exactly the version that was downloaded (otherwise it is left in place and reported as changed), and local files go to the recycle bin. New folder, rename, delete (always to the recycle bin, never permanently) and folder sizes work on the local side too, and `Ctrl+.` shows hidden files. Links and junctions are shown but never followed. Copying or moving between two local folders is left to your system's file manager.
+- **Edit the path.** `Ctrl+L`, or a click on the empty part of the path bar, turns it into a text field: type or paste an `s3://` address, a folder in the current bucket, or a local path, and press Enter. A path to a local file opens its folder with the file selected.
+- **Sync the other pane.** `Ctrl+Shift+Right` / `Ctrl+Shift+Left` make the other pane show the same bucket and folder, or the same local folder, as the one you are in.
+- **The window icon follows your accent colour.** The title bar, taskbar button and Alt+Tab icon now match the accent you picked. A shortcut pinned to the taskbar or Start menu keeps the installed yellow icon.
+- **Open the app from the command line.** `s3explorer [--connection <name>] [<path or s3://…>]` opens the app at a local folder or file, or at a bucket and folder, connecting with the saved connection you name (or the one you used last). If the app is already running, the location opens in that window instead of a second copy of the app. `s3explorer --help` shows the usage.
+- **Type to jump.** Typing in a file list moves to the first row whose name starts with what you typed, as in Windows Explorer; pressing the same letter again steps through the rows that start with it. This replaces typing to start a search: the search box is now reached with `Ctrl+F`, `/` or `Alt+F7`.
+- **Type-ahead in the source menu.** In the `Alt+F1` / `Alt+F2` menu, type a few letters to jump to a bucket or a drive (`d` picks `D:\`), then press Enter to open it.
+
+### Improved
+
+- **Switching panes and tabs is much faster.** In a folder of 10,000 files, switching tabs went from 255 ms to 21 ms in development builds and from 16 ms to 4 ms in the released app, and switching panes no longer redraws the rest of the window.
+- **Newest files shows 40 rows at first**, with Show more for the rest, and keeps showing the last bucket's list while you work in a local pane.
+- **The details column stays in place** when you switch to a local pane, so the layout no longer jumps.
+- **Enter confirms copy and move.** The copy, move, folder transfer and pane-to-pane dialogs open with their action button ready, so Enter goes ahead and Escape cancels. Delete and recycle-bin confirmations still start on Cancel, so a stray Enter never deletes anything.
+- **Pause and resume are one button** that stays in the same place on an Activity row, and `Space` pauses or resumes the row you are on.
+- **Files are sorted by name, A to Z, every time the app starts**, whatever sort you used last time.
+- **Sorting by Size puts folders in order of their calculated size.** Folders you have not calculated come after them, by name.
+
+### Fixed
+
+- **The `Alt+F1` / `Alt+F2` menu opened from the bottom of the window when the pane was empty.** It now opens under the path bar like everywhere else.
 
 ## [0.8.0] - 2026-10-13
 
