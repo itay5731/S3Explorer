@@ -13,6 +13,7 @@ pub mod file_manager;
 pub mod folder_size;
 pub mod jobs;
 pub mod keychain;
+pub mod launch;
 pub mod lifecycle;
 pub mod local_fs;
 pub mod local_open;
@@ -31,6 +32,7 @@ pub(crate) mod testutil;
 pub mod transfers;
 pub mod updates;
 pub mod versions;
+pub mod window_icon;
 mod windows_shell;
 
 use std::sync::Arc;
@@ -77,10 +79,42 @@ impl BatchSink for TauriBatchSink {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // The command line first: `--help` and an invalid command line end here, before any window.
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let launch_request = match launch::parse(&args, &cwd) {
+        Ok(launch::Parsed::Help) => {
+            launch::print(launch::USAGE, false);
+            std::process::exit(0);
+        }
+        Ok(launch::Parsed::Request(r)) => r,
+        Err(reason) => {
+            launch::print(&format!("s3explorer: {reason}\n\n{}", launch::USAGE), true);
+            std::process::exit(2);
+        }
+    };
     let context = tauri::generate_context!();
     // Before any window exists, so the taskbar ties every window to the installed shortcuts.
     windows_shell::set_app_user_model_id(&context.config().identifier);
     tauri::Builder::default()
+        // First plugin, as the plugin requires: a second launch hands its command line over and exits.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+            let args: Vec<String> = argv.into_iter().skip(1).collect();
+            match launch::parse(&args, std::path::Path::new(&cwd)) {
+                Ok(launch::Parsed::Request(Some(req))) => {
+                    let _ = app.emit(launch::LAUNCH_OPEN_EVENT, req);
+                }
+                Ok(_) => {}
+                // The second process already refused an invalid command line; never crash over one.
+                Err(reason) => eprintln!("Ignored the command line of a second launch: {reason}"),
+            }
+        }))
+        .manage(launch::LaunchState::new(launch_request))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -145,6 +179,8 @@ pub fn run() {
             commands::jobs::list_jobs,
             commands::settings::get_settings,
             commands::settings::update_settings,
+            commands::settings::set_window_icon,
+            commands::settings::take_launch_request,
             commands::saved::list_saved_connections,
             commands::saved::save_connection,
             commands::saved::delete_saved_connection,

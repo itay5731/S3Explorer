@@ -295,7 +295,7 @@ pub enum AccentColor {
 }
 
 impl AccentColor {
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "yellow" => Some(Self::Yellow),
             "green" => Some(Self::Green),

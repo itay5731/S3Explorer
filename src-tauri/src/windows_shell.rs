@@ -80,6 +80,42 @@ fn set_big_icon(hwnd: isize) {
     }
 }
 
+/// v0.9.0: makes the window's large (taskbar / Alt+Tab) icon an icon built from `rgba` (straight
+/// alpha, `width` x `height`), destroying the one this function set before. Tauri's `set_icon`
+/// only replaces the small (title bar) icon on Windows.
+#[cfg(windows)]
+pub fn set_big_icon_rgba(hwnd: isize, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    /// The large icon this function created last (0 = none): released when replaced.
+    static CREATED: AtomicIsize = AtomicIsize::new(0);
+
+    if width == 0 || height == 0 || rgba.len() != (width as usize) * (height as usize) * 4 {
+        return Err("The icon image has the wrong size".into());
+    }
+    // Windows wants BGRA; the AND mask is all zeros (transparency comes from the alpha channel).
+    let mut bgra = rgba.to_vec();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    // Mask rows are padded to 16 bits.
+    let mask_row = (width as usize).div_ceil(16) * 2;
+    let mask = vec![0u8; mask_row * height as usize];
+    // SAFETY: both buffers are as large as the sizes passed say; the icon is owned by us and
+    // destroyed only after the window no longer uses it.
+    unsafe {
+        let icon = ffi::CreateIcon(0, width as i32, height as i32, 1, 32, mask.as_ptr(), bgra.as_ptr());
+        if icon == 0 {
+            return Err("CreateIcon failed".into());
+        }
+        ffi::SendMessageW(hwnd, ffi::WM_SETICON, ffi::ICON_BIG, icon);
+        let previous = CREATED.swap(icon, Ordering::SeqCst);
+        if previous != 0 {
+            ffi::DestroyIcon(previous);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn running_from_cargo_target() -> bool {
     let Ok(exe) = tauri::utils::platform::current_exe() else {
@@ -119,6 +155,16 @@ mod ffi {
             load: u32,
         ) -> isize;
         pub fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+        pub fn CreateIcon(
+            instance: isize,
+            width: i32,
+            height: i32,
+            planes: u8,
+            bits_per_pixel: u8,
+            and_bits: *const u8,
+            xor_bits: *const u8,
+        ) -> isize;
+        pub fn DestroyIcon(icon: isize) -> i32;
     }
 
     #[link(name = "kernel32")]
@@ -156,6 +202,12 @@ mod tests {
             ffi::CoTaskMemFree(ptr.cast());
             Some(id)
         }
+    }
+
+    #[test]
+    fn a_big_icon_needs_a_matching_buffer() {
+        assert!(set_big_icon_rgba(0, &[0; 15], 2, 2).is_err());
+        assert!(set_big_icon_rgba(0, &[], 0, 0).is_err());
     }
 
     /// The test binary lives in `target\debug\deps`, not `target\debug`, so it counts as an

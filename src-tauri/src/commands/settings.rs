@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult, ErrorCode};
 use crate::models::AppSettings;
 use crate::state::AppState;
 
@@ -15,4 +15,48 @@ pub async fn get_settings(state: State<'_, AppState>) -> AppResult<AppSettings> 
 pub async fn update_settings(state: State<'_, AppState>, settings: serde_json::Value) -> AppResult<AppSettings> {
     let settings = AppSettings::from_json_strict(&settings)?;
     state.update_settings(settings).await
+}
+
+/// v0.9.0: the main window's icon (title bar and taskbar / Alt+Tab) in the accent colour, from the
+/// icons bundled in the executable. `accent` is taken as a string so an unknown one is
+/// `InvalidInput` (see `window_icon::parse_accent`).
+#[tauri::command]
+pub async fn set_window_icon(app: tauri::AppHandle, accent: String) -> AppResult<()> {
+    use tauri::Manager;
+    let accent = crate::window_icon::parse_accent(&accent)?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| AppError::new(ErrorCode::Unknown, "The main window is not open"))?;
+    let (small, big) = crate::window_icon::icon_png(accent);
+    let failed = |e: tauri::Error| AppError::new(ErrorCode::Unknown, format!("Could not set the window icon: {e}"));
+    #[cfg(windows)]
+    {
+        // Tauri sets only the small icon on Windows; the large one goes through the shell helper,
+        // on the window's own thread.
+        window.set_icon(crate::window_icon::decode(small)?).map_err(failed)?;
+        let big = crate::window_icon::decode(big)?;
+        let hwnd = window.hwnd().map_err(failed)?.0 as isize;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        app.run_on_main_thread(move || {
+            let _ = tx.send(crate::windows_shell::set_big_icon_rgba(hwnd, big.rgba(), big.width(), big.height()));
+        })
+        .map_err(failed)?;
+        rx.await
+            .map_err(|_| AppError::new(ErrorCode::Unknown, "Could not set the window icon"))?
+            .map_err(|m| AppError::new(ErrorCode::Unknown, format!("Could not set the taskbar icon: {m}")))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = small;
+        window.set_icon(crate::window_icon::decode(big)?).map_err(failed)
+    }
+}
+
+/// v0.9.0: the request parsed from this process's command line, once (`null` afterwards and when
+/// there was none). An invalid command line never gets here: the app exits with the usage first.
+#[tauri::command]
+pub async fn take_launch_request(
+    launch: State<'_, crate::launch::LaunchState>,
+) -> AppResult<Option<crate::launch::LaunchRequest>> {
+    Ok(launch.take())
 }
