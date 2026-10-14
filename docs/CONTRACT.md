@@ -2252,6 +2252,20 @@ it is the right one; both chords are bound to the one action, which always targe
 the other pane show the active pane's source and location (bucket + prefix, or local directory). It opens
 the split if needed. Nothing is selected in the target pane afterwards.
 
+### Window icon follows the accent
+
+The logo drawn in the app takes the accent colour, but the window and taskbar icon was always the yellow
+installed icon. From v0.9.0 the running window's icon matches the accent:
+
+| Command | Args | Returns |
+|---|---|---|
+| `set_window_icon` | `{ accent: AccentColor }` | `void`. Sets the main window's icon (both the title-bar and the taskbar/Alt-Tab sizes) to the bundled icon for that accent. Icons are bundled in the executable (`src-tauri/icons/accent/<accent>-32.png` and `<accent>-256.png`, rendered from the app's logo with the same gradient the UI uses), so no file access and no network. `InvalidInput` for an unknown accent. |
+
+- The frontend calls it once after settings load and whenever the accent setting changes (also in the
+  Settings dialog's live preview, reverting on cancel). The mock ignores it.
+- The icon of a pinned taskbar or Start-menu shortcut comes from the installer and stays yellow; only the
+  running window (title bar, taskbar button, Alt-Tab) follows the accent. The changelog says so.
+
 ### Scope note
 
 The local pane makes "dragging objects out of the app" partly unnecessary (copy to a local pane instead);
