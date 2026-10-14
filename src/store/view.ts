@@ -1,10 +1,41 @@
 // Derived view of the current listing: filtered + sorted rows, folders first.
 
 import { useMemo } from "react";
+import { create } from "zustand";
 import type { FolderEntry, ObjectEntry, SearchHit } from "../lib/types";
 import { activePane, getPane, matchesFilter, usePaneId, type PaneId, type SortState } from "./app";
-import { usePanes } from "./panes";
+import { isLocalPane, usePanes, type PaneState } from "./panes";
 import { hitId, usePaneSearch } from "./search";
+import { folderSizeId, useFolderSizes } from "./folderSizes";
+import { localSizeKey, useLocalSizes } from "./localSizes";
+
+// ---- folder sizes in the Size sort ---------------------------------------------------------------
+// Folders sort by their calculated size when the table is sorted by Size. The rows depend on a
+// version that changes only when a calculated byte count appears, changes or goes (never while a scan
+// runs), so the sort neither re-renders on progress nor rescans the size stores per row.
+
+/** Bumped when any calculated folder size (S3 or local) changes its bytes. */
+const useSizesVersion = create<{ v: number }>(() => ({ v: 0 }));
+let lastBytes = new Map<string, number>();
+
+function sizesChanged() {
+  const next = new Map<string, number>();
+  for (const [id, e] of Object.entries(useFolderSizes.getState().byId)) if (e.size) next.set(`s3\u0000${id}`, e.size.bytes);
+  for (const [k, e] of Object.entries(useLocalSizes.getState().byPath)) if (e.size) next.set(`local\u0000${k}`, e.size.bytes);
+  let same = next.size === lastBytes.size;
+  if (same) for (const [k, b] of next) if (lastBytes.get(k) !== b) { same = false; break; }
+  lastBytes = next;
+  if (!same) useSizesVersion.setState((s) => ({ v: s.v + 1 }));
+}
+useFolderSizes.subscribe(sizesChanged);
+useLocalSizes.subscribe(sizesChanged);
+
+/** The calculated bytes of a folder row of this pane, or null when it has none. */
+function folderBytes(s: Pick<PaneState, "bucket" | "source" | "local">, f: FolderEntry): number | null {
+  if (isLocalPane(s)) return useLocalSizes.getState().byPath[localSizeKey(f.prefix)]?.size?.bytes ?? null;
+  if (!s.bucket) return null;
+  return useFolderSizes.getState().byId[folderSizeId(s.bucket, f.prefix)]?.size?.bytes ?? null;
+}
 
 export type Row =
   | { kind: "folder"; id: string; name: string; folder: FolderEntry }
@@ -17,6 +48,8 @@ interface RowsCache {
   objects: ObjectEntry[];
   filter: string;
   sort: SortState;
+  /** The sizes' version the rows were sorted with (only matters for the Size sort). */
+  sizes: number;
   rows: Row[];
 }
 
@@ -25,7 +58,8 @@ const caches: Record<PaneId, RowsCache | null> = { a: null, b: null };
 
 export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filter: string, sort: SortState, pane: PaneId): Row[] {
   const cache = caches[pane];
-  if (cache && cache.folders === folders && cache.objects === objects && cache.filter === filter && cache.sort === sort) {
+  const sizes = sort.key === "size" ? useSizesVersion.getState().v : -1;
+  if (cache && cache.folders === folders && cache.objects === objects && cache.filter === filter && cache.sort === sort && cache.sizes === sizes) {
     return cache.rows;
   }
   const match = (name: string) => matchesFilter(name, filter);
@@ -36,8 +70,21 @@ export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filt
 
   const dir = sort.dir;
   const byName = (a: Row, b: Row) => collator.compare(a.name, b.name);
-  // Folders have no size/date/class: they always sort by name.
-  fr.sort((a, b) => (sort.key === "name" ? dir : 1) * byName(a, b));
+  if (sort.key === "size") {
+    // Folders by their calculated size (in the column's direction); folders without one after the
+    // sized ones, by name. Folders still come before files.
+    const s = getPane(pane);
+    const bytes = new Map<string, number | null>(fr.map((r) => [r.id, r.kind === "folder" ? folderBytes(s, r.folder) : null]));
+    fr.sort((a, b) => {
+      const x = bytes.get(a.id) ?? null;
+      const y = bytes.get(b.id) ?? null;
+      if (x === null || y === null) return x === y ? byName(a, b) : x === null ? 1 : -1;
+      return x !== y ? dir * (x - y) : byName(a, b);
+    });
+  } else {
+    // Folders have no date or class: they sort by name.
+    fr.sort((a, b) => (sort.key === "name" ? dir : 1) * byName(a, b));
+  }
   const val = (r: Row): number | string => {
     if (r.kind !== "object") return 0;
     switch (sort.key) {
@@ -62,7 +109,7 @@ export function computeRows(folders: FolderEntry[], objects: ObjectEntry[], filt
     });
   }
   const rows = fr.concat(or);
-  caches[pane] = { folders, objects, filter, sort, rows };
+  caches[pane] = { folders, objects, filter, sort, sizes, rows };
   return rows;
 }
 
@@ -74,6 +121,8 @@ export function useViewRows(pane?: PaneId): Row[] {
   const objects = usePanes((s) => s[id].listing.objects);
   const filter = usePanes((s) => s[id].filter);
   const sort = usePanes((s) => s[id].sort);
+  // Re-sort when a calculated folder size changes, only while sorted by Size.
+  useSizesVersion((s) => (sort.key === "size" ? s.v : -1));
   return computeRows(folders, objects, filter, sort, id);
 }
 

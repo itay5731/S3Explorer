@@ -6,7 +6,7 @@
 
 import { create } from "zustand";
 import * as api from "../lib/api";
-import type { AppError, LocalDirSize, LocalEntry, LocalRoot } from "../lib/types";
+import type { AppError, LocalEntry, LocalRoot } from "../lib/types";
 import { asFolderPrefix, basename } from "../lib/format";
 import { parseS3Path } from "../lib/search";
 import { plural } from "../lib/ops";
@@ -131,15 +131,8 @@ export function selectedLocal(pane: PaneId = activePane()): LocalEntry[] {
 
 // ---- folder sizes ------------------------------------------------------------------------------
 
-export interface LocalSizeEntry {
-  size: LocalDirSize | null;
-  running: boolean;
-  error: AppError | null;
-}
-
-export const useLocalSizes = create<{ byPath: Record<string, LocalSizeEntry> }>(() => ({ byPath: {} }));
-
-const sizeKey = (path: string) => (api.clientOS === "other" ? path : path.toLowerCase());
+import { localSizeKey as sizeKey, useLocalSizes, type LocalSizeEntry } from "./localSizes";
+export { useLocalSizes, type LocalSizeEntry } from "./localSizes";
 
 /** Hook: the calculated size of a local folder (by its exact path). */
 export const useLocalSize = (path: string) => useLocalSizes((s) => s.byPath[sizeKey(path)]);
