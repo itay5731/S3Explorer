@@ -1,8 +1,9 @@
 //! `open_local`: which local paths the app may open with the OS default application.
 //!
 //! Only what the app itself downloaded: the `localPath` of a completed download transfer, or the
-//! folder of a finished download batch that wrote at least one file. Never a file type that could
-//! run as a program, and never through a link that leaves the recorded destination folder.
+//! folder of a finished download batch that wrote at least one file; and (v0.9.0) a file directly
+//! inside a folder the user listed in a local pane this session. Never a file type that could run
+//! as a program, and never through a link that leaves the recorded destination or listed folder.
 
 use std::path::{Path, PathBuf};
 
@@ -84,9 +85,20 @@ fn allowed(transfers: &[Transfer], batches: &[Batch]) -> Vec<Allowed> {
     files.chain(folders).collect()
 }
 
-/// Checks `requested` against the finished downloads and returns the canonical path to open.
-/// Blocking (file system); call through `spawn_blocking`.
-pub fn resolve(requested: &str, transfers: &[Transfer], batches: &[Batch]) -> AppResult<PathBuf> {
+/// A file directly inside a folder listed in a local pane (`listed`: canonical folders, see
+/// `local_fs::ListedDirs`): the requested path's parent must canonicalize to a listed folder, and
+/// the file's canonical path must stay inside it (a link to elsewhere is refused). `real` is the
+/// canonical requested path.
+fn browsed_file(req: &Path, real: &Path, listed: &[PathBuf]) -> bool {
+    let Some(parent) = req.parent().filter(|p| !p.as_os_str().is_empty()).and_then(canonical) else { return false };
+    let parent_cmp = folded(&parent);
+    let Some(dir) = listed.iter().map(|d| folded(d)).find(|d| *d == parent_cmp) else { return false };
+    folded(real).starts_with(&dir) && real.is_file()
+}
+
+/// Checks `requested` against the finished downloads and the folders listed in local panes, and
+/// returns the canonical path to open. Blocking (file system); call through `spawn_blocking`.
+pub fn resolve(requested: &str, transfers: &[Transfer], batches: &[Batch], listed: &[PathBuf]) -> AppResult<PathBuf> {
     let req = Path::new(requested);
     if requested.trim().is_empty() || !req.is_absolute() {
         return Err(AppError::invalid(NOT_A_DOWNLOAD));
@@ -107,6 +119,13 @@ pub fn resolve(requested: &str, transfers: &[Transfer], batches: &[Batch]) -> Ap
     };
     let real_cmp = folded(&real);
     let Some(hit) = candidates.iter().find(|a| canonical(&a.path).is_some_and(|c| folded(&c) == real_cmp)) else {
+        if browsed_file(req, &real, listed) {
+            // And by what it really is (a link inside the folder could point at a program).
+            if refused_extension(&real) {
+                return Err(AppError::new(ErrorCode::NotSupported, refused_message(&real)));
+            }
+            return Ok(real);
+        }
         return Err(AppError::invalid(NOT_A_DOWNLOAD));
     };
     // Never through a link that leaves the recorded folder.
@@ -129,6 +148,15 @@ mod tests {
     use super::*;
     use crate::models::BatchStatus;
     use crate::testutil::{dir_link, ScratchDir};
+
+    /// The pre-v0.9.0 cases: no folder listed in a local pane.
+    fn resolve(requested: &str, transfers: &[Transfer], batches: &[Batch]) -> AppResult<PathBuf> {
+        super::resolve(requested, transfers, batches, &[])
+    }
+
+    fn listed(dirs: &[&Path]) -> Vec<PathBuf> {
+        dirs.iter().map(|d| crate::local_fs::canonical_dir(&d.to_string_lossy()).expect("canonical")).collect()
+    }
 
     #[test]
     fn refused_extensions() {
@@ -299,5 +327,61 @@ mod tests {
         std::fs::create_dir(&app_dir).expect("mkdir");
         let e = resolve(&s(&app_dir), &[], &[batch(&app_dir, BatchStatus::Completed, 1)]).unwrap_err();
         assert_eq!(e.code, ErrorCode::NotSupported);
+    }
+    #[test]
+    fn files_in_a_listed_folder_open() {
+        let dir = ScratchDir::new("open-browsed");
+        let other = ScratchDir::new("open-browsed-other");
+        let file = dir.0.join("notes.txt");
+        std::fs::write(&file, b"x").expect("write");
+        let prog = dir.0.join("Setup.EXE");
+        std::fs::write(&prog, b"x").expect("write");
+        let sub = dir.0.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        std::fs::write(sub.join("deep.txt"), b"x").expect("write");
+        std::fs::write(other.0.join("o.txt"), b"x").expect("write");
+        let l = listed(&[&dir.0]);
+
+        let opened = super::resolve(&s(&file), &[], &[], &l).expect("browsed file");
+        assert!(opened.ends_with("notes.txt"));
+        assert!(!opened.to_string_lossy().starts_with(r"\\?\"), "{}", opened.display());
+        if cfg!(windows) {
+            assert!(super::resolve(&s(&file).to_uppercase(), &[], &[], &l).is_ok());
+        }
+        // Without the listing, or outside it: refused as before.
+        assert_eq!(resolve(&s(&file), &[], &[]).unwrap_err().message, NOT_A_DOWNLOAD);
+        assert_eq!(super::resolve(&s(&other.0.join("o.txt")), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+        // Only files directly inside: not a file of an unlisted subfolder, not a folder.
+        assert_eq!(super::resolve(&s(&sub.join("deep.txt")), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+        assert_eq!(super::resolve(&s(&sub), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+        assert!(super::resolve(&s(&sub.join("deep.txt")), &[], &[], &listed(&[&dir.0, &sub])).is_ok());
+        // The same extension refusal.
+        let e = super::resolve(&s(&prog), &[], &[], &l).unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotSupported);
+        // Missing or relative.
+        assert_eq!(super::resolve(&s(&dir.0.join("gone.txt")), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+        assert_eq!(super::resolve("notes.txt", &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn a_link_in_a_listed_folder_is_refused() {
+        let dir = ScratchDir::new("open-browsed-link");
+        let outside = ScratchDir::new("open-browsed-link-out");
+        std::fs::write(outside.0.join("secret.txt"), b"x").expect("write");
+        let link = dir.0.join("link");
+        dir_link(&link, &outside.0);
+        let l = listed(&[&dir.0]);
+        // Through the junction: its folder is not the listed one.
+        assert_eq!(super::resolve(&s(&link.join("secret.txt")), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+        // The link itself is a folder link, not a file.
+        assert_eq!(super::resolve(&s(&link), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
+        // A listed folder later replaced by a junction no longer matches.
+        let replaced = ScratchDir::new("open-browsed-replaced");
+        let folder = replaced.0.join("docs");
+        std::fs::create_dir(&folder).expect("mkdir");
+        let l = listed(&[&folder]);
+        std::fs::remove_dir(&folder).expect("rmdir");
+        dir_link(&folder, &outside.0);
+        assert_eq!(super::resolve(&s(&folder.join("secret.txt")), &[], &[], &l).unwrap_err().code, ErrorCode::InvalidInput);
     }
 }

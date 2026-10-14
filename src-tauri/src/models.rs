@@ -302,6 +302,27 @@ impl AccentColor {
     }
 }
 
+/// v0.9.0: the default keybinding map that `keybindings` overrides apply to (`KeybindingsPreset`
+/// in `types.ts`). New installs get `Commander`; a settings file without the field loads `Classic`
+/// (see [`AppSettings::from_json_lenient`]), so an upgrading user's keys do not change.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KeybindingsPreset {
+    #[default]
+    Commander,
+    Classic,
+}
+
+impl KeybindingsPreset {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "commander" => Some(Self::Commander),
+            "classic" => Some(Self::Classic),
+            _ => None,
+        }
+    }
+}
+
 /// User settings (flat object, `AppSettings` in `types.ts`). `part_size_mib: None` means Auto.
 ///
 /// Parsing goes through [`AppSettings::from_json_lenient`] (the on-disk file) or
@@ -351,6 +372,10 @@ pub struct AppSettings {
     /// v0.8.0: the details panel previews the selected file on its own; off = a "Preview" button.
     #[serde(default = "default_true")]
     pub preview_automatically: bool,
+    /// v0.9.0: the default keybinding map. `Default` (and serde's field default) is `Commander`;
+    /// the on-disk file without the field loads `Classic` in [`AppSettings::from_json_lenient`].
+    #[serde(default)]
+    pub keybindings_preset: KeybindingsPreset,
 }
 
 /// Inclusive range of the bandwidth limits (mirror `BANDWIDTH_LIMITS` in `types.ts`).
@@ -422,6 +447,7 @@ impl Default for AppSettings {
             download_limit_kibps: None,
             upload_limit_kibps: None,
             preview_automatically: default_true(),
+            keybindings_preset: KeybindingsPreset::Commander,
         }
     }
 }
@@ -454,6 +480,10 @@ fn check_updates_error() -> crate::error::AppError {
 
 fn preview_automatically_error() -> crate::error::AppError {
     crate::error::AppError::invalid("previewAutomatically must be true or false")
+}
+
+fn keybindings_preset_error() -> crate::error::AppError {
+    crate::error::AppError::invalid(r#"keybindingsPreset must be "commander" or "classic""#)
 }
 
 fn notify_error() -> crate::error::AppError {
@@ -712,16 +742,24 @@ impl AppSettings {
                 .get("previewAutomatically")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(d.preview_automatically),
+            // v0.9.0: a file without the field (or with an unknown value) was written by an
+            // earlier version: keep its keys exactly as they were (`classic`), never `Default`.
+            keybindings_preset: obj
+                .get("keybindingsPreset")
+                .and_then(serde_json::Value::as_str)
+                .and_then(KeybindingsPreset::parse)
+                .unwrap_or(KeybindingsPreset::Classic),
         }
     }
 
-    /// Strict parse of the `update_settings` argument: all fifteen fields must be present
+    /// Strict parse of the `update_settings` argument: all sixteen fields must be present
     /// (`fileManagerCommand` a string or `null`; trimmed, empty becomes `null`; `keybindings` an
     /// object of chord arrays within [`validate_keybindings`]'s limits; `downloadLimitKibps` and
     /// `uploadLimitKibps` `null` or an integer within the bandwidth range). Transfer
     /// and text fields must be in-range integers (`partSizeMib` may be `null`); `theme` one of the
     /// three modes and `accent` one of the four colours; `checkUpdatesOnStartup`,
-    /// `notifyOnFinish`, `confirmCopyMove` and `previewAutomatically` booleans. Anything else is
+    /// `notifyOnFinish`, `confirmCopyMove` and `previewAutomatically` booleans; `keybindingsPreset` `"commander"` or
+    /// `"classic"`. Anything else is
     /// `InvalidInput` naming the field.
     /// Unknown fields are ignored.
     pub fn from_json_strict(v: &serde_json::Value) -> crate::error::AppResult<Self> {
@@ -776,6 +814,11 @@ impl AppSettings {
                 .get("previewAutomatically")
                 .and_then(serde_json::Value::as_bool)
                 .ok_or_else(preview_automatically_error)?,
+            keybindings_preset: obj
+                .get("keybindingsPreset")
+                .and_then(serde_json::Value::as_str)
+                .and_then(KeybindingsPreset::parse)
+                .ok_or_else(keybindings_preset_error)?,
         };
         s.validate()?;
         Ok(s)

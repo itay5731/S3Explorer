@@ -132,6 +132,12 @@ mod tests {
         e.message
     }
 
+    /// What a settings file written before v0.9.0 (no `keybindingsPreset`) loads as, apart from its
+    /// own fields: the defaults with the `classic` preset.
+    fn legacy() -> AppSettings {
+        AppSettings { keybindings_preset: KeybindingsPreset::Classic, ..AppSettings::default() }
+    }
+
     #[test]
     fn defaults_match_contract() {
         let d = AppSettings::default();
@@ -153,7 +159,8 @@ mod tests {
                 "keybindings": {},
                 "downloadLimitKibps": null,
                 "uploadLimitKibps": null,
-                "previewAutomatically": true
+                "previewAutomatically": true,
+                "keybindingsPreset": "commander"
             })
         );
         assert!(d.validate().is_ok());
@@ -234,6 +241,7 @@ mod tests {
         o.entry("downloadLimitKibps").or_insert(serde_json::Value::Null);
         o.entry("uploadLimitKibps").or_insert(serde_json::Value::Null);
         o.entry("previewAutomatically").or_insert(json!(true));
+        o.entry("keybindingsPreset").or_insert(json!("commander"));
         v
     }
 
@@ -274,7 +282,7 @@ mod tests {
     #[test]
     fn strict_parse_theme_and_update_flag() {
         let base =
-            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}, "downloadLimitKibps": null, "uploadLimitKibps": null, "previewAutomatically": true});
+            json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4, "notifyOnFinish": true, "textSize": 100, "textWeight": 400, "accent": "yellow", "confirmCopyMove": true, "fileManagerCommand": null, "keybindings": {}, "downloadLimitKibps": null, "uploadLimitKibps": null, "previewAutomatically": true, "keybindingsPreset": "commander"});
         let with = |theme: Option<serde_json::Value>, flag: Option<serde_json::Value>| {
             let mut v = base.clone();
             let o = v.as_object_mut().expect("object");
@@ -560,7 +568,7 @@ mod tests {
             .expect("write");
         let loaded = load(&path);
         assert_eq!((loaded.download_limit_kibps, loaded.upload_limit_kibps), (None, None));
-        assert_eq!(loaded, s(Some(16), 4, 2));
+        assert_eq!(loaded, AppSettings { keybindings_preset: KeybindingsPreset::Classic, ..s(Some(16), 4, 2) });
         // Round trip through the file.
         let saved = AppSettings { download_limit_kibps: Some(2048), upload_limit_kibps: Some(64), ..AppSettings::default() };
         save(&path, &saved).expect("save");
@@ -641,6 +649,7 @@ mod tests {
                 download_limit_kibps: None,
                 upload_limit_kibps: None,
                 preview_automatically: true,
+                keybindings_preset: KeybindingsPreset::Classic,
             }
         );
         // Saved again, the file carries the new field.
@@ -700,11 +709,12 @@ mod tests {
                 download_limit_kibps: None,
                 upload_limit_kibps: None,
                 preview_automatically: true,
+                keybindings_preset: KeybindingsPreset::Classic,
             }
         );
         std::fs::write(&path, "{\n  \"partSizeMib\": null,\n  \"maxConcurrentParts\": 8,\n  \"maxConcurrentTransfers\": 4\n}")
             .expect("write");
-        assert_eq!(load(&path), AppSettings::default());
+        assert_eq!(load(&path), legacy());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -732,32 +742,33 @@ mod tests {
                     download_limit_kibps: None,
                     upload_limit_kibps: None,
                     preview_automatically: true,
+                    keybindings_preset: KeybindingsPreset::Classic,
                 },
             ),
             // Non-boolean flag: only the flag falls back.
             (
                 r#"{"partSizeMib": 4, "theme": "dark", "checkUpdatesOnStartup": "yes"}"#,
-                AppSettings { part_size_mib: Some(4), theme: ThemeMode::Dark, ..AppSettings::default() },
+                AppSettings { part_size_mib: Some(4), theme: ThemeMode::Dark, ..legacy() },
             ),
             // Wrong-typed transfer field next to valid new fields.
             (
                 r#"{"maxConcurrentParts": "eight", "maxConcurrentTransfers": 2, "theme": "light"}"#,
-                AppSettings { max_concurrent_transfers: 2, theme: ThemeMode::Light, ..AppSettings::default() },
+                AppSettings { max_concurrent_transfers: 2, theme: ThemeMode::Light, ..legacy() },
             ),
             // Fractional / negative numbers.
             (
                 r#"{"partSizeMib": 2.5, "maxConcurrentParts": -1, "checkUpdatesOnStartup": true}"#,
-                AppSettings { check_updates_on_startup: true, ..AppSettings::default() },
+                AppSettings { check_updates_on_startup: true, ..legacy() },
             ),
             // Notifications switched off; a non-boolean value falls back to on.
-            (r#"{"notifyOnFinish": false}"#, AppSettings { notify_on_finish: false, ..AppSettings::default() }),
-            (r#"{"notifyOnFinish": "no"}"#, AppSettings::default()),
+            (r#"{"notifyOnFinish": false}"#, AppSettings { notify_on_finish: false, ..legacy() }),
+            (r#"{"notifyOnFinish": "no"}"#, legacy()),
             // v0.8.0: preview off is kept; a v0.7.0 file without the field previews automatically.
-            (r#"{"previewAutomatically": false}"#, AppSettings { preview_automatically: false, ..AppSettings::default() }),
-            (r#"{"previewAutomatically": "no"}"#, AppSettings::default()),
+            (r#"{"previewAutomatically": false}"#, AppSettings { preview_automatically: false, ..legacy() }),
+            (r#"{"previewAutomatically": "no"}"#, legacy()),
             // A file without checkUpdatesOnStartup checks (v0.8.0 default); `false` is respected.
-            (r#"{"theme": "dark"}"#, AppSettings { theme: ThemeMode::Dark, check_updates_on_startup: true, ..AppSettings::default() }),
-            (r#"{"checkUpdatesOnStartup": false}"#, AppSettings { check_updates_on_startup: false, ..AppSettings::default() }),
+            (r#"{"theme": "dark"}"#, AppSettings { theme: ThemeMode::Dark, check_updates_on_startup: true, ..legacy() }),
+            (r#"{"checkUpdatesOnStartup": false}"#, AppSettings { check_updates_on_startup: false, ..legacy() }),
         ];
         for (text, want) in cases {
             std::fs::write(&path, text).expect("write");
@@ -806,17 +817,31 @@ mod tests {
         let path = dir.join(SETTINGS_FILE);
         assert_eq!(load(&path), AppSettings::default(), "missing");
 
-        for corrupt in ["", "{", "not json", "[]", r#"{"maxConcurrentParts":"eight"}"#, r#"{"partSizeMib":-3}"#] {
+        // Not a JSON object: the defaults wholesale.
+        for corrupt in ["", "{", "not json", "[]"] {
             std::fs::write(&path, corrupt).expect("write");
             assert_eq!(load(&path), AppSettings::default(), "corrupt: {corrupt}");
         }
+        // An object written before v0.9.0 (no preset): its bad fields fall back, preset classic.
+        for corrupt in [r#"{"maxConcurrentParts":"eight"}"#, r#"{"partSizeMib":-3}"#] {
+            std::fs::write(&path, corrupt).expect("write");
+            assert_eq!(load(&path), legacy(), "corrupt: {corrupt}");
+        }
 
         std::fs::write(&path, r#"{"maxConcurrentParts": 3, "futureField": {"x": 1}}"#).expect("write");
-        assert_eq!(load(&path), s(None, 3, 4), "partial + unknown field");
+        assert_eq!(
+            load(&path),
+            AppSettings { keybindings_preset: KeybindingsPreset::Classic, ..s(None, 3, 4) },
+            "partial + unknown field"
+        );
 
         std::fs::write(&path, r#"{"partSizeMib": 999, "maxConcurrentParts": 0, "maxConcurrentTransfers": 2}"#)
             .expect("write");
-        assert_eq!(load(&path), s(None, 8, 2), "out-of-range fields fall back individually");
+        assert_eq!(
+            load(&path),
+            AppSettings { keybindings_preset: KeybindingsPreset::Classic, ..s(None, 8, 2) },
+            "out-of-range fields fall back individually"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -856,6 +881,72 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Io);
         assert!(!called);
         assert_eq!(store.get(), AppSettings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keybindings_preset_field() {
+        // A fresh install (no file) gets the Total Commander preset.
+        assert_eq!(AppSettings::default().keybindings_preset, KeybindingsPreset::Commander);
+        let dir = temp_dir("preset");
+        let path = dir.join(SETTINGS_FILE);
+        assert_eq!(load(&path).keybindings_preset, KeybindingsPreset::Commander, "fresh default");
+        assert_eq!(SettingsStore::load(path.clone()).get().keybindings_preset, KeybindingsPreset::Commander);
+
+        // Exactly what v0.8.0 wrote (all fifteen fields, no preset): classic, overrides kept.
+        let v080 = r#"{
+  "partSizeMib": null,
+  "maxConcurrentParts": 8,
+  "maxConcurrentTransfers": 4,
+  "theme": "system",
+  "checkUpdatesOnStartup": true,
+  "notifyOnFinish": true,
+  "textSize": 100,
+  "textWeight": 400,
+  "accent": "yellow",
+  "confirmCopyMove": true,
+  "fileManagerCommand": null,
+  "keybindings": {"act.rename": ["F2"]},
+  "downloadLimitKibps": null,
+  "uploadLimitKibps": null,
+  "previewAutomatically": true
+}"#;
+        std::fs::write(&path, v080).expect("write");
+        let got = load(&path);
+        assert_eq!(got.keybindings_preset, KeybindingsPreset::Classic, "v0.8 file without the field");
+        assert_eq!(got.keybindings.get("act.rename"), Some(&vec!["F2".to_string()]));
+        assert_eq!(got, AppSettings { keybindings: got.keybindings.clone(), ..legacy() });
+
+        let with = |value: Option<serde_json::Value>| {
+            let mut v = full(json!({"partSizeMib": null, "maxConcurrentParts": 8, "maxConcurrentTransfers": 4}));
+            let o = v.as_object_mut().expect("object");
+            match value {
+                Some(value) => o.insert("keybindingsPreset".into(), value),
+                None => o.remove("keybindingsPreset"),
+            };
+            v
+        };
+        for (name, preset) in [("commander", KeybindingsPreset::Commander), ("classic", KeybindingsPreset::Classic)] {
+            assert_eq!(AppSettings::from_json_strict(&with(Some(json!(name)))).expect("valid").keybindings_preset, preset);
+            assert_eq!(AppSettings::from_json_lenient(&with(Some(json!(name)))).keybindings_preset, preset);
+        }
+        // Strict (update_settings) requires the field; the file is read leniently as classic.
+        for bad in [None, Some(json!("Commander")), Some(json!("tc")), Some(json!("")), Some(json!(1)), Some(serde_json::Value::Null)] {
+            let v = with(bad);
+            let e = AppSettings::from_json_strict(&v).expect_err(&v.to_string());
+            assert_eq!(e.code, ErrorCode::InvalidInput);
+            assert!(e.message.starts_with("keybindingsPreset"), "{v} -> {}", e.message);
+            assert_eq!(AppSettings::from_json_lenient(&v), legacy(), "{v}");
+        }
+
+        // Saved, the file carries the field and reloads as saved (both presets).
+        for preset in [KeybindingsPreset::Classic, KeybindingsPreset::Commander] {
+            let saved = AppSettings { keybindings_preset: preset, ..AppSettings::default() };
+            save(&path, &saved).expect("save");
+            let text = std::fs::read_to_string(&path).expect("read");
+            assert!(text.contains("\"keybindingsPreset\""), "{text}");
+            assert_eq!(load(&path), saved);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -14,6 +14,7 @@ pub mod folder_size;
 pub mod jobs;
 pub mod keychain;
 pub mod lifecycle;
+pub mod local_fs;
 pub mod local_open;
 pub mod metadata;
 pub mod models;
@@ -176,6 +177,12 @@ pub fn run() {
             commands::transfers::try_file_manager,
             commands::files::write_text_file,
             commands::files::read_text_file,
+            commands::local::list_local_roots,
+            commands::local::list_local_dir,
+            commands::local::create_local_dir,
+            commands::local::rename_local,
+            commands::local::trash_local,
+            commands::local::local_dir_size,
         ])
         .build(context)
         .expect("error while building tauri application")

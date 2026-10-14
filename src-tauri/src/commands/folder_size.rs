@@ -12,9 +12,11 @@ pub async fn folder_size(state: State<'_, AppState>, id: String, bucket: String,
     st.folder_sizes.run(&id, &bucket, &prefix, || st.client_for_bucket(&bucket)).await
 }
 
-/// Stops the scan with this id (it rejects with `Cancelled`); a no-op for an unknown id.
+/// Stops the scan with this id (it rejects with `Cancelled`); a no-op for an unknown id. Also stops
+/// a `local_dir_size` scan with this id (v0.9.0).
 #[tauri::command]
 pub async fn cancel_folder_size(state: State<'_, AppState>, id: String) -> AppResult<()> {
     state.folder_sizes.cancel(&id);
+    state.local_dir_sizes.cancel(&id);
     Ok(())
 }

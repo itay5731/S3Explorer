@@ -16,6 +16,7 @@ use crate::batches::{BatchManager, BatchSink};
 use crate::jobs::{JobManager, JobSink};
 use crate::models::{AppSettings, ConnectionConfig, ConnectionInfo};
 use crate::folder_size::FolderSizeScans;
+use crate::local_fs::{ListedDirs, LocalDirSizes};
 use crate::search::SearchRegistry;
 use crate::settings::SettingsStore;
 use crate::transfers::{ProgressSink, TransferManager};
@@ -221,6 +222,10 @@ pub struct AppState {
     pub searches: SearchRegistry,
     /// Running `folder_size` scans by id.
     pub folder_sizes: FolderSizeScans,
+    /// v0.9.0: running `local_dir_size` scans by `scanId`.
+    pub local_dir_sizes: LocalDirSizes,
+    /// v0.9.0: directories listed by `list_local_dir` (what `open_local` may open files in).
+    pub listed_dirs: ListedDirs,
     pub settings: SettingsStore,
 }
 
@@ -241,6 +246,8 @@ impl AppState {
             batches,
             searches: SearchRegistry::new(),
             folder_sizes: FolderSizeScans::new(),
+            local_dir_sizes: LocalDirSizes::new(),
+            listed_dirs: ListedDirs::new(),
             settings,
         }
     }

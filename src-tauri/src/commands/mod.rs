@@ -9,6 +9,7 @@ pub mod folder_size;
 pub mod folders;
 pub mod jobs;
 pub mod lifecycle;
+pub mod local;
 pub mod metadata;
 pub mod saved;
 pub mod search;

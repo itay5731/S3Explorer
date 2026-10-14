@@ -65,17 +65,18 @@ pub async fn list_transfers(state: State<'_, AppState>) -> AppResult<Vec<Transfe
     Ok(state.transfers.list())
 }
 
-/// Opens a finished download: a file with its default application, a folder in the file manager
+/// Opens a finished download (or, v0.9.0, a file in a folder listed in a local pane): a file with
+/// its default application, a folder in the file manager
 /// (the `fileManagerCommand` override when set); see [`crate::local_open::resolve`] for what is
 /// accepted.
 #[tauri::command]
 pub async fn open_local(app: tauri::AppHandle, state: State<'_, AppState>, path: String) -> AppResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let (transfers, batches) = (state.transfers.list(), state.batches.list());
+    let (transfers, batches, listed) = (state.transfers.list(), state.batches.list(), state.listed_dirs.snapshot());
     let command = state.get_settings().file_manager_command;
     // Checking and opening both touch the file system and the shell: a blocking thread, never the runtime.
     tokio::task::spawn_blocking(move || {
-        let real = crate::local_open::resolve(&path, &transfers, &batches)?;
+        let real = crate::local_open::resolve(&path, &transfers, &batches, &listed)?;
         if let (true, Some(command)) = (real.is_dir(), command.as_deref()) {
             return crate::file_manager::launch(command, &real);
         }
