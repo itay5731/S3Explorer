@@ -2111,3 +2111,130 @@ None.
   Settings → Keyboard and the cheat sheet; the defaults table is extended with the final rows.
 - "Later" on the update popup is remembered per version; the details panel stays hidden until a bucket
   is open; folder sizes are "cleared by changes made in this app", not "never stale".
+
+## v0.9.0 additions — Commander mode (issue #13)
+
+Four requests from issue #13: Total Commander keybindings as the default without changing existing users'
+bindings; a pane that shows the local computer so copy = download and move = download + delete; an
+editable path; and syncing the other pane to this one.
+
+### Keybinding presets
+
+A **preset** is a complete default map (every action id → chords). Two presets ship:
+
+| Preset id | Meaning |
+|---|---|
+| `commander` | Total Commander layout: `F5` / `F6` copy / move to the other pane, `Shift+F6` rename, `F2` refresh (`Mod+R` too), `Alt+F7` focus search (plus `Mod+F`, `/`), `Alt+Shift+T` tags, `Alt+Shift+L` folder size, `Mod+T` and `Mod+N` new tab, `Alt+F1` / `Alt+F2` choose the left / right pane's source (new, below), `Mod+L` edit path (new), `Mod+Shift+ArrowRight` / `Mod+Shift+ArrowLeft` sync the other pane (new). Everything else as in `classic`. The exact map is the file attached to issue #13 plus the four new actions; it lives in `src/lib/keys.ts` as `PRESETS.commander` and is the source of truth. |
+| `classic` | The v0.7.0/v0.8.0 defaults exactly as they are today (`F5` refresh, `F2` rename, `Mod+Shift+C/X` copy/move to the other pane, …) plus the four new actions on the same chords as `commander` where free (`Mod+L`, `Mod+Shift+ArrowLeft/Right`, `Alt+F1`/`Alt+F2`). |
+
+```ts
+// AppSettings (v0.9.0)
+keybindingsPreset: "commander" | "classic";   // the default map that `keybindings` overrides apply to
+```
+
+- `DEFAULT_APP_SETTINGS.keybindingsPreset` is `"commander"`: **new installs get Total Commander keys.**
+- **A `settings.json` without the field loads `"classic"`.** That is the whole upgrade story: an existing
+  user's effective bindings do not change by one key, and their `keybindings` overrides keep meaning what
+  they meant. `update_settings` requires the field (strict), like every other field.
+- Settings → Keyboard gets a **Preset** control at the top (Total Commander / Classic) with a one-line
+  description of each. Changing it changes the default map; overrides stay as they are, and the
+  conflict check runs against the new defaults (conflicts are shown as today). "Reset all" resets the
+  overrides, not the preset. The cheat sheet and all tooltips follow the effective map as before.
+- Export files gain `"preset": "commander" | "classic"`; import applies the preset and then the
+  bindings. A file without `preset` (v0.8.0 export) imports as full explicit bindings, as today.
+- The always-prevented webview keys (F5, Ctrl+R, …) stay prevented in both presets.
+
+### Pane sources: S3 or the local computer
+
+A pane shows one **source**: this connection's S3 (a bucket and prefix, as today) or **the local
+computer** (a directory). Everything that worked on an S3 pane keeps working; a local pane adds a
+Commander-style view of the disk, and transfers between the two panes are the existing downloads and
+uploads.
+
+```ts
+type PaneSource = { kind: "s3" } | { kind: "local" };
+interface LocalRoot { path: string; label: string; kind: "drive" | "home" | "folder" }   // C:\, D:\, Home…
+interface LocalEntry {
+  name: string;
+  path: string;              // absolute, as the OS returns it
+  isDir: boolean;
+  size: number;              // 0 for directories
+  modified: string | null;   // RFC 3339
+  isSymlink: boolean;        // the entry itself is a symlink/junction (shown, never followed)
+  hidden: boolean;           // dotfile or hidden attribute
+}
+interface LocalListing { dirs: LocalEntry[]; files: LocalEntry[]; truncated: boolean; parent: string | null }
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `list_local_roots` | `{}` | `LocalRoot[]`: on Windows every ready drive letter plus the user's home; on macOS/Linux `/`, `/Volumes` or `/media`, `/mnt` mounts that exist, and the home. |
+| `list_local_dir` | `{ path, showHidden }` | `LocalListing`, sorted by name, **capped at 50,000 entries** (`truncated: true` past that), never following symlinks, `InvalidInput` for a relative path, `Io` with the OS message when unreadable (permissions, missing). `parent` is the parent directory or null at a root. |
+| `create_local_dir` | `{ parent, name }` | `void`. Name sanitized with the same rules as download file names; refuses an existing name. |
+| `rename_local` | `{ path, newName }` | `void`. Same directory only; refuses an existing target; never replaces. |
+| `trash_local` | `{ paths: string[] }` | `{ trashed: number; failed: { path: string; message: string }[] }`. Moves to the OS recycle bin / trash (the `trash` crate), **never a permanent delete**; a symlink is trashed as the link, never its target. |
+| `local_dir_size` | `{ path, scanId }` | `{ files, bytes, truncated }`, bounded like folder size (200,000 entries), cancellable by id, never follows symlinks. |
+
+- **Choosing a source:** `Alt+F1` (left pane) / `Alt+F2` (right pane), the pane's path-bar menu, and the
+  sidebar's new "This computer" group (the local roots, discreet: one collapsible group under the buckets)
+  open a source menu listing the connection's buckets and the local roots. Picking a local root turns the
+  pane into a local pane at that root; picking a bucket turns it back into an S3 pane. In single-pane
+  view `Alt+F1` acts on the one pane and `Alt+F2` opens the split with a local pane on the right.
+- **Local pane UI:** the same table (Name, Size, Modified; no storage class), the same selection and
+  keyboard rules, folders first, a hidden-files toggle in the path bar (per session), `Enter`/`Backspace`
+  navigate, the path bar shows the directory, "Open in file manager" uses the existing `reveal_local`
+  rule for directories, "Open" on a file uses `open_local` **extended to accept any file the user
+  browsed to in a local pane** (same extension refusal list, same link rule). Right-click: Open, Show in
+  folder, New folder, Rename, Delete (to recycle bin, with the usual confirmation listing exact paths),
+  Calculate size, Copy path. Search, tags, versions, lifecycle, metadata and preview are S3-only and are
+  disabled with a reason on a local pane (preview of local files is out of scope for v0.9.0).
+- **Transfers between panes** (toolbar Copy/Move to other pane, `F5`/`F6` in `commander`, drag and drop,
+  context menu), by pane kinds:
+  - S3 → local **copy**: `start_download` per object / `start_batch` download per folder into the local
+    pane's directory (the existing conflict preview, name sanitizing, link rules). **Move**: the same,
+    then, for each transfer or batch that ends `completed`, one delete job for exactly the keys/prefixes
+    that completed (the existing `delete` job, no extra confirmation beyond the move's own, which lists
+    the keys and says they will be deleted from S3 after download). Anything that failed, was cancelled
+    or was skipped is **not** deleted. Closing the app mid-way deletes nothing.
+  - local → S3 **copy**: `start_upload` per file / `start_batch` upload per folder to the S3 pane's
+    bucket + prefix (existing conflict preview). **Move**: the same, then `trash_local` for exactly the
+    files/folders whose transfer ended `completed` (to the recycle bin; the confirmation says so).
+  - local → local: copy/move on disk are **out of scope** (use the OS); the actions are disabled with that
+    reason. S3 → S3 is unchanged.
+  - The source selection and the destination directory/prefix are captured when the action starts; the
+    post-completion delete uses exactly the captured items that completed, matched by transfer id.
+- **Data safety for local panes:** every path shown is sent back verbatim; `trash_local` never bypasses
+  the recycle bin; symlinks and junctions are listed with a link badge and refused as sources of a move
+  (copy works, as a file); listings are bounded; a local pane never lists outside the roots the OS exposes
+  (no UNC or device paths typed by hand: `InvalidInput`).
+- **Keyboard:** `source.pickLeft` (`Alt+F1`), `source.pickRight` (`Alt+F2`), `local.toggleHidden`
+  (`Mod+.`), everything else reuses existing actions on the local pane (`act.delete` = trash,
+  `act.newFolder`, `act.rename`, `act.folderSize`, `act.copyToOther`, `act.moveToOther`).
+- **History** records local transfers like any transfer (they already are transfers); the per-connection
+  key applies to the S3 side.
+
+### Edit path
+
+`nav.editPath` (`Mod+L` in both presets) turns the active pane's path bar into a text field holding the
+current location (`s3://bucket/prefix/` for S3 panes, the directory for local panes). `Enter` navigates:
+an `s3://` address switches bucket if needed (same rules as the search box's `s3://` paste); a bare prefix
+is relative to the current bucket; an absolute local path turns the pane into a local pane at that
+directory (or its parent, selecting the file, when it is a file); a non-existent target shows the error
+inline and keeps the field open. `Esc` cancels. Clicking the path bar's empty area also opens it.
+
+### Sync the other pane
+
+`nav.syncOther` (`Mod+Shift+ArrowRight` when the active pane is the left one, `Mod+Shift+ArrowLeft` when
+it is the right one; both chords are bound to the one action, which always targets the other pane) makes
+the other pane show the active pane's source and location (bucket + prefix, or local directory). It opens
+the split if needed. Nothing is selected in the target pane afterwards.
+
+### Scope note
+
+The local pane makes "dragging objects out of the app" partly unnecessary (copy to a local pane instead);
+it stays out of scope as a drag target. Sync (two-way mirroring) stays out of scope: `nav.syncOther` only
+navigates.
+
+### IAM permissions added in this version
+
+None. Moves from S3 to local use `DeleteObject(s)` after download, which the Delete row already covers.

@@ -155,6 +155,11 @@ export interface AppSettings extends TransferSettings {
   uploadLimitKibps: number | null;
   /** v0.8.0: load a preview (HEAD + bounded GET) as soon as a single file is selected. Default true. */
   previewAutomatically: boolean;
+  /**
+   * v0.9.0: the default keybinding map that `keybindings` overrides apply to. New installs get
+   * "commander"; a settings file without the field loads "classic" (see "Keybinding presets").
+   */
+  keybindingsPreset: KeybindingsPreset;
 }
 
 /** Range of `downloadLimitKibps` / `uploadLimitKibps` (the backend enforces the same). */
@@ -180,6 +185,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   downloadLimitKibps: null,
   uploadLimitKibps: null,
   previewAutomatically: true,
+  keybindingsPreset: "commander",
 };
 
 // Saved connections
@@ -487,6 +493,37 @@ export interface SearchResult {
 }
 
 export const FILE_MANAGER_COMMAND_MAX = 1024;
+
+/** v0.9.0: the two shipped default keybinding maps (see "Keybinding presets" in docs/CONTRACT.md). */
+export type KeybindingsPreset = "commander" | "classic";
+
+// ---- v0.9.0: pane sources, the local computer (see "Pane sources" in docs/CONTRACT.md) ----
+
+export type PaneSource = { kind: "s3" } | { kind: "local" };
+
+export interface LocalRoot { path: string; label: string; kind: "drive" | "home" | "folder" }
+
+export interface LocalEntry {
+  name: string;
+  /** Absolute, as the OS returns it; sent back verbatim. */
+  path: string;
+  isDir: boolean;
+  /** 0 for directories. */
+  size: number;
+  /** RFC 3339, or null when unknown. */
+  modified: string | null;
+  /** The entry itself is a symlink or junction: shown with a badge, never followed. */
+  isSymlink: boolean;
+  hidden: boolean;
+}
+
+export interface LocalListing { dirs: LocalEntry[]; files: LocalEntry[]; truncated: boolean; parent: string | null }
+
+export interface TrashResult { trashed: number; failed: { path: string; message: string }[] }
+
+export interface LocalDirSize { files: number; bytes: number; truncated: boolean }
+
+export const LOCAL_LIMITS = { maxEntries: 50_000, dirSizeMaxEntries: 200_000 } as const;
 
 /** Limits for `AppSettings.keybindings` and the export/import file (see "Keyboard" in docs/CONTRACT.md). */
 export const KEYBINDING_LIMITS = {

@@ -5,6 +5,13 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+### New
+
+- **Total Commander keys, if you want them.** New installs start with the Total Commander layout (`F5` copy and `F6` move to the other pane, `Shift+F6` rename, `F2` refresh, `Alt+F7` search). If you already use S3 Explorer nothing changes: your keys stay exactly as they were, and Settings → Keyboard now has a Preset switch (Total Commander / Classic) so you can pick either at any time. Thanks to EthanLerner1 for the request (#13).
+- **The local computer in a pane.** `Alt+F1` / `Alt+F2` (or the new "This computer" group in the sidebar) turn the left or right pane into a view of a drive or folder on your machine. Copy from S3 to it to download, from it to S3 to upload; Move does the same and then removes the source, deleting from S3 only what finished downloading and sending local files to the recycle bin, never a permanent delete. New folder, rename, delete (to the recycle bin) and folder sizes work on the local side too.
+- **Edit the path.** `Mod+L` turns the path bar into a text field: paste an `s3://` address or a local path and press Enter.
+- **Sync the other pane.** `Ctrl+Shift+Right` / `Ctrl+Shift+Left` make the other pane show what this one shows.
+
 ## [0.8.0] - 2026-10-13
 
 ### New
