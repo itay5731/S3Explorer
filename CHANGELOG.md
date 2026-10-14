@@ -5,6 +5,8 @@ The section for a version becomes the text of its GitHub Release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-14
+
 ### New
 
 - **Total Commander keys by default.** `F5` copies and `F6` moves to the other pane, `Shift+F6` renames, `F7` creates a folder, `F8` or `Delete` deletes, `F2` refreshes, `Alt+F7` searches and `Ctrl+T` opens a new tab (on macOS, `Cmd` wherever this says `Ctrl`). If you already use S3 Explorer, nothing changes: your keys are kept exactly as they were, and a one-time message tells you so. **Reset all** in Settings → Keyboard switches you to the Total Commander layout. `F1` always shows the keys that apply to you. Thanks to EthanLerner1 for the request (#13).
@@ -25,10 +27,6 @@ The section for a version becomes the text of its GitHub Release.
 - **Pause and resume are one button** that stays in the same place on an Activity row, and `Space` pauses or resumes the row you are on.
 - **Files are sorted by name, A to Z, every time the app starts**, whatever sort you used last time.
 - **Sorting by Size puts folders in order of their calculated size.** Folders you have not calculated come after them, by name.
-
-### Fixed
-
-- **The `Alt+F1` / `Alt+F2` menu opened from the bottom of the window when the pane was empty.** It now opens under the path bar like everywhere else.
 
 ## [0.8.0] - 2026-10-13
 
