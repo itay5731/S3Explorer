@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { Archive, ArchiveX, Bookmark, BookmarkX, CalendarClock, ChevronRight, FolderOpen, HardDrive, Home, Info, MoreHorizontal, Plus, RefreshCw, Search, SquarePlus, Tag, Tags, Users, X } from "lucide-react";
 import { activePane, loadAddedBuckets, loadBuckets, navigate, navigateLocal, openModal, readPref, useApp, usePane, writePref } from "../store/app";
-import { loadLocalRoots, useLocalRoots } from "../store/local";
+import { focusComputer, loadLocalRoots, setLocalRootsOpen, useLocalRoots, useLocalRootsOpen } from "../store/local";
 import { focusPaneListSoon } from "../store/keyboard";
 import { useTags } from "../store/tags";
 import { formatExact } from "../lib/format";
@@ -66,6 +66,11 @@ function moveInList(from: HTMLElement, key: string): boolean {
   const rows = [...(list?.querySelectorAll<HTMLElement>(".bucket-item:not(.skeleton)") ?? [])];
   if (!rows.length) return false;
   const i = rows.indexOf(from);
+  // The buckets and "This computer" are one column: past the last bucket, a collapsed group opens.
+  if (key === "ArrowDown" && i === rows.length - 1 && !from.classList.contains("local-root") && !useLocalRootsOpen.getState().open) {
+    void focusComputer();
+    return true;
+  }
   const to =
     key === "ArrowDown" ? (i < 0 ? 0 : Math.min(rows.length - 1, i + 1))
     : key === "ArrowUp" ? (i < 0 ? rows.length - 1 : Math.max(0, i - 1))
@@ -150,14 +155,12 @@ function BucketRow({ b, selected, onMenu }: { b: BucketEntry; selected: boolean;
   );
 }
 
-const LOCAL_OPEN_KEY = "s3x.localRootsOpen";
-
 /**
  * "This computer" (v0.9.0): the drives and the home folder, one collapsible group under the buckets
  * (closed until opened once; the choice is remembered). A root opens in the active pane as a local pane.
  */
 function LocalRootsGroup() {
-  const [open, setOpen] = useState(() => readPref<boolean>(LOCAL_OPEN_KEY, false));
+  const open = useLocalRootsOpen((s) => s.open);
   const roots = useLocalRoots((s) => s.roots);
   const loading = useLocalRoots((s) => s.loading);
   const error = useLocalRoots((s) => s.error);
@@ -165,10 +168,7 @@ function LocalRootsGroup() {
   useEffect(() => {
     if (open) void loadLocalRoots();
   }, [open]);
-  const toggle = () => {
-    setOpen(!open);
-    writePref(LOCAL_OPEN_KEY, !open);
-  };
+  const toggle = () => setLocalRootsOpen(!open);
   const go = (path: string) => {
     navigateLocal(path, activePane());
     focusPaneListSoon(activePane());

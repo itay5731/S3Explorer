@@ -25,9 +25,13 @@ export const setRecording = (recording: boolean) => useKeys.setState({ recording
 
 let cache: { overrides: Bindings | undefined; preset: KeybindingsPreset; bindings: Bindings; index: KeyIndex } | null = null;
 
-/** The saved preset; a settings object without one (or none loaded yet) means "classic". */
+/**
+ * The defaults the saved overrides apply to: Total Commander, except for an upgraded install whose
+ * settings still say "classic" until its one-time migration is saved (store/settings.ts).
+ */
 export function currentPreset(): KeybindingsPreset {
-  return asPreset(useSettings.getState().settings?.keybindingsPreset) ?? "classic";
+  const s = useSettings.getState().settings;
+  return s ? (asPreset(s.keybindingsPreset) ?? "classic") : "commander";
 }
 
 /** Every action's chords and the dispatcher's index, from the saved preset and overrides. */

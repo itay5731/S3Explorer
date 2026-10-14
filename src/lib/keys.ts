@@ -18,8 +18,7 @@ export interface KeyAction {
   group: KeyGroup;
   context: KeyContext;
   /**
-   * Default chords of the `classic` preset, portable (`Mod` = Ctrl, or Cmd on macOS). At most 4.
-   * The defaults in effect depend on the preset: see `presetDefaults`.
+   * Default chords (the Total Commander layout), portable (`Mod` = Ctrl, or Cmd on macOS). At most 4.
    */
   defaults: readonly string[];
 }
@@ -50,7 +49,8 @@ const os = (id: string) => {
   return id;
 };
 
-export const KEY_ACTIONS: readonly KeyAction[] = [
+/** The registry with the v0.7.0/v0.8.0 ("classic") defaults; the shipped defaults are Total Commander's (below). */
+const CLASSIC_ACTIONS: readonly KeyAction[] = [
   // Navigate
   a("nav.open", "Open folder / go to object", "Navigate", "files", "Enter"),
   a("nav.up", "Up one level", "Navigate", "global", "Backspace", "Alt+ArrowUp"),
@@ -120,10 +120,6 @@ export const KEY_ACTIONS: readonly KeyAction[] = [
   a("act.disconnect", "Disconnect", "Act", "global", "Mod+Shift+Q"),
 ];
 
-export const ACTIONS_BY_ID: ReadonlyMap<string, KeyAction> = new Map(KEY_ACTIONS.map((x) => [x.id, x]));
-
-// ---- presets (v0.9.0) ----------------------------------------------------------------------
-
 /**
  * Where the Total Commander layout differs from `classic` (the file attached to issue #13; every
  * other action, the v0.9.0 actions included, keeps its classic chords).
@@ -139,17 +135,26 @@ const COMMANDER_CHANGES: Readonly<Record<string, readonly string[]>> = {
   "act.folderSize": ["Alt+Shift+L"],
 };
 
+/**
+ * Every action, with its default chords: the Total Commander layout, the only default map (see
+ * "Keybinding presets" in docs/CONTRACT.md). The classic map is kept for the one-time migration of
+ * upgraded installs and for importing a file made against it.
+ */
+export const KEY_ACTIONS: readonly KeyAction[] = CLASSIC_ACTIONS.map((x) => ({ ...x, defaults: COMMANDER_CHANGES[x.id] ?? x.defaults }));
+
+export const ACTIONS_BY_ID: ReadonlyMap<string, KeyAction> = new Map(KEY_ACTIONS.map((x) => [x.id, x]));
+
 /** The two shipped default maps: every action id to its chords (see "Keybinding presets" in docs/CONTRACT.md). */
 export const PRESETS: Readonly<Record<KeybindingsPreset, Readonly<Record<string, readonly string[]>>>> = {
-  classic: Object.fromEntries(KEY_ACTIONS.map((x) => [x.id, x.defaults])),
-  commander: Object.fromEntries(KEY_ACTIONS.map((x) => [x.id, COMMANDER_CHANGES[x.id] ?? x.defaults])),
+  classic: Object.fromEntries(CLASSIC_ACTIONS.map((x) => [x.id, x.defaults])),
+  commander: Object.fromEntries(KEY_ACTIONS.map((x) => [x.id, x.defaults])),
 };
 
 /** A preset id from untrusted input (a settings object, an import file); anything else is null. */
 export const asPreset = (v: unknown): KeybindingsPreset | null => (v === "commander" || v === "classic" ? v : null);
 
 /** An action's default chords in a preset. */
-export function presetDefaults(id: string, preset: KeybindingsPreset = "classic"): readonly string[] {
+export function presetDefaults(id: string, preset: KeybindingsPreset = "commander"): readonly string[] {
   return PRESETS[preset]?.[id] ?? ACTIONS_BY_ID.get(id)?.defaults ?? [];
 }
 
@@ -429,7 +434,7 @@ export function formatPartial(partial: string): string {
 export type Bindings = Record<string, string[]>;
 
 /** The chords of every known action: the overrides over the preset's defaults. */
-export function effectiveBindings(overrides: Bindings | null | undefined, preset: KeybindingsPreset = "classic"): Bindings {
+export function effectiveBindings(overrides: Bindings | null | undefined, preset: KeybindingsPreset = "commander"): Bindings {
   const out: Bindings = {};
   for (const act of KEY_ACTIONS) {
     const o = overrides?.[act.id];
@@ -450,7 +455,7 @@ const sameChordList = (x: readonly string[], y: readonly string[]) => {
  * Overrides as saved: only actions whose chords differ from the defaults (an empty list unbinds),
  * chords written in normal form, duplicates dropped. Unknown action ids are kept as they are.
  */
-export function normalizeOverrides(overrides: Bindings, preset: KeybindingsPreset = "classic"): Bindings {
+export function normalizeOverrides(overrides: Bindings, preset: KeybindingsPreset = "commander"): Bindings {
   const out: Bindings = {};
   for (const [id, chords] of Object.entries(overrides)) {
     const act = ACTIONS_BY_ID.get(id);
@@ -582,7 +587,7 @@ export interface KeybindingsFile {
 }
 
 /** The export file: the preset, every known action's chords (and kept unknown overrides), pretty-printed. */
-export function exportBindings(overrides: Bindings, preset: KeybindingsPreset = "classic"): string {
+export function exportBindings(overrides: Bindings, preset: KeybindingsPreset = "commander"): string {
   const bindings = effectiveBindings(overrides, preset);
   for (const [id, chords] of Object.entries(overrides)) if (!ACTIONS_BY_ID.has(id)) bindings[id] = [...chords];
   const file: KeybindingsFile = { s3explorer: EXPORT_KIND, version: EXPORT_VERSION, preset, bindings };
@@ -633,7 +638,7 @@ function checkEntry(id: string, chords: unknown): string[] {
  * Read and validate an export file against the current overrides. Throws an Error with a readable
  * message when the file is not a keybindings file or breaks a limit; nothing is applied then.
  */
-export function parseImport(text: string, currentOverrides: Bindings, currentPreset: KeybindingsPreset = "classic"): ImportResult {
+export function parseImport(text: string, currentOverrides: Bindings, currentPreset: KeybindingsPreset = "commander"): ImportResult {
   if (new TextEncoder().encode(text).length > KEYBINDING_LIMITS.fileMaxBytes) {
     throw new Error(`The file is larger than ${KEYBINDING_LIMITS.fileMaxBytes / 1024} KiB.`);
   }
@@ -690,6 +695,17 @@ export function parseImport(text: string, currentOverrides: Bindings, currentPre
     bindings[id] = asDefault;
     if (!sameChordList(asDefault, current[id])) changes.push({ id, label: act.label, from: current[id], to: asDefault });
   }
+  // A file made against the classic map (another machine not yet migrated): every action it doesn't
+  // name keeps its classic chords, explicitly, so the result means the same over the Commander defaults.
+  if (preset === "classic") {
+    for (const act of KEY_ACTIONS) {
+      if (Object.prototype.hasOwnProperty.call(bindings, act.id)) continue;
+      const to = [...PRESETS.classic[act.id]];
+      bindings[act.id] = to;
+      if (!sameChordList(to, current[act.id])) changes.push({ id: act.id, label: act.label, from: current[act.id], to });
+    }
+    preset = "commander";
+  }
   // A preset change also changes the actions the file does not name and the user has not overridden.
   if (preset && preset !== currentPreset) {
     for (const act of KEY_ACTIONS) {
@@ -708,10 +724,23 @@ export function parseImport(text: string, currentOverrides: Bindings, currentPre
 export function applyImport(
   currentOverrides: Bindings,
   result: ImportResult,
-  currentPreset: KeybindingsPreset = "classic",
+  currentPreset: KeybindingsPreset = "commander",
 ): { preset: KeybindingsPreset; overrides: Bindings } {
   const preset = result.preset ?? currentPreset;
   return { preset, overrides: normalizeOverrides({ ...currentOverrides, ...result.bindings }, preset) };
+}
+
+/**
+ * The one-time migration of an upgraded install (`keybindingsPreset: "classic"`): its effective map
+ * (classic defaults + its overrides) as overrides against the Commander defaults. Existing overrides
+ * win; actions equal to the Commander default are not stored; unknown ids are kept.
+ */
+export function migrateClassicOverrides(overrides: Bindings | null | undefined): Bindings {
+  const effective = effectiveBindings(overrides, "classic");
+  const out: Bindings = {};
+  for (const [id, chords] of Object.entries(overrides ?? {})) if (!ACTIONS_BY_ID.has(id)) out[id] = [...chords];
+  for (const act of KEY_ACTIONS) if (!sameChordList(effective[act.id], act.defaults)) out[act.id] = effective[act.id];
+  return normalizeOverrides(out, "commander");
 }
 
 /** Validate a saved `keybindings` value as the backend does; the first problem, or null. */

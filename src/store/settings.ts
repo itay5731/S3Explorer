@@ -5,6 +5,8 @@ import { create } from "zustand";
 import * as api from "../lib/api";
 import { applyAccent, applyTheme, readAccentMirror, readThemeMirror, writeAccentMirror, writeThemeMirror } from "../lib/theme";
 import type { AppError, AppSettings } from "../lib/types";
+import { migrateClassicOverrides } from "../lib/keys";
+import { toast } from "./toasts";
 
 export type SettingsTabId = "transfers" | "behavior" | "appearance" | "notifications" | "keyboard" | "updates";
 
@@ -56,8 +58,25 @@ export async function loadSettings(): Promise<void> {
     const settings = await api.getSettings();
     set({ settings, loading: false });
     syncTheme(settings);
+    void migrateKeybindings(settings);
   } catch (e) {
     set({ loading: false, error: e as AppError });
+  }
+}
+
+/**
+ * v0.9.0: the one default map is Total Commander. An upgraded install (`keybindingsPreset: "classic"`)
+ * keeps its shortcuts: its effective map is written as overrides against the Commander defaults and
+ * saved with "commander", once, with a toast. If the save fails it is tried again at the next start
+ * (meanwhile the classic map keeps applying, so nothing changes for the user).
+ */
+async function migrateKeybindings(s: AppSettings) {
+  if (s.keybindingsPreset === "commander") return;
+  try {
+    await saveSettings({ ...s, keybindings: migrateClassicOverrides(s.keybindings), keybindingsPreset: "commander" });
+    toast.info("Your keyboard shortcuts were kept. Reset all in Settings → Keyboard switches to the Total Commander layout.");
+  } catch {
+    /* kept as is; tried again next time */
   }
 }
 

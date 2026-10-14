@@ -108,7 +108,7 @@ export function SourceButton({ pane }: { pane: PaneId }) {
 
 const rootIcon = (r: LocalRoot) => (r.kind === "home" ? <Home size={14} /> : r.kind === "drive" ? <HardDrive size={14} /> : <FolderOpen size={14} />);
 
-/** The source menu: this connection's buckets, then the local roots. Rendered once (Explorer). */
+/** The source menu: the local roots first (like Total Commander's drive list), then this connection's buckets. Rendered once (Explorer). */
 export function SourceMenu() {
   const menu = useSourceMenu((s) => s.menu);
   const buckets = useApp((s) => s.buckets);
@@ -147,8 +147,8 @@ export function SourceMenu() {
       label={pane === "a" ? "Source of the left pane" : "Source of the right pane"}
       className="source-menu"
       onClose={closeSourceMenu}
-      headings={["S3 buckets", "This computer"]}
-      groups={[bucketItems, rootItems]}
+      headings={["This computer", "S3 buckets"]}
+      groups={[rootItems, bucketItems]}
     />
   );
 }

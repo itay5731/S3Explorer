@@ -465,3 +465,47 @@ async function goToLocal(pane: PaneId, path: string): Promise<string | null> {
     }
   }
 }
+
+// ---- the sidebar's "This computer" group ---------------------------------------------------------
+
+const LOCAL_OPEN_KEY = "s3x.localRootsOpen";
+
+function readOpen(): boolean {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_OPEN_KEY) ?? "false") === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Whether the sidebar's "This computer" group is expanded (remembered). */
+export const useLocalRootsOpen = create<{ open: boolean }>(() => ({ open: readOpen() }));
+
+export function setLocalRootsOpen(open: boolean) {
+  useLocalRootsOpen.setState({ open });
+  try {
+    localStorage.setItem(LOCAL_OPEN_KEY, JSON.stringify(open));
+  } catch {
+    /* storage unavailable */
+  }
+  if (open) void loadLocalRoots();
+}
+
+/**
+ * Give the keyboard to the first "This computer" row (ArrowDown past the last bucket):
+ * expands the group and waits for its rows. Resolves false when there are none.
+ */
+export async function focusComputer(): Promise<boolean> {
+  setLocalRootsOpen(true);
+  await loadLocalRoots();
+  for (let i = 0; i < 30; i++) {
+    const row = document.querySelector<HTMLElement>(".local-roots .local-root");
+    if (row) {
+      row.focus();
+      row.scrollIntoView({ block: "nearest" });
+      return true;
+    }
+    await new Promise((r) => requestAnimationFrame(r));
+  }
+  return false;
+}
