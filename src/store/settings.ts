@@ -4,7 +4,7 @@
 import { create } from "zustand";
 import * as api from "../lib/api";
 import { applyAccent, applyTheme, readAccentMirror, readThemeMirror, writeAccentMirror, writeThemeMirror } from "../lib/theme";
-import type { AppError, AppSettings } from "../lib/types";
+import type { AccentColor, AppError, AppSettings } from "../lib/types";
 import { migrateClassicOverrides } from "../lib/keys";
 import { toast } from "./toasts";
 
@@ -42,6 +42,14 @@ export function applyTextStyle(size: number, weight: number) {
   api.setZoom(size / 100).catch(() => {});
 }
 
+/**
+ * v0.9.0: the window and taskbar icon in an accent colour (title bar, taskbar button, Alt-Tab; the
+ * installed shortcut stays yellow). Errors are ignored: the icon is cosmetic.
+ */
+export function applyWindowIcon(accent: AccentColor) {
+  api.setWindowIcon(accent).catch((e) => console.debug("set_window_icon failed", e));
+}
+
 /** Apply the confirmed look and refresh the pre-render mirrors. Skipped while the dialog previews one. */
 function syncTheme(settings: AppSettings) {
   writeThemeMirror(settings.theme);
@@ -58,6 +66,7 @@ export async function loadSettings(): Promise<void> {
     const settings = await api.getSettings();
     set({ settings, loading: false });
     syncTheme(settings);
+    if (!useSettings.getState().open) applyWindowIcon(settings.accent);
     void migrateKeybindings(settings);
   } catch (e) {
     set({ loading: false, error: e as AppError });
@@ -84,8 +93,10 @@ async function migrateKeybindings(s: AppSettings) {
 export async function saveSettings(next: AppSettings): Promise<AppSettings> {
   set({ saving: true });
   try {
+    const prevAccent = useSettings.getState().settings?.accent;
     const settings = await api.updateSettings(next);
     set({ settings, saving: false, error: null });
+    if (settings.accent !== prevAccent) applyWindowIcon(settings.accent);
     writeThemeMirror(settings.theme);
     writeAccentMirror(settings.accent);
     return settings;
@@ -107,5 +118,6 @@ export const closeSettings = () => {
   const saved = useSettings.getState().settings;
   applyTheme(saved?.theme ?? readThemeMirror());
   applyAccent(saved?.accent ?? readAccentMirror());
+  applyWindowIcon(saved?.accent ?? readAccentMirror());
   if (saved) applyTextStyle(saved.textSize, saved.textWeight);
 };

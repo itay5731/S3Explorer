@@ -17,7 +17,6 @@ import {
   requestDisconnect,
   setActivePane,
   setDetailsOpen,
-  setFilter,
   setSelection,
   setSplit,
   setShowHidden,
@@ -26,7 +25,7 @@ import {
   syncOtherPane,
   useApp,
 } from "./app";
-import { isLocalPane, otherPane, paneHasLocation } from "./panes";
+import { isLocalPane, otherPane, paneHasLocation, type PaneId } from "./panes";
 import { otherPaneRefusal, transferToOtherPane } from "./cross";
 import {
   calculateLocalSizes,
@@ -47,7 +46,7 @@ import { copySelection, requestBulkTags, requestDelete, requestPaste, requestRen
 import { ARCHIVED_REASON, isArchiveClass, needsRestore } from "./archive";
 import { useClipboard } from "./clipboard";
 import { getSelected } from "./view";
-import { rerunSearch, scheduleSearch, setSearchScope, useSearch } from "./search";
+import { rerunSearch, setSearchScope, useSearch } from "./search";
 import { openSettings, useSettings } from "./settings";
 import { toast } from "./toasts";
 import { currentKeys, focusBuckets, focusPaneList, focusPaneListSoon, listKeys, searchInput, setCheatOpen, useKeys, type MoveTarget } from "./keyboard";
@@ -58,6 +57,8 @@ import { toggleBookmark } from "./bookmarks";
 import { calculateFolderSizes } from "./folderSizes";
 import { MAX_EDIT_BYTES } from "../lib/metadata";
 import { canPauseAll, canResumeAll, setAllPaused } from "./pause";
+import { isActive, setTransferPaused, useTransfers } from "./transfers";
+import { isBatchActive, setBatchPaused, useBatches } from "./batches";
 import { useActivityTab } from "../components/ActivityHistory";
 
 /** What a handler did: nothing to do here (`false`: the key keeps its usual meaning), or why it can't. */
@@ -422,6 +423,22 @@ const HANDLERS: Record<string, (extend: boolean) => Outcome> = {
     if (!canPauseAll()) return no("Nothing to pause");
     setAllPaused(true);
   },
+  "act.pauseResume": () => {
+    const row = eventTarget?.closest?.<HTMLElement>("[data-activity-id]");
+    const kind = row?.dataset.activityKind;
+    const id = row?.dataset.activityId;
+    if (!row || !id) return false;
+    if (kind === "transfer") {
+      const t = useTransfers.getState().byId[id];
+      if (!t || !isActive(t)) return no("This transfer has finished");
+      void setTransferPaused(id, t.status !== "paused");
+    } else if (kind === "batch") {
+      const b = useBatches.getState().byId[id];
+      if (!b || !isBatchActive(b)) return no("This folder transfer has finished");
+      if (b.status === "planning") return no("Pause becomes available once the folder has been read");
+      void setBatchPaused(id, b.status !== "paused");
+    } else return no("File operations can't be paused");
+  },
   "act.resumeAll": () => {
     if (!canResumeAll()) return no("Nothing to resume");
     setAllPaused(false);
@@ -538,8 +555,15 @@ export function onExplorerKeyDown(e: KeyboardEvent) {
   eventTarget = el instanceof Element ? el : null;
   const chord = chordFromEvent(e);
   if (!chord) {
-    // A character with no chord name (Hebrew, AltGr symbols): it can still start a search.
-    if (focus.files && !overlay && isTypedCharacter(e)) typeToSearch(e);
+    // A character with no chord name (Hebrew, AltGr symbols): it still jumps to a row.
+    if (focus.files && !overlay && isTypedCharacter(e)) typeToJump(e);
+    return;
+  }
+  // While a type-to-jump prefix is being typed, Backspace edits it and Escape clears it.
+  if (focus.files && !overlay && jumpActive() && !e.ctrlKey && !e.altKey && !e.metaKey && (e.key === "Backspace" || e.key === "Escape")) {
+    e.preventDefault();
+    if (e.key === "Escape") clearJump();
+    else editJump();
     return;
   }
   const { index } = currentKeys();
@@ -573,6 +597,8 @@ export function onExplorerKeyDown(e: KeyboardEvent) {
     return true;
   };
 
+  // 0. A focused row of the Activity list (v0.9.0): its own context (Space = pause / resume).
+  if (!overlay && el instanceof Element && el.closest("[data-activity-id]") && !focus.typing && run(lookup("activity"))) return;
   // 1. The search box's own context.
   if (focus.search && run(lookup("search"))) return;
   // 2. The file list: `files` beats `global` for the same chord.
@@ -585,8 +611,8 @@ export function onExplorerKeyDown(e: KeyboardEvent) {
     const hit = lookup("global");
     if (hit && run(hit)) return;
   }
-  // 4. Type to search: a printable character typed in the file list that nothing is bound to.
-  if (focus.files && !overlay && parsed && parsed.key.length === 1 && isTypedCharacter(e)) typeToSearch(e);
+  // 4. Type to jump: a printable character typed in the file list that nothing is bound to.
+  if (focus.files && !overlay && parsed && parsed.key.length === 1 && isTypedCharacter(e)) typeToJump(e);
 }
 
 /** One printable character typed without Ctrl, Alt or Cmd (Shift and AltGr allowed). */
@@ -595,16 +621,38 @@ function isTypedCharacter(e: KeyboardEvent): boolean {
   return isAltGraph(e) || (!e.ctrlKey && !e.altKey && !e.metaKey);
 }
 
-/** Put a character typed in the file list into the search box (it searches as you type). */
-function typeToSearch(e: KeyboardEvent) {
-  const input = searchInput();
-  if (!input || input.disabled) return;
+// ---- type to jump (v0.9.0) ------------------------------------------------------------------------
+// Like Windows Explorer: characters typed in the file list build a prefix (reset 1 s after the last
+// key) and move focus and selection to the first visible row starting with it; the same letter again
+// cycles. Nothing matches: nothing moves. The search box has its own keys (Mod+F, /, Alt+F7).
+
+/** How long after the last key the prefix starts again. */
+export const JUMP_RESET_MS = 1000;
+const jump = { prefix: "", at: 0, pane: null as PaneId | null };
+
+const jumpActive = () => !!jump.prefix && Date.now() - jump.at <= JUMP_RESET_MS && jump.pane === activePane();
+const clearJump = () => {
+  jump.prefix = "";
+  jump.at = 0;
+};
+
+function runJump() {
+  const l = listKeys(activePane());
+  if (l && jump.prefix) l.jump(jump.prefix);
+}
+
+function editJump() {
+  jump.prefix = [...jump.prefix].slice(0, -1).join("");
+  jump.at = Date.now();
+  runJump();
+}
+
+function typeToJump(e: KeyboardEvent) {
   e.preventDefault();
   const pane = activePane();
-  const text = getPane(pane).filter + e.key;
-  setFilter(text, pane);
-  scheduleSearch(text, pane);
-  input.focus();
-  // The caret goes after the typed character once React has written the value.
-  requestAnimationFrame(() => input.setSelectionRange(input.value.length, input.value.length));
+  if (!jumpActive()) clearJump();
+  jump.pane = pane;
+  jump.prefix += e.key;
+  jump.at = Date.now();
+  runJump();
 }

@@ -1,14 +1,14 @@
 // The confirmation of a copy or move between an S3 pane and a local pane (v0.9.0, see "Transfers
 // between panes" in docs/CONTRACT.md). Loaded on first use.
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { AlertCircle, AlertTriangle, ArrowRight, FolderDown, FolderUp, Loader2 } from "lucide-react";
 import { formatBytes, s3Uri } from "../lib/format";
 import { plural } from "../lib/ops";
 import type { BatchPreview, ConflictPolicy } from "../lib/types";
 import { openModal } from "../store/app";
-import { crossPlan, dropCrossPlan, planTargets, startPlan, type CrossTarget } from "../store/cross";
-import { ConflictChoice, ModalShell } from "./Modals";
+import { crossPlan, dropCrossPlan, planTargets, startPlan, type CrossPlan, type CrossTarget } from "../store/cross";
+import { ConflictChoice, ModalShell, useDefaultAction } from "./Modals";
 import { useBatchPreviews } from "./BatchDialogs";
 
 // ---- cross-pane transfer confirmation -------------------------------------------------------------
@@ -20,6 +20,10 @@ import { useBatchPreviews } from "./BatchDialogs";
  */
 export function CrossTransferModal({ planId }: { planId: number }) {
   const plan = useMemo(() => crossPlan(planId), [planId]);
+  return plan ? <CrossTransferBody planId={planId} plan={plan} /> : null;
+}
+
+function CrossTransferBody({ planId, plan }: { planId: number; plan: CrossPlan }) {
   const [targets, setTargets] = useState<CrossTarget[] | null>(null);
   const [policy, setPolicy] = useState<ConflictPolicy | null>(null);
   const [busy, setBusy] = useState(false);
@@ -50,7 +54,7 @@ export function CrossTransferModal({ planId }: { planId: number }) {
     [plan, targets, folderTargets],
   );
   const [states, retry] = useBatchPreviews(requests, 0);
-  if (!plan) return null;
+  const actionRef = useRef<HTMLButtonElement>(null);
   const download = plan.direction === "download";
   const move = plan.mode === "cut";
   const loadingFolders = !!states && states.some((s) => s.status === "loading");
@@ -68,6 +72,8 @@ export function CrossTransferModal({ planId }: { planId: number }) {
   const destLabel = download ? plan.dir : s3Uri(plan.bucket, plan.prefix);
   const srcLabel = download ? s3Uri(plan.bucket, plan.prefix) : plan.dir;
   const verb = move ? "Move" : download ? "Download" : "Upload";
+  // Enter confirms once the plan is checked (focus moves to the action button).
+  useDefaultAction(actionRef, canStart);
 
   const start = async () => {
     if (!canStart || !targets) return;
@@ -195,10 +201,10 @@ export function CrossTransferModal({ planId }: { planId: number }) {
         />
       )}
       <div className="modal-actions">
-        <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus>
+        <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus data-default-from>
           Cancel
         </button>
-        <button type="button" className={`btn ${overwrite ? "btn-danger" : "btn-primary"}`} onClick={() => void start()} disabled={!canStart}>
+        <button ref={actionRef} type="button" className={`btn ${overwrite ? "btn-danger" : "btn-primary"}`} onClick={() => void start()} disabled={!canStart}>
           {(busy || !ready) && <Loader2 size={14} className="spin" />}
           {busy ? "Starting…" : `${verb}${startable.length ? ` ${plural(startable.length, "item")}` : ""}${overwrite ? ", overwrite" : ""}`}
         </button>

@@ -14,7 +14,7 @@ import {
   usePaneId,
   type SortKey,
 } from "../store/app";
-import { registerListKeys, type ListKeys } from "../store/keyboard";
+import { findJump, registerListKeys, type ListKeys } from "../store/keyboard";
 import { getViewRows, useViewRows, type Row } from "../store/view";
 import { formatBytes, formatExact, formatRelative, formatStorageClass, displayName } from "../lib/format";
 import { FolderSizeCell } from "./FolderSize";
@@ -335,6 +335,15 @@ export function ObjectTable() {
       if (!r) return;
       openContextMenu(el ? { x: r.left + 40, y: r.top + Math.min(r.height, ROW_H) } : { x: r.left + 40, y: r.top + 12 });
     },
+    jump(prefix) {
+      const rows = getViewRows(pane);
+      const { focus } = getPane(pane);
+      const i = findJump(rows.map((r) => r.name), prefix, focus ? rows.findIndex((r) => r.id === focus) : -1);
+      if (i < 0) return false;
+      selectIndex(i, "single");
+      virtualizer.scrollToIndex(i, { align: "auto" });
+      return true;
+    },
   };
   useEffect(
     () =>
@@ -346,6 +355,7 @@ export function ObjectTable() {
         clear: () => keysRef.current?.clear(),
         open: () => keysRef.current?.open(),
         menu: () => keysRef.current?.menu(),
+        jump: (prefix) => keysRef.current?.jump(prefix) ?? false,
       }),
     [pane],
   );

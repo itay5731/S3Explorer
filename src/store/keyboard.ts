@@ -78,6 +78,32 @@ export interface ListKeys {
   open(): void;
   /** The context menu for the focused row (or the folder, with nothing focused). */
   menu(): void;
+  /**
+   * Type to jump (v0.9.0): focus and select the row `findJump` picks for `prefix`; false when
+   * nothing matches (nothing moves then).
+   */
+  jump(prefix: string): boolean;
+}
+
+/**
+ * The row type-to-jump moves to: the first whose name starts with `prefix` (case-insensitive), or,
+ * when the prefix is one letter typed again and again ("aaa"), the next row after `current` starting
+ * with that letter (cycling). -1 when nothing matches.
+ */
+export function findJump(names: readonly string[], prefix: string, current: number): number {
+  const p = prefix.toLocaleLowerCase();
+  if (!p) return -1;
+  const chars = [...p];
+  const cycle = chars.length > 1 && chars.every((c) => c === chars[0]);
+  if (cycle) {
+    const c = chars[0];
+    for (let k = 1; k <= names.length; k++) {
+      const i = (current + k + names.length) % names.length;
+      if (names[i].toLocaleLowerCase().startsWith(c)) return i;
+    }
+    return -1;
+  }
+  return names.findIndex((n) => n.toLocaleLowerCase().startsWith(p));
 }
 
 const lists: Partial<Record<PaneId, ListKeys>> = {};

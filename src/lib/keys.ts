@@ -8,7 +8,7 @@ import { clientOS } from "./api";
 // ---- actions ------------------------------------------------------------------------------
 
 /** Where a chord fires: anywhere (`global`), in the file list (`files`), or in the search box. */
-export type KeyContext = "global" | "files" | "search";
+export type KeyContext = "global" | "files" | "search" | "activity";
 export type KeyGroup = "Navigate" | "Select" | "Act";
 export const KEY_GROUPS: readonly KeyGroup[] = ["Navigate", "Select", "Act"];
 
@@ -116,6 +116,7 @@ const CLASSIC_ACTIONS: readonly KeyAction[] = [
   a(os("act.editMetadata"), "Edit content type and metadata", "Act", "files", ...byOS(["Mod+M"], [])),
   a("act.folderSize", "Calculate folder size", "Act", "files"),
   a("act.pauseAll", "Pause all transfers", "Act", "global"),
+  a("act.pauseResume", "Pause / resume the focused transfer", "Act", "activity", "Space"),
   a("act.resumeAll", "Resume all transfers", "Act", "global"),
   a("act.disconnect", "Disconnect", "Act", "global", "Mod+Shift+Q"),
 ];
@@ -485,7 +486,7 @@ export function sameOverrides(x: Bindings | null | undefined, y: Bindings | null
 }
 
 /** Context group for the conflict check: `files` and `global` count as one. */
-const conflictScope = (c: KeyContext) => (c === "search" ? "search" : "explorer");
+const conflictScope = (c: KeyContext) => (c === "search" ? "search" : c === "activity" ? "activity" : "explorer");
 
 export interface Conflict {
   /** The chord, canonical for this platform. */
@@ -537,10 +538,12 @@ export interface KeyIndex {
   files: Map<string, string>;
   global: Map<string, string>;
   search: Map<string, string>;
+  /** v0.9.0: a focused row of the Activity list. */
+  activity: Map<string, string>;
 }
 
 export function buildIndex(bindings: Bindings): KeyIndex {
-  const idx: KeyIndex = { files: new Map(), global: new Map(), search: new Map() };
+  const idx: KeyIndex = { files: new Map(), global: new Map(), search: new Map(), activity: new Map() };
   for (const act of KEY_ACTIONS) {
     for (const c of bindings[act.id] ?? []) {
       const k = canonicalChord(c);

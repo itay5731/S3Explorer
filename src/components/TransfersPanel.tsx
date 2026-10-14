@@ -33,6 +33,8 @@ import { isActive, isMoving, selectActiveCount, setTransferPaused, useTransfers 
 import { jobRequest, removeJobs, selectActiveJobCount, useJobs } from "../store/jobs";
 import { batchFraction, cancelBatch, isBatchActive, removeBatches, selectActiveBatchCount, setBatchPaused, useBatches } from "../store/batches";
 import { setAllPaused } from "../store/pause";
+import { currentKeys, withKey } from "../store/keyboard";
+import { formatChord } from "../lib/keys";
 import { setTransfersOpen, useApp } from "../store/app";
 import { copyText } from "../store/actions";
 import { PopupMenu, type PopupMenuItem } from "./PopupMenu";
@@ -65,28 +67,33 @@ const STATUS_ICON: Record<TransferStatus, typeof Clock | null> = {
 /** Why a folder transfer that is still being planned shows its Pause button disabled. */
 const PLANNING_NO_PAUSE = "Pause becomes available once the folder has been read";
 
-/** The Pause / Resume button of a row, next to Cancel; disabled while planning, nothing for a finished row. */
+/**
+ * The Pause / Resume toggle of a row, next to Cancel: one button that stays in its place and only
+ * swaps its icon and label; disabled while planning, nothing for a finished row.
+ */
 function PauseButton({ status, onToggle, what }: { status: string; onToggle: (pause: boolean) => void; what: string }) {
-  if (status === "planning") {
-    return (
-      <button className="icon-btn" disabled title={PLANNING_NO_PAUSE} aria-label={`Pause ${what}: ${PLANNING_NO_PAUSE}`}>
-        <Pause size={14} />
-      </button>
-    );
-  }
-  if (status === "paused") {
-    return (
-      <button className="icon-btn" onClick={() => onToggle(false)} title="Resume" aria-label={`Resume ${what}`}>
-        <Play size={14} />
-      </button>
-    );
-  }
-  if (status !== "running" && status !== "queued") return null;
+  if (status !== "running" && status !== "queued" && status !== "paused" && status !== "planning") return null;
+  const paused = status === "paused";
+  const planning = status === "planning";
+  const label = paused ? "Resume" : "Pause";
   return (
-    <button className="icon-btn" onClick={() => onToggle(true)} title="Pause" aria-label={`Pause ${what}`}>
-      <Pause size={14} />
+    <button
+      className="icon-btn pause-toggle"
+      disabled={planning}
+      onClick={() => onToggle(!paused)}
+      title={planning ? PLANNING_NO_PAUSE : withKey(label, pauseKeyHint())}
+      aria-label={planning ? `Pause ${what}: ${PLANNING_NO_PAUSE}` : `${label} ${what}`}
+      aria-pressed={paused}
+    >
+      {paused ? <Play size={14} /> : <Pause size={14} />}
     </button>
   );
+}
+
+/** The key that toggles a focused row (act.pauseResume), for the tooltip. */
+function pauseKeyHint(): string {
+  const chords = currentKeys().bindings["act.pauseResume"] ?? [];
+  return chords.length ? formatChord(chords[0]) : "";
 }
 
 async function cancel(id: string) {
@@ -473,6 +480,9 @@ const useActivityMenu = create<{ menu: MenuTarget | null }>(() => ({ menu: null 
 function menuProps(kind: MenuTarget["kind"], id: string) {
   return {
     tabIndex: 0,
+    // The key dispatcher's `activity` context (act.pauseResume) finds the row by these.
+    "data-activity-kind": kind,
+    "data-activity-id": id,
     onContextMenu: (e: ReactMouseEvent<HTMLElement>) => {
       e.preventDefault();
       useActivityMenu.setState({ menu: { kind, id, x: e.clientX, y: e.clientY, el: e.currentTarget } });
@@ -787,14 +797,10 @@ export function ActivityPanel() {
         <Summary />
         <LimitNote />
         <div className="spacer" />
-        {canPause && (
-          <button className="link-btn" onClick={() => setAllPaused(true)}>
-            Pause all
-          </button>
-        )}
-        {canResume && (
-          <button className="link-btn" onClick={() => setAllPaused(false)}>
-            Resume all
+        {/* One toggle in one place: Pause all while anything runs, Resume all when everything active is paused. */}
+        {(canPause || canResume) && (
+          <button className="link-btn pause-all-toggle" onClick={() => setAllPaused(canPause)} aria-pressed={!canPause}>
+            {canPause ? "Pause all" : "Resume all"}
           </button>
         )}
         {open && tab === "now" && finishedCount > 0 && (

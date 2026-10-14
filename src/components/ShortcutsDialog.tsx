@@ -11,6 +11,7 @@ const CONTEXT_NOTE: Record<KeyAction["context"], string> = {
   files: "in the file list",
   global: "",
   search: "in the search box",
+  activity: "on an Activity row",
 };
 
 /** One chord as key caps: `Ctrl` `Shift` `K` (or ⌘⇧K on macOS). */
@@ -115,8 +116,8 @@ function Sheet() {
         </div>
         <div className="modal-actions shortcuts-foot">
           <span className="muted small">
-            <kbd>Shift</kbd> with the arrow keys, Page Up/Down, Home or End extends the selection. Typing a letter in the
-            file list starts a search.
+            <kbd>Shift</kbd> with the arrow keys, Page Up/Down, Home or End extends the selection. Typing letters in the
+            file list jumps to the first name that starts with them.
           </span>
           <div className="spacer" />
           <button

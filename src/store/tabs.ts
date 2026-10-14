@@ -22,6 +22,7 @@ import {
   writePref,
 } from "./app";
 import {
+  DEFAULT_SORT,
   emptySearch,
   freshPane,
   isLocalPane,
@@ -33,7 +34,6 @@ import {
   usePaneTabs,
   type PaneId,
   type PaneState,
-  type SortState,
   type TabEntry,
 } from "./panes";
 import { cancelScheduledSearch, cancelSearch } from "./search";
@@ -53,9 +53,10 @@ const tabsOf = (pane: PaneId): TabEntry[] => usePaneTabs.getState()[pane];
 const setTabs = (pane: PaneId, tabs: TabEntry[]) => usePaneTabs.setState({ [pane]: tabs } as Partial<Record<PaneId, TabEntry[]>>);
 
 /** A hidden tab's state at a location, not listed yet (it lists when shown). */
-function stateAt({ bucket, prefix }: Location, sort: SortState): PaneState {
+function stateAt({ bucket, prefix }: Location): PaneState {
   const p = asFolderPrefix(prefix);
-  return { ...freshPane(sort), bucket, prefix: p, history: { entries: [{ bucket, prefix: p }], index: 0 } };
+  // A new tab starts sorted by Name, ascending.
+  return { ...freshPane(), bucket, prefix: p, history: { entries: [{ bucket, prefix: p }], index: 0 } };
 }
 
 /** Where a tab is: the pane's state for the shown tab, the saved one for the others. */
@@ -122,11 +123,13 @@ export function openTab(pane: PaneId, at: Location | null, show: boolean, index?
     return true;
   }
   let saved: PaneState;
-  if (at) saved = stateAt(at, cur.sort);
+  if (at) saved = stateAt(at);
   else if (paneHasLocation(cur)) {
     saved = {
       ...cur,
       tab: newTabId(),
+      // A new tab starts sorted by Name, ascending.
+      sort: DEFAULT_SORT,
       selection: new Set(),
       anchor: null,
       focus: null,
@@ -309,12 +312,11 @@ function restore(key: string) {
     const at = saved.tabs[saved.active];
     // With both panes remembered, neither follows the other to its first bucket.
     navigate(at.bucket, at.prefix, pane, { alone: panes.length > 1 });
-    const sort = getPane(pane).sort;
     setTabs(
       pane,
       saved.tabs.map((loc, i) => {
         if (i === saved.active) return tabEntry(getPane(pane).tab);
-        const s = stateAt(loc, sort);
+        const s = stateAt(loc);
         return tabEntry(s.tab, s);
       }),
     );

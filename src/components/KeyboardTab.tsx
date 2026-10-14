@@ -39,6 +39,7 @@ const CONTEXT_LABEL: Record<KeyAction["context"], string> = {
   global: "Anywhere",
   files: "File list",
   search: "Search box",
+  activity: "Activity list",
 };
 
 interface Recording {
@@ -337,7 +338,7 @@ export function KeyboardTab({
                       ))}
                       {printable.map((c) => (
                         <span key={c} className="muted">
-                          <Info size={12} /> Typing {formatChord(c)} in the file list runs this action instead of starting a search with it.
+                          <Info size={12} /> Typing {formatChord(c)} in the file list runs this action instead of jumping to a name starting with it.
                         </span>
                       ))}
                     </div>

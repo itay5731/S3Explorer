@@ -25,8 +25,8 @@ import {
   PANE_IDS,
   PaneContext,
   paneHasLocation,
+  DEFAULT_SORT,
   S3_SOURCE,
-  SORT_KEY,
   tabEntry,
   usePanes,
   usePaneTabs,
@@ -230,7 +230,7 @@ function resetPane(id: PaneId) {
   resetListeners.forEach((cb) => cb(id));
   freshPanes.add(id);
   listSeq[id]++;
-  const fresh = { ...freshPane(getPane(id).sort), search: emptySearch };
+  const fresh = { ...freshPane(), search: emptySearch };
   usePaneTabs.setState({ [id]: [tabEntry(fresh.tab)] } as Partial<Record<PaneId, never>>);
   setPane(id, fresh);
 }
@@ -608,6 +608,8 @@ export function navigate(
   // Server-provided prefixes are used verbatim (see asFolderPrefix / normalizePrefix).
   const p = asFolderPrefix(prefix);
   if (!opts.fromHistory) pushHistory(pane, bucket, p, opts.replaceHistory);
+  // A pane switching from this computer to S3 starts sorted by Name again.
+  if (getPane(pane).source.kind !== "s3") setPane(pane, { sort: DEFAULT_SORT });
   setPane(pane, {
     source: S3_SOURCE,
     local: null,
@@ -649,6 +651,8 @@ export function navigateLocal(
   if (!opts.fromHistory) pushHistory(pane, "", "", opts.replaceHistory, dir);
   const sel = opts.select ?? null;
   setPane(pane, (s) => ({
+    // A pane switching from S3 to this computer starts sorted by Name again.
+    ...(s.source.kind !== "local" ? { sort: DEFAULT_SORT } : {}),
     source: LOCAL_SOURCE,
     local: { dir, parent: s.local && s.local.dir === dir ? s.local.parent : null, truncated: false, entries: new Map() },
     bucket: null,
@@ -945,7 +949,6 @@ export function setSort(key: SortKey, pane: PaneId = activePane()) {
   const cur = getPane(pane).sort;
   const sort: SortState = cur.key === key ? { key, dir: cur.dir === 1 ? -1 : 1 } : { key, dir: key === "modified" || key === "size" ? -1 : 1 };
   setPane(pane, { sort });
-  writePref(SORT_KEY, sort);
 }
 
 /** The quick filter's row predicate (shared with the derived view in ./view.ts). */

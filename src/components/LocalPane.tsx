@@ -148,6 +148,7 @@ export function SourceMenu() {
       className="source-menu"
       onClose={closeSourceMenu}
       headings={["This computer", "S3 buckets"]}
+      typeAhead
       groups={[rootItems, bucketItems]}
     />
   );

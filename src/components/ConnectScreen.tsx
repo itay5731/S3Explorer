@@ -25,6 +25,7 @@ import {
   Plus,
   RefreshCw,
   Server,
+  MapPin,
   Trash2,
   UserRound,
 } from "lucide-react";
@@ -37,6 +38,7 @@ import {
   type SavedConnection,
 } from "../lib/types";
 import { formatExact, formatRelative, nameTone } from "../lib/format";
+import { launchLabel, useLaunch } from "../store/launch";
 import { connectionIdentity, forgetSavedConnection, readPref, setConnected, writePref } from "../store/app";
 import { toast } from "../store/toasts";
 import { Logo } from "./Logo";
@@ -423,6 +425,7 @@ function DeleteSavedModal({ conn, onClose, onDeleted }: { conn: SavedConnection;
 type View = "loading" | "saved" | "form";
 
 export function ConnectScreen() {
+  const launch = useLaunch((s) => s.pending);
   const [lastUsed] = useState(loadLastUsed);
   const [mode, setMode] = useState<Mode>(lastUsed.mode);
   const [profiles, setProfiles] = useState<ProfileInfo[] | null>(null);
@@ -747,6 +750,15 @@ export function ConnectScreen() {
       </div>
     </div>
   );
+  // v0.9.0: the app was started with a location (command line); it opens once connected.
+  const launchNote = launch && (
+    <div className="callout info launch-note" role="status">
+      <MapPin size={14} />
+      <span>
+        Connect to open <span className="mono">{launchLabel(launch)}</span>
+      </span>
+    </div>
+  );
 
   const errorBox = (error || savedError) && (
     <div className="form-error" role="alert">
@@ -767,6 +779,7 @@ export function ConnectScreen() {
         </div>
         <div className="connect-card" aria-busy="true">
           {header}
+          {launchNote}
           <div className="profile-list">
             {[0, 1, 2].map((i) => (
               <div key={i} className="profile-row skeleton" />
@@ -894,6 +907,7 @@ export function ConnectScreen() {
       </div>
       <form ref={cardRef} className="connect-card" onSubmit={submit} noValidate>
         {header}
+        {launchNote}
 
         {(hasSaved || editing) && (
           <div className="form-nav">

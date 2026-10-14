@@ -4,7 +4,7 @@
 // choice. A batch always asks first, whatever the "Ask before copying or moving" setting says,
 // because it can overwrite many files.
 
-import { useEffect, useId, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { AlertCircle, AlertTriangle, ArrowRight, ChevronRight, FolderDown, FolderUp, Loader2, RotateCw } from "lucide-react";
 import * as api from "../lib/api";
 import { BATCH_LIMITS, type AppError, type BatchPlanRequest, type BatchPreview, type ConflictPolicy, type FolderEntry } from "../lib/types";
@@ -14,7 +14,7 @@ import { openModal, setTransfersOpen } from "../store/app";
 import { startBatch } from "../store/batches";
 import { defaultUploadPrefix } from "../store/folders";
 import { isDenied, permissionText, toastFailure } from "../store/toasts";
-import { ConflictChoice, ModalShell } from "./Modals";
+import { ConflictChoice, ModalShell, useDefaultAction } from "./Modals";
 
 /** `at`: when the preview arrived (ms since epoch), so a destructive Start can insist on a fresh one. */
 type PreviewState = { status: "loading" } | { status: "ok"; preview: BatchPreview; at: number } | { status: "error"; error: AppError };
@@ -438,6 +438,8 @@ export function DownloadFoldersModal({ bucket, folders, dir: initialDir }: { buc
   const overwrite = needChoice && policy === "overwrite";
   const downloadCount = startCount(files, conflicts, policy);
   const single = folders.length === 1;
+  const actionRef = useRef<HTMLButtonElement>(null);
+  useDefaultAction(actionRef, canStart);
 
   useEffect(() => {
     setPolicy(null);
@@ -612,10 +614,10 @@ export function DownloadFoldersModal({ bucket, folders, dir: initialDir }: { buc
         </div>
       )}
       <div className="modal-actions">
-        <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus>
+        <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus data-default-from>
           Cancel
         </button>
-        <button type="button" className={`btn ${overwrite ? "btn-danger" : "btn-primary"}`} onClick={() => void start()} disabled={!canStart}>
+        <button ref={actionRef} type="button" className={`btn ${overwrite ? "btn-danger" : "btn-primary"}`} onClick={() => void start()} disabled={!canStart}>
           {(busy || loading) && <Loader2 size={14} className="spin" />}
           {busy ? "Starting…" : `Download${ready && !truncated && downloadCount !== null ? ` ${plural(downloadCount, "file")}` : ""}${overwrite ? ", overwrite" : ""}`}
         </button>

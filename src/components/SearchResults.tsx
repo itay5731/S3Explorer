@@ -24,7 +24,7 @@ import {
   takeResultsFocus,
   usePaneSearch,
 } from "../store/search";
-import { registerListKeys, searchInput, type ListKeys } from "../store/keyboard";
+import { findJump, registerListKeys, searchInput, type ListKeys } from "../store/keyboard";
 import { FileIcon } from "./FileIcon";
 
 const ROW_H = 44;
@@ -347,6 +347,15 @@ export function SearchResults() {
       const r = row?.getBoundingClientRect() ?? scrollRef.current?.getBoundingClientRect();
       if (r) openContextMenu({ x: r.left + 40, y: r.top + Math.min(r.height, ROW_H) });
     },
+    jump(prefix) {
+      // A hit's name: the object's or folder's own name (its last segment).
+      const names = hits.map((h) => (h.kind === "folder" ? (h.folder?.name ?? "") : (h.entry?.name ?? "")));
+      const i = findJump(names, prefix, focusIndex);
+      if (i < 0) return false;
+      selectIndex(i, "single", pane);
+      virtualizer.scrollToIndex(i, { align: "auto" });
+      return true;
+    },
   };
   useEffect(
     () =>
@@ -358,6 +367,7 @@ export function SearchResults() {
         clear: () => keysRef.current?.clear(),
         open: () => keysRef.current?.open(),
         menu: () => keysRef.current?.menu(),
+        jump: (prefix) => keysRef.current?.jump(prefix) ?? false,
       }),
     [pane],
   );

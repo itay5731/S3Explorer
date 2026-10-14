@@ -45,6 +45,7 @@ import { formatBytes } from "../lib/format";
 import { applyAccent, applyTheme } from "../lib/theme";
 import {
   applyTextStyle,
+  applyWindowIcon,
   closeSettings,
   loadSettings,
   openSettings,
@@ -801,6 +802,8 @@ function SettingsDialogInner() {
 
   const dialogRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([]);
+  /** The window icon was previewed in another accent during this dialog (closing reverts it). */
+  const iconPreviewed = useRef(false);
   const keepEditingRef = useRef<HTMLButtonElement>(null);
 
   // The settings may arrive after the dialog opened (first load still in flight).
@@ -816,7 +819,13 @@ function SettingsDialogInner() {
   // Live accent preview, reverted the same way.
   const previewAccent = draft?.accent;
   useEffect(() => {
-    if (previewAccent) applyAccent(previewAccent);
+    if (!previewAccent) return;
+    applyAccent(previewAccent);
+    // The window icon previews too; closing the dialog puts the saved accent's icon back.
+    if (previewAccent !== useSettings.getState().settings?.accent || iconPreviewed.current) {
+      iconPreviewed.current = true;
+      applyWindowIcon(previewAccent);
+    }
   }, [previewAccent]);
   // Live text preview, reverted the same way.
   const [previewSize, previewWeight] = [draft?.textSize, draft?.textWeight];

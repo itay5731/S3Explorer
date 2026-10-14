@@ -345,9 +345,18 @@ export function openSourceMenu(pane: PaneId, at?: { x: number; y: number }) {
   let pos = at;
   if (!pos) {
     const root = document.querySelector<HTMLElement>(`[data-pane="${pane}"]`);
-    const anchor = root?.querySelector<HTMLElement>(".source-btn") ?? root;
-    const r = anchor?.getBoundingClientRect();
-    pos = r ? { x: r.left + 4, y: r.bottom + 4 } : { x: 80, y: 120 };
+    // Under the path bar's source button; a pane with nothing open has no path bar, so the menu goes
+    // just inside the pane's top-left corner (below the pane's tab strip when it has one), never
+    // below the whole pane (which made the menu flip up from the bottom of the window).
+    const btn = root?.querySelector<HTMLElement>(".source-btn");
+    if (btn) {
+      const r = btn.getBoundingClientRect();
+      pos = { x: r.left, y: r.bottom + 4 };
+    } else if (root) {
+      const r = root.getBoundingClientRect();
+      const strip = root.querySelector<HTMLElement>(".tab-strip")?.getBoundingClientRect();
+      pos = { x: r.left + 8, y: (strip ? strip.bottom : r.top) + 8 };
+    } else pos = { x: 80, y: 120 };
   }
   useApp.setState({ contextMenu: null });
   useSourceMenu.setState({ menu: { pane, ...pos } });
@@ -502,3 +511,9 @@ export async function focusComputer(): Promise<boolean> {
   }
   return false;
 }
+
+/**
+ * Open a local path in a pane (the command line, see store/launch.ts): a directory, or a file's
+ * directory with the file selected. Resolves with an error to show, or null.
+ */
+export const openLocalPath = (pane: PaneId, path: string) => goToLocal(pane, path);

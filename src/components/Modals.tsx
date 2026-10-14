@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode, type RefObject } from "react";
 import { AlertCircle, AlertTriangle, ArrowRight, ClipboardPaste, FolderPlus, Loader2, LogOut, PencilLine, RotateCw, Trash2 } from "lucide-react";
 import * as api from "../lib/api";
 import type { AppError, ConflictPolicy, JobPreview, JobRequest } from "../lib/types";
@@ -171,6 +171,24 @@ function NewFolderModal({ bucket, prefix }: { bucket: string; prefix: string }) 
       </form>
     </ModalShell>
   );
+}
+
+/**
+ * v0.9.0 "Dialog default buttons": a copy / move / transfer confirmation gives its action button the
+ * keyboard as soon as it can be pressed (its preview is ready), so Enter confirms. Until then focus is on
+ * Cancel (marked `data-default-from`); focus the user moved elsewhere (a choice, a field) is never taken.
+ * Delete and recycle-bin confirmations don't use this: they keep Cancel.
+ */
+export function useDefaultAction(ref: RefObject<HTMLButtonElement | null>, ready: boolean) {
+  const done = useRef(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!ready || done.current || !el || el.disabled) return;
+    done.current = true;
+    const active = document.activeElement as HTMLElement | null;
+    const modal = el.closest(".modal");
+    if (!active || active === document.body || active === modal || active.hasAttribute("data-default-from")) el.focus();
+  }, [ready, ref]);
 }
 
 // ---- shared pieces for job confirmations -------------------------------------------------
@@ -570,6 +588,9 @@ function PasteModal({
   const needChoice = conflicts > 0;
   const canStart = !!preview && !nothing && (!needChoice || policy !== null) && !busy;
   const overwrite = needChoice && policy === "overwrite";
+  // Enter confirms once the preview is ready (focus moves to the action button).
+  const actionRef = useRef<HTMLButtonElement>(null);
+  useDefaultAction(actionRef, canStart);
   // Without conflicts "skip" is sent, so anything that appears meanwhile is not overwritten.
   const finalRequest: JobRequest = { ...request, onConflict: needChoice && policy ? policy : "skip" };
 
@@ -633,10 +654,10 @@ function PasteModal({
         />
       )}
       <div className="modal-actions">
-        <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus>
+        <button type="button" className="btn" onClick={close} disabled={busy} data-autofocus data-default-from>
           Cancel
         </button>
-        <button type="button" className={`btn ${overwrite ? "btn-danger" : "btn-primary"}`} onClick={() => void confirm()} disabled={!canStart}>
+        <button ref={actionRef} type="button" className={`btn ${overwrite ? "btn-danger" : "btn-primary"}`} onClick={() => void confirm()} disabled={!canStart}>
           {(busy || state?.status === "loading") && <Loader2 size={14} className="spin" />}
           {busy ? "Starting…" : `${Verb}${preview ? ` ${plural(preview.objects, "object")}${preview.truncated ? "+" : ""}` : ""}${overwrite ? ", overwrite" : ""}`}
         </button>

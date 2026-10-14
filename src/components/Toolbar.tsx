@@ -111,8 +111,8 @@ const TYPING_HINT_KEY = "s3x.searchTypingHintDismissed";
 /**
  * The search box, on its own row under the toolbar: typing filters the loaded rows at once and
  * searches 500 ms after the last keystroke (Enter searches right away); Esc clears it and leaves
- * the results. The scope control sits beside it. Mod+F, `/` and typing in the file list focus it
- * (key dispatcher). While the box is empty a hint shows the query syntax; while there is text, one
+ * the results. The scope control sits beside it. Mod+F, `/` and Alt+F7 (Total Commander) focus it
+ * (key dispatcher); typing in the file list jumps to a row instead (v0.9.0). While the box is empty a hint shows the query syntax; while there is text, one
  * says what is being searched and that Enter searches now, since the scope is easy to miss.
  */
 function SearchBox() {

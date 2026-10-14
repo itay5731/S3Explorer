@@ -14,6 +14,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   BATCH_PROGRESS_EVENT,
   JOB_PROGRESS_EVENT,
+  LAUNCH_OPEN_EVENT,
   TRANSFER_PROGRESS_EVENT,
   UPDATE_PROGRESS_EVENT,
   type AddedBucket,
@@ -37,6 +38,8 @@ import {
   type LocalRoot,
   type TrashResult,
   type LifecycleIssue,
+  type AccentColor,
+  type LaunchRequest,
   type ListPage,
   type MetadataEdit,
   type ObjectEntry,
@@ -196,6 +199,10 @@ export interface Backend {
   renameLocal(path: string, newName: string): Promise<void>;
   trashLocal(paths: string[]): Promise<TrashResult>;
   localDirSize(path: string, scanId: string): Promise<LocalDirSize>;
+  // v0.9.0: the window icon follows the accent; the command line opens a location
+  setWindowIcon(accent: AccentColor): Promise<void>;
+  takeLaunchRequest(): Promise<LaunchRequest | null>;
+  onLaunchOpen(cb: (req: LaunchRequest) => void): Promise<Unlisten>;
 }
 
 export const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -376,6 +383,9 @@ const tauriBackend: Backend = {
   renameLocal: (path, newName) => invoke<void>("rename_local", { path, newName }),
   trashLocal: (paths) => invoke<TrashResult>("trash_local", { paths }),
   localDirSize: (path, scanId) => invoke<LocalDirSize>("local_dir_size", { path, scanId }),
+  setWindowIcon: (accent) => invoke<void>("set_window_icon", { accent }),
+  takeLaunchRequest: () => invoke<LaunchRequest | null>("take_launch_request"),
+  onLaunchOpen: (cb) => listen<LaunchRequest>(LAUNCH_OPEN_EVENT, (e) => cb(e.payload)),
   onFileDrop: (cb) =>
     getCurrentWebview().onDragDropEvent((event) => {
       const p = event.payload;
@@ -596,3 +606,10 @@ export const renameLocal = (path: string, newName: string) => call("renameLocal"
 export const trashLocal = (paths: string[]) => call("trashLocal", paths);
 /** Files and bytes under a local folder, bounded (200,000 entries); a newer call with the same id cancels. */
 export const localDirSize = (path: string, scanId: string) => call("localDirSize", path, scanId);
+
+/** v0.9.0: the window and taskbar icon in the accent colour (the installed shortcut stays yellow). */
+export const setWindowIcon = (accent: AccentColor) => call("setWindowIcon", accent);
+/** The location the app was started with (`s3explorer [--connection <name>] [<location>]`), once; null after. */
+export const takeLaunchRequest = () => call("takeLaunchRequest");
+/** A second launch handed its arguments to this running instance (single instance). */
+export const onLaunchOpen = (cb: (req: LaunchRequest) => void) => call("onLaunchOpen", cb);

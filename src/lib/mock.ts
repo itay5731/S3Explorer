@@ -29,6 +29,7 @@ import type {
   LocalListing,
   LocalRoot,
   TrashResult,
+  LaunchRequest,
   MetadataEdit,
   ObjectEntry,
   ObjectMeta,
@@ -2878,6 +2879,43 @@ Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
   },
 });
 
+// ---- window icon and command line (v0.9.0) ------------------------------------------------------
+// The icon is not set in a browser; the calls are recorded. The launch request a test sets survives
+// the page reload that stands for an app start (mock-only localStorage key) and is returned once.
+
+const windowIconCalls: string[] = [];
+const MOCK_LAUNCH_KEY = "s3x.mock.launch";
+const launchListeners = new Set<(req: LaunchRequest) => void>();
+const launchCallLog: { cmd: string; result: unknown }[] = [];
+
+function takePendingLaunch(): LaunchRequest | null {
+  try {
+    const raw = localStorage.getItem(MOCK_LAUNCH_KEY);
+    localStorage.removeItem(MOCK_LAUNCH_KEY);
+    return raw ? (JSON.parse(raw) as LaunchRequest) : null;
+  } catch {
+    return null;
+  }
+}
+
+Object.assign((globalThis as Record<string, unknown>).__s3xMock as object, {
+  windowIconCalls,
+  launchCalls: launchCallLog,
+  /** The next `take_launch_request` (also after a page reload, which stands for an app start) returns this. */
+  setLaunchRequest: (req: LaunchRequest | null) => {
+    try {
+      if (req) localStorage.setItem(MOCK_LAUNCH_KEY, JSON.stringify(req));
+      else localStorage.removeItem(MOCK_LAUNCH_KEY);
+    } catch {
+      /* storage unavailable */
+    }
+  },
+  /** A second launch handing its arguments to this instance. */
+  emitLaunchOpen: (req: LaunchRequest) => {
+    for (const cb of launchListeners) cb(req);
+  },
+});
+
 export const mockBackend: Backend = {
   async listProfiles() {
     await latency();
@@ -3868,6 +3906,24 @@ export const mockBackend: Backend = {
     }
     if (/[\\/][^\\/]*missing[^\\/]*[\\/][^\\/]+$/i.test(path)) throw fail("Io", "The folder does not exist.");
     textFiles.set(path.toLowerCase(), { path, content });
+  },
+
+  async setWindowIcon(accent) {
+    windowIconCalls.push(accent);
+  },
+
+  async takeLaunchRequest() {
+    await delay(20);
+    const req = takePendingLaunch();
+    launchCallLog.push({ cmd: "take_launch_request", result: req });
+    return req;
+  },
+
+  async onLaunchOpen(cb) {
+    launchListeners.add(cb);
+    return () => {
+      launchListeners.delete(cb);
+    };
   },
 
   async listLocalRoots(): Promise<LocalRoot[]> {

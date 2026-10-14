@@ -13,6 +13,7 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { UpdateDialog } from "./components/UpdateDialog";
 import { loadSettings, useSettings } from "./store/settings";
 import { checkWhatsNew, scheduleStartupCheck } from "./store/updates";
+import { startLaunch } from "./store/launch";
 
 export default function App() {
   const connected = useApp((s) => s.connection !== null);
@@ -28,7 +29,9 @@ export default function App() {
     // Before the syncs start, so no finish event is missed; also while disconnected.
     const stopHistory = installHistory();
     // Settings work while disconnected, so load them independently of the connection.
-    void loadSettings().then(() => {
+    let stopLaunch: (() => void) | null = null;
+    const settingsLoaded = loadSettings();
+    void settingsLoaded.then(() => {
       if (disposed) return;
       // The first launch after an update shows what changed.
       void checkWhatsNew();
@@ -50,13 +53,19 @@ export default function App() {
         if (info && !disposed) setConnected(info);
       })
       .catch(() => {})
-      .finally(() => !disposed && setBooting(false));
+      .finally(() => {
+        if (disposed) return;
+        setBooting(false);
+        // v0.9.0: the command line's location, once settings and the connection status are known.
+        void settingsLoaded.then(() => startLaunch()).then((off) => (disposed ? off() : (stopLaunch = off)));
+      });
     return () => {
       disposed = true;
       stop?.();
       stopJobs?.();
       stopBatches?.();
       cancelUpdateCheck?.();
+      stopLaunch?.();
       stopHistory();
     };
   }, []);

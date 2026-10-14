@@ -9,7 +9,6 @@
 import { createContext } from "react";
 import { create } from "zustand";
 import type { AppError, FolderEntry, LocalEntry, ObjectEntry, PaneSource, SearchResult } from "../lib/types";
-import { readPref } from "./prefs";
 
 export type PaneId = "a" | "b";
 export const PANE_IDS: readonly PaneId[] = ["a", "b"];
@@ -146,7 +145,11 @@ export const emptySearch: PaneSearch = {
   focus: null,
 };
 
-export const SORT_KEY = "s3x.sort";
+/**
+ * Every pane, tab and new source starts sorted by Name, ascending. The sort is per pane and lasts
+ * only for the session (a stored `s3x.sort` from earlier versions is ignored).
+ */
+export const DEFAULT_SORT: SortState = { key: "name", dir: 1 };
 
 export const S3_SOURCE: PaneSource = { kind: "s3" };
 export const LOCAL_SOURCE: PaneSource = { kind: "local" };
@@ -163,7 +166,7 @@ let tabSeq = 0;
 export const newTabId = () => ++tabSeq;
 
 /** A pane with nothing open. The sort order is the saved one (shared by both panes as a default). */
-export function freshPane(sort: SortState = readPref<SortState>(SORT_KEY, { key: "name", dir: 1 })): PaneState {
+export function freshPane(sort: SortState = DEFAULT_SORT): PaneState {
   return {
     source: S3_SOURCE,
     local: null,

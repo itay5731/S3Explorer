@@ -23,6 +23,7 @@ export function PopupMenu({
   label,
   className,
   headings,
+  typeAhead,
 }: {
   x: number;
   y: number;
@@ -33,6 +34,11 @@ export function PopupMenu({
   className?: string;
   /** A small heading above each group, by group index (empty groups are still skipped). */
   headings?: string[];
+  /**
+   * v0.9.0: typing selects the first item whose label (or hint, such as a drive's path) starts with
+   * the typed prefix, case-insensitively; the prefix starts again 1 s after the last key. Enter opens it.
+   */
+  typeAhead?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
@@ -60,7 +66,20 @@ export function PopupMenu({
     const onDown = (e: MouseEvent) => {
       if (!ref.current?.contains(e.target as Node)) close();
     };
+    let typed = "";
+    let typedAt = 0;
     const onKey = (e: KeyboardEvent) => {
+      if (typeAhead && [...e.key].length === 1 && e.key !== " " && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        const now = Date.now();
+        typed = (now - typedAt > 1000 ? "" : typed) + e.key.toLocaleLowerCase();
+        typedAt = now;
+        const btns = [...(ref.current?.querySelectorAll<HTMLButtonElement>("button:not(:disabled)") ?? [])];
+        const hit = btns.find((b) => [b.dataset.label ?? "", b.dataset.hint ?? ""].some((t) => t.toLocaleLowerCase().startsWith(typed)));
+        hit?.focus();
+        return;
+      }
       if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -106,6 +125,8 @@ export function PopupMenu({
               <button
                 key={item.label}
                 role="menuitem"
+                data-label={item.label}
+                data-hint={item.hint}
                 className={`menu-item ${item.danger ? "danger" : ""}`}
                 disabled={item.disabled}
                 title={item.title}
