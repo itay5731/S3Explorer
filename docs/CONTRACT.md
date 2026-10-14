@@ -2266,6 +2266,48 @@ installed icon. From v0.9.0 the running window's icon matches the accent:
 - The icon of a pinned taskbar or Start-menu shortcut comes from the installer and stays yellow; only the
   running window (title bar, taskbar button, Alt-Tab) follows the accent. The changelog says so.
 
+### Command line: open the app at a location
+
+```
+s3explorer [--connection <saved connection name>] [<location>]
+s3explorer --help
+```
+
+`<location>` is an absolute local path (a directory, or a file: its directory with the file selected) or an
+`s3://bucket[/prefix]` address. Relative paths are resolved against the current directory of the shell that
+launched the app. UNC and device paths are refused like everywhere else.
+
+```ts
+interface LaunchRequest {
+  connection: string | null;                 // --connection value, verbatim
+  local: string | null;                      // absolute local path (file or directory), as given after resolving
+  s3: { bucket: string; prefix: string } | null;
+  raw: string[];                             // the arguments after the executable, for the error message
+}
+```
+
+| Command | Args | Returns |
+|---|---|---|
+| `take_launch_request` | `{}` | `LaunchRequest \| null`. The request parsed from the process arguments, returned once (later calls return null). Parse errors (unknown option, two locations, a malformed `s3://`) are `InvalidInput` with the usage text. |
+
+| Event | Payload |
+|---|---|
+| `launch:open` | `LaunchRequest`. Emitted when a second launch of the app hands its arguments to the running instance (single-instance behaviour: the second process exits at once; the running window is shown and focused). |
+
+- **Single instance.** The app uses the single-instance plugin: launching `s3explorer <location>` while the
+  app runs does not open a second window; the running instance receives `launch:open`.
+- **Frontend behaviour.** On start, after settings load, the frontend calls `take_launch_request`. With a
+  request: if a connection is open, apply it; else pick the saved connection named by `--connection`
+  (exact name, case-insensitive) or, without it, the most recently used saved connection; connect with it
+  (secret from the keychain, no prompt), then apply. With no saved connection the connect screen shows a
+  note "Connect to open <location>" and applies the request after the user connects. Applying: an `s3`
+  location opens the bucket and prefix in the active pane (a bucket not in the list is added as a shared
+  bucket by name, same rules as the "+" button; failure toasts); a `local` location opens a local pane
+  (the active pane in single view; in split view the pane that is not showing S3, else the right pane),
+  selecting the file when a file was given. `launch:open` applies the same way at any time.
+- `--help` prints the usage to stdout and exits 0 (visible when run from a terminal); an invalid command
+  line prints the usage and exits 2 before any window opens.
+
 ### Scope note
 
 The local pane makes "dragging objects out of the app" partly unnecessary (copy to a local pane instead);

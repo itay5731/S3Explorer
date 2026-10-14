@@ -529,6 +529,16 @@ export interface LocalDirSize { files: number; bytes: number; truncated: boolean
 
 export const LOCAL_LIMITS = { maxEntries: 50_000, dirSizeMaxEntries: 200_000 } as const;
 
+/** v0.9.0: what the command line asked the app to open (see "Command line" in docs/CONTRACT.md). */
+export interface LaunchRequest {
+  connection: string | null;
+  local: string | null;
+  s3: { bucket: string; prefix: string } | null;
+  raw: string[];
+}
+
+export const LAUNCH_OPEN_EVENT = "launch:open";
+
 /** Limits for `AppSettings.keybindings` and the export/import file (see "Keyboard" in docs/CONTRACT.md). */
 export const KEYBINDING_LIMITS = {
   maxActions: 200,
