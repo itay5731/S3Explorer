@@ -2114,7 +2114,7 @@ None.
 
 ## v0.9.0 additions — Commander mode (issue #13)
 
-Four requests from issue #13: Total Commander keybindings as the default without changing existing users'
+Four requests from issue #13 (five new action ids): Total Commander keybindings as the default without changing existing users'
 bindings; a pane that shows the local computer so copy = download and move = download + delete; an
 editable path; and syncing the other pane to this one.
 
@@ -2192,9 +2192,11 @@ interface LocalListing { dirs: LocalEntry[]; files: LocalEntry[]; truncated: boo
   context menu), by pane kinds:
   - S3 → local **copy**: `start_download` per object / `start_batch` download per folder into the local
     pane's directory (the existing conflict preview, name sanitizing, link rules). **Move**: the same,
-    then, for each transfer or batch that ends `completed`, one delete job for exactly the keys/prefixes
-    that completed (the existing `delete` job, no extra confirmation beyond the move's own, which lists
-    the keys and says they will be deleted from S3 after download). Anything that failed, was cancelled
+    then one delete job for **exactly the object keys whose download completed** (single transfers by
+    key; for a folder batch, the keys of its per-file transfers that ended `completed`, never the prefix
+    itself, so an object added under the folder after the move was planned is never deleted and folder
+    markers are left in place). The existing `delete` job runs it with no extra confirmation beyond the
+    move's own, which lists the items and says they will be deleted from S3 after download. Anything that failed, was cancelled
     or was skipped is **not** deleted. Closing the app mid-way deletes nothing.
   - local → S3 **copy**: `start_upload` per file / `start_batch` upload per folder to the S3 pane's
     bucket + prefix (existing conflict preview). **Move**: the same, then `trash_local` for exactly the
