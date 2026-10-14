@@ -2144,11 +2144,17 @@ keybindingsPreset: "commander" | "classic";   // the default map that `keybindin
   gets `commander`. That is the whole upgrade story: an existing
   user's effective bindings do not change by one key, and their `keybindings` overrides keep meaning what
   they meant. `update_settings` requires the field (strict), like every other field.
-- **There is no preset control in the UI** (user decision 2026-10-14). The field is an internal marker of
-  which default map an installation started from: new installs are Total Commander, upgraded installs keep
-  the classic map as their defaults so nothing changes for them. Settings → Keyboard shows only the actions,
-  the chords and Record / Reset / Reset all / Export / Import as before; "Reset all" returns an installation
-  to its own default map. The cheat sheet and tooltips follow the effective map as before.
+- **There is no preset control in the UI, and there is only one default map: Total Commander** (user
+  decisions 2026-10-14). The field is a one-time **migration marker**: when the frontend loads settings with
+  `keybindingsPreset: "classic"` (an upgraded install), it computes that user's effective map (classic
+  defaults + their overrides), writes it back as explicit `keybindings` overrides against the Commander
+  defaults (existing overrides win; actions equal to the Commander default are not stored), saves with
+  `keybindingsPreset: "commander"`, and shows a one-time toast "Your keyboard shortcuts were kept. Reset all in
+  Settings → Keyboard switches to the Total Commander layout." After that `classic` never appears again.
+  Settings → Keyboard shows the actions, the chords and Record / Reset / Reset all / Export / Import as before;
+  **"Reset all" returns to the Total Commander defaults for everyone**. Export writes `preset: "commander"`;
+  importing a file with `preset: "classic"` converts it the same way. The cheat sheet and tooltips follow the
+  effective map as before.
 - Export files gain `"preset": "commander" | "classic"`; import applies the preset and then the
   bindings. A file without `preset` (v0.8.0 export) imports as full explicit bindings, as today.
 - The always-prevented webview keys (F5, Ctrl+R, …) stay prevented in both presets.
