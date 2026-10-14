@@ -65,8 +65,9 @@ The user defined v1 precisely. Deliver exactly this, do not widen it:
 35. Pause and resume downloads, uploads and folder transfers, in memory only (added on request after v0.7.0;
     see "Pause and resume transfers" in `docs/CONTRACT.md`).
 
-36. (v0.9.0) Keybinding presets: Total Commander layout as the default for new installs, Classic kept for
-    existing settings files; selectable in Settings → Keyboard (issue #13).
+36. (v0.9.0) Total Commander keybindings are the one default map; an upgraded install keeps its effective keys
+    through a one-time migration into overrides, and "Reset all" restores Total Commander. No preset control
+    in the UI (issue #13).
 37. (v0.9.0) A pane can show the local computer (drives, folders) so copy and move between panes are downloads
     and uploads; local delete goes to the recycle bin only; local→local copy/move stays with the OS (issue #13).
 38. (v0.9.0) Editable path bar (`Mod+L`) and "sync the other pane to this one" (issue #13).
