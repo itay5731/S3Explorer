@@ -363,6 +363,10 @@ pub(crate) async fn existing_dests(ctx: &Ctx<'_>, exp: &Expansion, cap: Option<u
 /// (and that a `HeadObject` afterwards still found, or could not check).
 pub(crate) const DELETE_NOT_CONFIRMED: &str = "The server did not confirm the delete.";
 
+/// v0.9.0: a delete-job item pinned to an ETag whose object was rewritten since.
+pub(crate) const CHANGED_NOT_DELETED: &str =
+    "Changed on S3, not deleted: the object was rewritten after this operation was planned, so it was left in place.";
+
 /// What one `DeleteObjects` response says about one requested key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyOutcome {
@@ -381,15 +385,6 @@ enum BatchError {
     Request(Box<SdkError<aws_sdk_s3::operation::delete_objects::DeleteObjectsError, HttpResponse>>),
     /// The response cannot be attributed to keys (an `<Error>` without a key).
     Unattributed(String),
-}
-
-impl BatchError {
-    fn message(self) -> String {
-        match self {
-            BatchError::Request(e) => AppError::from(*e).message,
-            BatchError::Unattributed(m) => m,
-        }
-    }
 }
 
 fn error_text(code: Option<&str>, message: Option<&str>) -> String {
@@ -501,18 +496,105 @@ pub(crate) fn record_delete_batch(entry: &JobEntry, chunk: &[Planned], r: Result
 }
 
 pub(crate) async fn run_delete(ctx: &Ctx<'_>, entry: &JobEntry, work: &[Planned]) {
+    // Cleared once the server shows it does not take conditional deletes (same fallback as the
+    // delete of a move's sources).
+    let etags_ok = AtomicBool::new(true);
+    let etags_ok = &etags_ok;
     let results = stream::iter(0..work.len().div_ceil(DELETE_BATCH))
         .take_until(ctx.cancel.cancelled())
         .map(move |c| async move {
             let chunk = &work[c * DELETE_BATCH..((c + 1) * DELETE_BATCH).min(work.len())];
-            let keys: Vec<(&str, Option<&str>)> = chunk.iter().map(|p| (p.src.as_str(), None)).collect();
-            (chunk, delete_objects(ctx.src, &ctx.req.src_bucket, &keys).await.map_err(BatchError::message))
+            (chunk, delete_chunk(ctx, etags_ok, chunk).await)
         })
         .buffer_unordered(DELETE_CONCURRENCY);
     tokio::pin!(results);
     while let Some((chunk, r)) = results.next().await {
-        record_delete_batch(entry, chunk, r);
+        record_delete_batch(entry, chunk, Ok(r));
     }
+}
+
+/// The ETag a delete-job object is pinned to: only what the request item carried (single
+/// objects), never an ETag from a prefix listing.
+fn delete_pin<'a>(ctx: &Ctx<'_>, p: &'a Planned) -> Option<&'a str> {
+    let item = ctx.req.items.get(p.item)?;
+    if item.is_prefix || item.etag.is_none() {
+        return None;
+    }
+    p.etag.as_deref()
+}
+
+/// One delete-job batch, one outcome per key. Pinned keys are deleted with their ETag; a 412
+/// (`PreconditionFailed`) is [`CHANGED_NOT_DELETED`] for that key. A server that rejects the
+/// condition itself (the whole request, or per key with `NotImplemented`) gets the affected keys
+/// once more without it, and `etags_ok` is cleared for the rest of the job.
+async fn delete_chunk(ctx: &Ctx<'_>, etags_ok: &AtomicBool, chunk: &[Planned]) -> Vec<KeyOutcome> {
+    let mut out: Vec<Option<KeyOutcome>> = vec![None; chunk.len()];
+    let mut todo: Vec<usize> = (0..chunk.len()).collect();
+    loop {
+        let with = etags_ok.load(Ordering::Relaxed);
+        let pin = |i: usize| if with { delete_pin(ctx, &chunk[i]) } else { None };
+        let any_pinned = todo.iter().any(|&i| pin(i).is_some());
+        let keys: Vec<(&str, Option<&str>)> = todo.iter().map(|&i| (chunk[i].src.as_str(), pin(i))).collect();
+        match delete_objects(ctx.src, &ctx.req.src_bucket, &keys).await {
+            Ok(outcomes) => {
+                let mut retry = Vec::new();
+                for (&i, o) in todo.iter().zip(outcomes) {
+                    let pinned = pin(i).is_some();
+                    out[i] = Some(match o {
+                        KeyOutcome::Failed(m) if pinned && m.starts_with("NotImplemented") => {
+                            retry.push(i);
+                            continue;
+                        }
+                        KeyOutcome::Failed(m) if pinned && m.starts_with("PreconditionFailed") => {
+                            KeyOutcome::Failed(CHANGED_NOT_DELETED.into())
+                        }
+                        o => o,
+                    });
+                }
+                if retry.is_empty() {
+                    break;
+                }
+                etags_ok.store(false, Ordering::Relaxed);
+                todo = retry;
+            }
+            Err(BatchError::Request(e)) => {
+                let (status, code) = err_info(&e);
+                if any_pinned && status == Some(412) {
+                    // A whole-request 412: nothing in it was deleted, and a pinned key changed.
+                    for &i in &todo {
+                        out[i] = Some(KeyOutcome::Failed(if pin(i).is_some() {
+                            CHANGED_NOT_DELETED.into()
+                        } else {
+                            "PreconditionFailed: not deleted (an object in the same request changed on S3)".into()
+                        }));
+                    }
+                    break;
+                }
+                let unsupported = matches!(status, Some(400) | Some(501))
+                    && matches!(
+                        code.as_deref(),
+                        Some("NotImplemented") | Some("MalformedXML") | Some("InvalidArgument") | Some("InvalidRequest")
+                    );
+                if with && any_pinned && unsupported {
+                    // Nothing in this request was deleted; retry it without conditions.
+                    etags_ok.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                let m = AppError::from(*e).message;
+                for &i in &todo {
+                    out[i] = Some(KeyOutcome::Failed(m.clone()));
+                }
+                break;
+            }
+            Err(BatchError::Unattributed(m)) => {
+                for &i in &todo {
+                    out[i] = Some(KeyOutcome::Failed(m.clone()));
+                }
+                break;
+            }
+        }
+    }
+    out.into_iter().map(|o| o.unwrap_or(KeyOutcome::Unconfirmed)).collect()
 }
 
 // ---- working phase: copy / move ---------------------------------------------------------------

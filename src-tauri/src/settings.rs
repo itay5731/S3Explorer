@@ -8,22 +8,44 @@
 //! of range falls back to its own default and the valid fields are kept (see
 //! [`AppSettings::from_json_lenient`]). A v0.2.0 file (three fields) loads with the new fields at
 //! their defaults.
+//!
+//! v0.9.0 keybinding preset: only a fresh install gets the `commander` default. A settings file
+//! without the field, an unreadable or unparsable settings file, and a missing settings file in a
+//! config directory that already holds any other file (an existing install that never saved
+//! settings) all load `classic`, so an upgrading user's keys do not change.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::models::AppSettings;
+use crate::models::{AppSettings, KeybindingsPreset};
 
 pub const SETTINGS_FILE: &str = "settings.json";
 
 /// Reads settings from `path`, falling back to defaults (see module docs). Never fails.
 pub fn load(path: &Path) -> AppSettings {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .map(|v| AppSettings::from_json_lenient(&v))
-        .unwrap_or_default()
+    let classic = || AppSettings { keybindings_preset: KeybindingsPreset::Classic, ..AppSettings::default() };
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            // A file that is not a JSON object (`[]`, `1`) is an existing install's broken file too.
+            .filter(serde_json::Value::is_object)
+            .map(|v| AppSettings::from_json_lenient(&v))
+            .unwrap_or_else(classic),
+        // No settings file at all (whatever the error says) in a fresh config folder.
+        Err(_) if std::fs::symlink_metadata(path).is_err() && !existing_install(path) => AppSettings::default(),
+        Err(_) => classic(),
+    }
+}
+
+/// Whether the folder of the settings file holds anything else (`connections.json`,
+/// `added-buckets.json`, history, ...): an install that has run before. An absent or unreadable
+/// folder, or an empty one, is a fresh install.
+fn existing_install(settings_path: &Path) -> bool {
+    let Some(dir) = settings_path.parent().filter(|d| !d.as_os_str().is_empty()) else { return false };
+    let Ok(read) = std::fs::read_dir(dir) else { return false };
+    let own = settings_path.file_name();
+    read.flatten().any(|e| Some(e.file_name().as_os_str()) != own)
 }
 
 /// Writes `settings` to `path` atomically (see [`write_json_atomic`]).
@@ -817,10 +839,11 @@ mod tests {
         let path = dir.join(SETTINGS_FILE);
         assert_eq!(load(&path), AppSettings::default(), "missing");
 
-        // Not a JSON object: the defaults wholesale.
+        // Not a JSON object: the defaults wholesale, with the classic preset (the file is there, so
+        // this is an existing install).
         for corrupt in ["", "{", "not json", "[]"] {
             std::fs::write(&path, corrupt).expect("write");
-            assert_eq!(load(&path), AppSettings::default(), "corrupt: {corrupt}");
+            assert_eq!(load(&path), legacy(), "corrupt: {corrupt}");
         }
         // An object written before v0.9.0 (no preset): its bad fields fall back, preset classic.
         for corrupt in [r#"{"maxConcurrentParts":"eight"}"#, r#"{"partSizeMib":-3}"#] {
@@ -881,6 +904,35 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Io);
         assert!(!called);
         assert_eq!(store.get(), AppSettings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_settings_in_an_existing_install_load_classic() {
+        // Absent config folder, and an empty one: a fresh install.
+        let dir = temp_dir("fresh");
+        let absent = dir.join("not-created").join(SETTINGS_FILE);
+        assert_eq!(load(&absent), AppSettings::default());
+        assert_eq!(load(&absent).keybindings_preset, KeybindingsPreset::Commander);
+        let path = dir.join(SETTINGS_FILE);
+        std::fs::remove_dir(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert_eq!(load(&path).keybindings_preset, KeybindingsPreset::Commander, "empty folder");
+        assert_eq!(SettingsStore::load(path.clone()).get(), AppSettings::default());
+        // Any other file there (saved connections, added buckets, ...): an existing install.
+        for other in ["connections.json", "added-buckets.json"] {
+            let f = dir.join(other);
+            std::fs::write(&f, b"[]").expect("write");
+            assert_eq!(load(&path), legacy(), "{other}");
+            assert_eq!(SettingsStore::load(path.clone()).get().keybindings_preset, KeybindingsPreset::Classic);
+            std::fs::remove_file(&f).expect("rm");
+        }
+        // A subfolder counts too.
+        std::fs::create_dir(dir.join("history")).expect("mkdir");
+        assert_eq!(load(&path).keybindings_preset, KeybindingsPreset::Classic);
+        // Once saved, the file decides, whatever else is there.
+        save(&path, &AppSettings::default()).expect("save");
+        assert_eq!(load(&path).keybindings_preset, KeybindingsPreset::Commander);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -457,6 +457,7 @@ pub(super) async fn run(
 
     let p = plan::plan_download(size, cfg.part_size_mib);
     entry.set_totals(size, p.parts_total());
+    entry.set_etag(etag.clone());
     let result = async {
         if p.multipart {
             let (f, part_size) = (file.clone(), p.part_size);

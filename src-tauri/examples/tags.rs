@@ -178,10 +178,10 @@ fn tag_req(items: Vec<JobItem>, op: TagOperation) -> JobRequest {
 }
 
 fn pre(p: &str) -> JobItem {
-    JobItem { from: p.into(), to: None, is_prefix: true }
+    JobItem { from: p.into(), to: None, is_prefix: true, etag: None }
 }
 fn obj(k: &str) -> JobItem {
-    JobItem { from: k.into(), to: None, is_prefix: false }
+    JobItem { from: k.into(), to: None, is_prefix: false, etag: None }
 }
 
 // ---- 0. probe -------------------------------------------------------------------------------
@@ -580,13 +580,13 @@ async fn rejections(c: &Client, rec: &Arc<Recorder>) -> Res<()> {
     };
     expect_err(mgr.start(del.clone(), c.clone(), None), ErrorCode::InvalidInput, "a delete job with tags set")?;
     expect_err(jobs::preview(&del, c, None).await, ErrorCode::InvalidInput, "preview of a delete job with tags set")?;
-    let copy = JobRequest { kind: JobKind::Copy, dest_bucket: Some(A.into()), items: vec![JobItem { from: "bulk/".into(), to: Some("copy/".into()), is_prefix: true }], ..del.clone() };
+    let copy = JobRequest { kind: JobKind::Copy, dest_bucket: Some(A.into()), items: vec![JobItem { from: "bulk/".into(), to: Some("copy/".into()), is_prefix: true, etag: None }], ..del.clone() };
     expect_err(mgr.start(copy, c.clone(), Some(c.clone())), ErrorCode::InvalidInput, "a copy job with tags set")?;
     let no_tags = JobRequest { tags: None, ..tag_req(vec![pre("bulk/")], op.clone()) };
     expect_err(mgr.start(no_tags, c.clone(), None), ErrorCode::InvalidInput, "a tag job without tags")?;
     let with_dest = JobRequest { dest_bucket: Some(A.into()), ..tag_req(vec![pre("bulk/")], op.clone()) };
     expect_err(mgr.start(with_dest, c.clone(), None), ErrorCode::InvalidInput, "a tag job with destBucket")?;
-    let with_to = tag_req(vec![JobItem { from: "bulk/".into(), to: Some("x/".into()), is_prefix: true }], op.clone());
+    let with_to = tag_req(vec![JobItem { from: "bulk/".into(), to: Some("x/".into()), is_prefix: true, etag: None }], op.clone());
     expect_err(mgr.start(with_to, c.clone(), None), ErrorCode::InvalidInput, "a tag job with an item `to`")?;
     let eleven: Vec<Tag> = (0..11).map(|i| t(&format!("k{i}"), "v")).collect();
     let big = tag_req(vec![pre("bulk/")], TagOperation { mode: TagMode::Replace, set: eleven, remove: vec![] });

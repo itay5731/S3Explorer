@@ -268,8 +268,8 @@ pub fn create_dir(parent: &str, name: &str) -> AppResult<PathBuf> {
 }
 
 /// `rename_local`: renames `path` (a file, folder or link, never followed) to `new_name`
-/// (sanitized) in the same folder. Refuses an existing target, except a change of case only
-/// where the file system ignores case; never replaces.
+/// (sanitized) in the same folder. Refuses an existing target, except the source itself (a change
+/// of case on a case-insensitive file system); never replaces.
 pub fn rename(path: &str, new_name: &str) -> AppResult<PathBuf> {
     let src = check_path(path)?;
     let parent = src
@@ -283,13 +283,8 @@ pub fn rename(path: &str, new_name: &str) -> AppResult<PathBuf> {
         return Ok(src);
     }
     let dst = parent.join(&clean);
-    let same_entry = fold_name(&clean) == fold_name(&old);
-    if !same_entry {
-        match std::fs::symlink_metadata(&dst) {
-            Ok(_) => return Err(AppError::invalid(format!("{clean} already exists"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_error("check", &dst.to_string_lossy(), &e)),
-        }
+    if blocked_by_existing(&src, &dst).map_err(|e| io_error("check", &dst.to_string_lossy(), &e))? {
+        return Err(AppError::invalid(format!("{clean} already exists")));
     }
     rename_no_replace(&src, &dst).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
@@ -314,14 +309,47 @@ fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Elsewhere: the target was checked to be absent just before (a small window remains between
-/// the check and the rename).
+/// Elsewhere: refused when [`blocked_by_existing`] (a small window remains between the check and
+/// the rename). A target that is the source itself (case-only rename on a case-insensitive file
+/// system) is allowed.
 #[cfg(not(windows))]
 fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if std::fs::symlink_metadata(dst).is_ok() {
+    if blocked_by_existing(src, dst)? {
         return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists));
     }
     std::fs::rename(src, dst)
+}
+
+/// Whether something other than `src` itself exists at `dst` (links are not followed). Shared by
+/// every platform: on a case-insensitive file system `dst` differing from `src` only in case is
+/// `src` itself.
+fn blocked_by_existing(src: &Path, dst: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(dst_meta) => {
+            let src_meta = std::fs::symlink_metadata(src)?;
+            Ok(!same_entry(src, &src_meta, dst, &dst_meta))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// `src` and `dst` name the same directory entry: same device and inode on Unix; on Windows the
+/// same canonical path (the parent canonicalized, the name compared case-insensitively as NTFS
+/// does), since a stable file id is not available there.
+#[cfg(unix)]
+fn same_entry(_src: &Path, a: &std::fs::Metadata, _dst: &Path, b: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_entry(src: &Path, _a: &std::fs::Metadata, dst: &Path, _b: &std::fs::Metadata) -> bool {
+    let key = |p: &Path| -> Option<String> {
+        let parent = std::fs::canonicalize(p.parent()?).ok()?;
+        Some(fold_name(&parent.join(p.file_name()?).to_string_lossy()))
+    };
+    matches!((key(src), key(dst)), (Some(a), Some(b)) if a == b)
 }
 
 #[cfg(windows)]
@@ -334,35 +362,179 @@ fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
 mod ffi {
     pub const DRIVE_FIXED: u32 = 3;
 
+    pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+    // Predefined keys are sign-extended 32-bit values (`(HKEY)(ULONG_PTR)(LONG)0x80000001`).
+    pub const HKEY_CURRENT_USER: isize = 0x8000_0001_u32 as i32 as isize;
+    pub const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+
     #[link(name = "kernel32")]
     extern "system" {
         pub fn GetLogicalDrives() -> u32;
         pub fn GetDriveTypeW(root: *const u16) -> u32;
         pub fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+        pub fn GetVolumeNameForVolumeMountPointW(mount_point: *const u16, volume_name: *mut u16, len: u32) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        pub fn RegGetValueW(
+            key: isize,
+            subkey: *const u16,
+            value: *const u16,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut core::ffi::c_void,
+            size: *mut u32,
+        ) -> i32;
     }
 }
 
-/// Windows: only a fixed disk has a recycle bin. On a removable, network, optical or RAM drive
-/// the shell would delete permanently, so those are refused.
+/// The drive letter of a canonical (verbatim) path: only `\\?\X:\...`. A UNC share
+/// (`\\?\UNC\...`), a volume mounted without a letter (`\\?\Volume{...}\...`), a device path
+/// or a non-canonical path are refused with the reason.
 #[cfg(windows)]
-fn has_recycle_bin(p: &Path) -> Result<(), String> {
-    let Some(Component::Prefix(prefix)) = p.components().next() else {
-        return Err("Not a drive path".into());
+fn verbatim_drive(canonical: &Path) -> Result<char, String> {
+    use std::path::Prefix;
+    match canonical.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::VerbatimDisk(l) => Ok((l as char).to_ascii_uppercase()),
+            Prefix::VerbatimUNC(..) | Prefix::UNC(..) => {
+                Err("It is on a network share, which has no recycle bin; nothing was deleted. Delete it in your file manager.".into())
+            }
+            Prefix::Verbatim(v) if v.to_string_lossy().to_ascii_lowercase().starts_with("volume{") => Err(
+                "It is on a volume mounted without a drive letter, whose recycle bin cannot be checked; nothing was deleted. Delete it in your file manager."
+                    .into(),
+            ),
+            _ => Err("Its drive could not be determined, so it was not deleted.".into()),
+        },
+        _ => Err("Its drive could not be determined, so it was not deleted.".into()),
+    }
+}
+
+/// `{GUID}` out of a volume name `\\?\Volume{GUID}\`.
+#[cfg(windows)]
+fn volume_guid(volume_name: &str) -> Option<&str> {
+    let start = volume_name.find('{')?;
+    let end = start + volume_name[start..].find('}')?;
+    Some(&volume_name[start..=end])
+}
+
+#[cfg(windows)]
+fn volume_name_of(letter: char) -> Option<String> {
+    let root = wide(std::ffi::OsStr::new(&format!("{letter}:\\")));
+    let mut buf = [0u16; 64];
+    // SAFETY: `root` is NUL-terminated; `buf` is writable for the length passed.
+    let ok = unsafe { ffi::GetVolumeNameForVolumeMountPointW(root.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if ok == 0 {
+        return None;
+    }
+    let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// A DWORD registry value, `None` when absent.
+#[cfg(windows)]
+fn reg_dword(root: isize, subkey: &str, value: &str) -> Option<u32> {
+    let (k, v) = (wide(std::ffi::OsStr::new(subkey)), wide(std::ffi::OsStr::new(value)));
+    let mut data: u32 = 0;
+    let mut size: u32 = 4;
+    // SAFETY: NUL-terminated strings; `data` is a writable DWORD and `size` says so.
+    let status = unsafe {
+        ffi::RegGetValueW(root, k.as_ptr(), v.as_ptr(), ffi::RRF_RT_REG_DWORD, std::ptr::null_mut(), (&mut data as *mut u32).cast(), &mut size)
     };
-    let std::path::Prefix::Disk(letter) = prefix.kind() else {
-        return Err("Not a drive path".into());
+    (status == 0).then_some(data)
+}
+
+/// The recycle bin settings of a volume: (`NukeOnDelete`, `MaxCapacity` in MB).
+#[cfg(windows)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BinSettings {
+    nuke_on_delete: bool,
+    max_capacity_mb: Option<u64>,
+}
+
+#[cfg(windows)]
+const BITBUCKET: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket";
+
+#[cfg(windows)]
+fn bin_settings(letter: char) -> BinSettings {
+    let per_volume = volume_name_of(letter)
+        .as_deref()
+        .and_then(volume_guid)
+        .map(|g| format!("{BITBUCKET}\\Volume\\{g}"));
+    let get = |value: &str| -> Option<u32> {
+        per_volume.as_deref().and_then(|k| reg_dword(ffi::HKEY_CURRENT_USER, k, value))
     };
-    let letter = (letter as char).to_ascii_uppercase();
+    // Group policy "Do not move deleted files to the Recycle Bin", the legacy global switch, then
+    // the volume's own setting.
+    let policy = reg_dword(ffi::HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoRecycleFiles")
+        .or_else(|| reg_dword(ffi::HKEY_LOCAL_MACHINE, r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoRecycleFiles"));
+    let legacy = reg_dword(ffi::HKEY_CURRENT_USER, BITBUCKET, "NukeOnDelete")
+        .or_else(|| reg_dword(ffi::HKEY_LOCAL_MACHINE, BITBUCKET, "NukeOnDelete"));
+    let nuke = [policy, legacy, get("NukeOnDelete")].iter().any(|v| v.is_some_and(|n| n != 0));
+    BinSettings { nuke_on_delete: nuke, max_capacity_mb: get("MaxCapacity").map(u64::from) }
+}
+
+/// Whether an item of `size` bytes (`truncated`: at least that much) fits in the bin: refused when
+/// the bin is set to delete immediately, when it is larger than the bin, or when its size could
+/// not be told (more entries than the bounded walk looks at).
+#[cfg(windows)]
+fn bin_accepts(bin: BinSettings, letter: char, size: u64, truncated: bool) -> Result<(), String> {
+    if bin.nuke_on_delete {
+        return Err(format!(
+            "The recycle bin of drive {letter}: is set to remove files immediately, so it was not deleted. Delete it in your file manager."
+        ));
+    }
+    if let Some(cap) = bin.max_capacity_mb {
+        let mb = size.div_ceil(1024 * 1024);
+        if mb > cap {
+            return Err(format!(
+                "It is larger ({mb} MB) than the recycle bin of drive {letter}: ({cap} MB), which would delete it permanently; nothing was deleted."
+            ));
+        }
+        if truncated {
+            return Err(format!(
+                "It holds more than {LOCAL_DIR_SIZE_MAX_ENTRIES} entries, so it could not be confirmed to fit in the recycle bin of drive {letter}:; nothing was deleted."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Windows: the drive that really holds `p` (its canonical parent: junctions and mount points
+/// resolved) must be a fixed local disk. On a removable, network, optical or RAM drive the shell
+/// would delete permanently, so those are refused.
+#[cfg(windows)]
+fn trash_drive(p: &Path) -> Result<char, String> {
+    let parent = p.parent().ok_or_else(|| "A drive or root folder cannot be deleted".to_string())?;
+    let canonical = std::fs::canonicalize(parent).map_err(|e| format!("Could not resolve its folder: {e}"))?;
+    let letter = verbatim_drive(&canonical)?;
     let root = wide(std::ffi::OsStr::new(&format!("{letter}:\\")));
     // SAFETY: a NUL-terminated UTF-16 string that outlives the call.
     let kind = unsafe { ffi::GetDriveTypeW(root.as_ptr()) };
-    if kind == ffi::DRIVE_FIXED {
-        Ok(())
-    } else {
-        Err(format!(
+    if kind != ffi::DRIVE_FIXED {
+        return Err(format!(
             "Drive {letter}: has no recycle bin (removable, network or optical drive); nothing was deleted. Delete it in your file manager."
-        ))
+        ));
     }
+    Ok(letter)
+}
+
+/// Windows: every check before the item goes to the recycle bin.
+#[cfg(windows)]
+fn recycle_bin_ok(p: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+    let letter = trash_drive(p)?;
+    let bin = bin_settings(letter);
+    let (size, truncated) = if meta.file_type().is_symlink() {
+        (0, false) // the link itself goes to the bin
+    } else if meta.is_dir() {
+        let s = dir_size(&p.to_string_lossy(), LOCAL_DIR_SIZE_MAX_ENTRIES, &AtomicBool::new(false))
+            .map_err(|e| format!("Could not measure it: {}", e.message))?;
+        (s.bytes, s.truncated)
+    } else {
+        (meta.len(), false)
+    };
+    bin_accepts(bin, letter, size, truncated)
 }
 
 fn trash_context() -> trash::TrashContext {
@@ -384,13 +556,15 @@ fn trash_one(ctx: &trash::TrashContext, path: &str) -> Result<(), String> {
     if p.parent().is_none_or(|q| q.as_os_str().is_empty()) {
         return Err("A drive or root folder cannot be deleted".into());
     }
-    match std::fs::symlink_metadata(&p) {
-        Ok(_) => {}
+    let meta = match std::fs::symlink_metadata(&p) {
+        Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("It does not exist (any more)".into()),
         Err(e) => return Err(format!("Could not read it: {e}")),
-    }
+    };
     #[cfg(windows)]
-    has_recycle_bin(&p)?;
+    recycle_bin_ok(&p, &meta)?;
+    #[cfg(not(windows))]
+    let _ = meta;
     // The trash crate canonicalizes only the parent and appends the name, so a link itself is
     // moved, never its target.
     ctx.delete(&p).map_err(|e| format!("Could not move it to the recycle bin: {e}"))?;
@@ -423,13 +597,33 @@ pub fn trash_paths(paths: &[String]) -> AppResult<TrashResult> {
 /// Counts files and bytes under `path`, never following a link (links are neither counted nor
 /// entered). Looks at no more than `limit` entries (`truncated: true` when it stopped there).
 /// Unreadable subfolders are skipped; an unreadable `path` is `Io`. `stop` set: `Cancelled`.
+/// Pending folders are kept as paths and opened one at a time, so at most one directory handle is
+/// open, however wide or deep the tree.
 pub fn dir_size(path: &str, limit: u64, stop: &AtomicBool) -> AppResult<LocalDirSize> {
+    dir_size_with(path, limit, stop, |p: &Path| std::fs::read_dir(p))
+}
+
+fn dir_size_with<I>(
+    path: &str,
+    limit: u64,
+    stop: &AtomicBool,
+    mut open: impl FnMut(&Path) -> std::io::Result<I>,
+) -> AppResult<LocalDirSize>
+where
+    I: Iterator<Item = std::io::Result<std::fs::DirEntry>>,
+{
     let root = check_dir(path)?;
     let mut out = LocalDirSize::default();
     let mut seen: u64 = 0;
-    let first = std::fs::read_dir(&root).map_err(|e| io_error("read", path, &e))?;
-    let mut pending = vec![first];
-    while let Some(read) = pending.pop() {
+    let mut pending: Vec<PathBuf> = Vec::new();
+    let mut current = Some(open(&root).map_err(|e| io_error("read", path, &e))?);
+    loop {
+        let Some(read) = current.take() else {
+            let Some(next) = pending.pop() else { break };
+            // An unreadable subfolder is skipped.
+            current = open(&next).ok();
+            continue;
+        };
         for entry in read {
             if stop.load(Ordering::Relaxed) {
                 return Err(AppError::cancelled());
@@ -445,14 +639,13 @@ pub fn dir_size(path: &str, limit: u64, stop: &AtomicBool) -> AppResult<LocalDir
                 continue;
             }
             if t.is_dir() {
-                if let Ok(sub) = std::fs::read_dir(entry.path()) {
-                    pending.push(sub);
-                }
+                pending.push(entry.path());
             } else if t.is_file() {
                 out.files += 1;
                 out.bytes = out.bytes.saturating_add(entry.metadata().map_or(0, |m| m.len()));
             }
         }
+        // `read` (this folder's handle) is closed here, before the next one is opened.
     }
     Ok(out)
 }
@@ -541,7 +734,8 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os(var).filter(|h| !h.is_empty()).map(PathBuf::from).filter(|p| p.is_absolute())
 }
 
-/// `list_local_roots`: Windows, every ready drive letter; elsewhere `/` and the mounts under
+/// `list_local_roots`: Windows, every ready drive letter (`drive`); elsewhere `/` (`drive`) and,
+/// as `folder` roots, the mounts under
 /// `/Volumes` (macOS) or `/media`, `/run/media` and `/mnt` (one level, a folder named after the
 /// user is looked into); then the home folder.
 pub fn roots() -> Vec<LocalRoot> {
@@ -600,7 +794,7 @@ fn plain_subdirs(dir: &Path) -> Vec<PathBuf> {
 #[cfg(not(windows))]
 fn push_mount(out: &mut Vec<LocalRoot>, p: &Path) {
     let label = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
-    out.push(LocalRoot { path: p.to_string_lossy().into_owned(), label, kind: LocalRootKind::Drive });
+    out.push(LocalRoot { path: p.to_string_lossy().into_owned(), label, kind: LocalRootKind::Folder });
 }
 
 #[cfg(test)]
@@ -888,14 +1082,95 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn the_volume_comes_from_the_canonical_verbatim_prefix() {
+        assert_eq!(verbatim_drive(Path::new(r"\\?\C:\Users\x")), Ok('C'));
+        assert_eq!(verbatim_drive(Path::new(r"\\?\d:\")), Ok('D'));
+        for bad in [
+            r"\\?\UNC\server\share\x",
+            r"\\server\share\x",
+            r"\\?\Volume{0f1e2d3c-1111-2222-3333-444455556666}\dir",
+            r"\\.\C:\x",
+            r"C:\x",
+            "relative",
+        ] {
+            assert!(verbatim_drive(Path::new(bad)).is_err(), "{bad}");
+        }
+        assert!(verbatim_drive(Path::new(r"\\?\UNC\s\h")).unwrap_err().contains("network share"));
+        assert!(verbatim_drive(Path::new(r"\\?\Volume{ab}\x")).unwrap_err().contains("without a drive letter"));
+        assert_eq!(volume_guid(r"\\?\Volume{0f1e2d3c-1111}\"), Some("{0f1e2d3c-1111}"));
+        assert_eq!(volume_guid("nothing"), None);
+        // The real C: has a volume name and readable (possibly absent) bin settings.
+        assert!(volume_name_of('C').and_then(|v| volume_guid(&v).map(str::to_string)).is_some());
+        let _ = bin_settings('C');
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_bin_must_be_enabled_and_large_enough() {
+        let on = BinSettings { nuke_on_delete: false, max_capacity_mb: Some(10) };
+        assert!(bin_accepts(on, 'C', 10 * 1024 * 1024, false).is_ok());
+        let e = bin_accepts(on, 'C', 10 * 1024 * 1024 + 1, false).unwrap_err();
+        assert!(e.contains("larger") && e.contains("11 MB") && e.contains("10 MB"), "{e}");
+        assert!(bin_accepts(on, 'C', 5, true).unwrap_err().contains("could not be confirmed"));
+        let nuke = BinSettings { nuke_on_delete: true, max_capacity_mb: None };
+        assert!(bin_accepts(nuke, 'C', 0, false).unwrap_err().contains("remove files immediately"));
+        // No capacity known: only the switch is checked.
+        assert!(bin_accepts(BinSettings::default(), 'C', u64::MAX, true).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn only_fixed_drives_have_a_recycle_bin() {
-        assert!(has_recycle_bin(Path::new(r"C:\x")).is_ok());
-        // A drive letter that is not mounted is not a fixed disk.
+        let d = ScratchDir::new("local-trash-drive");
+        std::fs::write(d.0.join("f"), b"x").expect("write");
+        let here = d.0.to_string_lossy().chars().next().map(|c| c.to_ascii_uppercase()).expect("drive");
+        assert_eq!(trash_drive(&d.0.join("f")), Ok(here));
+        // A missing folder cannot be resolved; a root has no parent.
+        assert!(trash_drive(&d.0.join("missing").join("f")).is_err());
+        assert!(trash_drive(Path::new(r"C:\")).is_err());
+        // A drive letter that is not mounted cannot be resolved either.
         // SAFETY: no arguments.
         let mask = unsafe { ffi::GetLogicalDrives() };
         if let Some(i) = (0..26u8).rev().find(|i| mask & (1 << i) == 0) {
-            let p = format!("{}:\\x", (b'A' + i) as char);
-            assert!(has_recycle_bin(Path::new(&p)).is_err(), "{p}");
+            let p = format!("{}:\\x\\y", (b'A' + i) as char);
+            assert!(trash_drive(Path::new(&p)).is_err(), "{p}");
+        }
+    }
+
+    /// A junction to a folder on another drive: the item really lives on that drive.
+    #[cfg(windows)]
+    #[test]
+    fn the_drive_of_an_item_behind_a_junction_is_the_target_drive() {
+        let d = ScratchDir::new("local-trash-junction");
+        let here = d.0.to_string_lossy().chars().next().map(|c| c.to_ascii_uppercase()).expect("drive");
+        let other_base = std::env::temp_dir();
+        let there = other_base.to_string_lossy().chars().next().map(|c| c.to_ascii_uppercase()).expect("drive");
+        if here == there {
+            println!("skipping: the scratch folder and the temp folder are both on {here}:, no second drive to point a junction at");
+            return;
+        }
+        let target = other_base.join(format!("s3x-junction-target-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&target).expect("mkdir");
+        std::fs::write(target.join("f.txt"), b"x").expect("write");
+        let link = d.0.join("link");
+        dir_link(&link, &target);
+        assert_eq!(trash_drive(&link.join("f.txt")), Ok(there), "the target's drive, not {here}:");
+        // The junction itself lives on this drive.
+        assert_eq!(trash_drive(&link), Ok(here));
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn an_existing_target_blocks_unless_it_is_the_source() {
+        let d = ScratchDir::new("local-blocked");
+        let a = d.0.join("a.txt");
+        std::fs::write(&a, b"A").expect("write");
+        std::fs::write(d.0.join("b.txt"), b"B").expect("write");
+        assert!(!blocked_by_existing(&a, &d.0.join("new.txt")).expect("absent"));
+        assert!(blocked_by_existing(&a, &d.0.join("b.txt")).expect("other"));
+        assert!(!blocked_by_existing(&a, &a).expect("itself"));
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(!blocked_by_existing(&a, &d.0.join("A.TXT")).expect("case only"));
         }
     }
 
@@ -925,6 +1200,57 @@ mod tests {
         // A set flag stops the walk.
         let e = dir_size(&s(&d.0), 100, &AtomicBool::new(true)).expect_err("stopped");
         assert!(e.is_cancelled());
+    }
+
+    /// A `read_dir` that counts how many handles are open at once.
+    struct Counted {
+        inner: std::fs::ReadDir,
+        live: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Iterator for Counted {
+        type Item = std::io::Result<std::fs::DirEntry>;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.inner.next()
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn dir_size_holds_one_handle_at_a_time() {
+        let d = ScratchDir::new("local-size-wide");
+        // 2,000 folders: 40 chains, each 50 deep, a file at every level.
+        for chain in 0..40 {
+            let mut p = d.0.join(format!("c{chain}"));
+            for level in 0..50 {
+                if level > 0 {
+                    p = p.join("d");
+                }
+                std::fs::create_dir_all(&p).expect("mkdir");
+                std::fs::write(p.join("f"), b"ab").expect("write");
+            }
+        }
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (most, opened) = (Arc::new(std::sync::atomic::AtomicUsize::new(0)), Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let open = |p: &Path| -> std::io::Result<Counted> {
+            let inner = std::fs::read_dir(p)?;
+            let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            opened.fetch_add(1, Ordering::SeqCst);
+            Ok(Counted { inner, live: live.clone() })
+        };
+        let got = dir_size_with(&s(&d.0), LOCAL_DIR_SIZE_MAX_ENTRIES, &AtomicBool::new(false), open).expect("size");
+        assert_eq!(got, LocalDirSize { files: 2000, bytes: 4000, truncated: false });
+        assert_eq!(opened.load(Ordering::SeqCst), 2001, "every folder once, plus the root");
+        assert_eq!(most.load(Ordering::SeqCst), 1, "one directory handle at a time");
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        // And through the real `read_dir`.
+        assert_eq!(dir_size(&s(&d.0), LOCAL_DIR_SIZE_MAX_ENTRIES, &AtomicBool::new(false)).expect("size"), got);
     }
 
     #[test]
@@ -986,6 +1312,8 @@ mod tests {
         let r = roots();
         assert!(r.iter().any(|x| x.kind == LocalRootKind::Home));
         assert!(r.iter().any(|x| x.kind == LocalRootKind::Drive));
+        let v = serde_json::to_value(LocalRootKind::Folder).expect("ser");
+        assert_eq!(v, "folder");
         if cfg!(windows) {
             assert!(r.iter().any(|x| x.path == r"C:\" && x.label == "C:"), "{r:?}");
         }

@@ -436,7 +436,7 @@ mod tests {
                     kind: JobKind::Delete,
                     src_bucket: "b".into(),
                     dest_bucket: None,
-                    items: vec![JobItem { from: "x/".into(), to: None, is_prefix: true }],
+                    items: vec![JobItem { from: "x/".into(), to: None, is_prefix: true, etag: None }],
                     on_conflict: ConflictPolicy::Skip,
                     tags: None,
                     restore: None,

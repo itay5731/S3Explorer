@@ -79,7 +79,7 @@ async fn delete_prefix(client: &aws_sdk_s3::Client, bucket: &str, prefix: &str) 
         kind: JobKind::Delete,
         src_bucket: bucket.into(),
         dest_bucket: None,
-        items: vec![JobItem { from: prefix.into(), to: None, is_prefix: true }],
+        items: vec![JobItem { from: prefix.into(), to: None, is_prefix: true, etag: None }],
         on_conflict: ConflictPolicy::Skip,
         tags: None,
         restore: None,

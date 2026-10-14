@@ -150,6 +150,14 @@ pub fn validate(req: &JobRequest) -> AppResult<()> {
                 it.from
             )));
         }
+        if it.etag.is_some() && (req.kind != JobKind::Delete || it.is_prefix) {
+            return Err(AppError::invalid(format!(
+                "{at}.etag is only allowed on single objects of a delete job; it must be null here"
+            )));
+        }
+        if it.etag.as_deref().is_some_and(str::is_empty) {
+            return Err(AppError::invalid(format!("{at}.etag must not be empty")));
+        }
         if !transfer {
             if it.to.is_some() {
                 return Err(AppError::invalid(format!("{at}.to must be null for {verb}")));
@@ -227,10 +235,10 @@ mod tests {
     use crate::models::{ConflictPolicy, JobItem};
 
     fn obj(from: &str, to: Option<&str>) -> JobItem {
-        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false }
+        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false, etag: None }
     }
     fn pre(from: &str, to: Option<&str>) -> JobItem {
-        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: true }
+        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: true, etag: None }
     }
     fn req(kind: JobKind, dest: Option<&str>, items: Vec<JobItem>) -> JobRequest {
         JobRequest {

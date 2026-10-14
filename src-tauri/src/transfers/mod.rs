@@ -178,6 +178,11 @@ impl TransferEntry {
         r.parts_total = parts_total;
     }
 
+    /// v0.9.0: the ETag a download is pinned to (shown in `Transfer.etag`).
+    fn set_etag(&self, etag: Option<String>) {
+        self.lock().etag = etag;
+    }
+
     fn add_bytes(&self, n: u64) {
         self.transferred.fetch_add(n, Ordering::Relaxed);
     }
@@ -530,6 +535,7 @@ impl TransferManager {
             error: None,
             started_at: now_iso(),
             finished_at: None,
+            etag: None,
         };
         let cancel = link.as_ref().map_or_else(CancellationToken::new, |l| l.cancel.child_token());
         let limit = match kind {
@@ -1049,6 +1055,9 @@ mod tests {
             assert!(r.query.contains("versionId=3HL4kq.v%2F1"), "{} {} without the version: {}", r.method, r.path, r.query);
         }
         assert!(reqs.iter().filter(|r| r.method == "GET").all(|r| r.header("if-match") == Some("\"v1\"")), "still pinned by If-Match");
+        // v0.9.0: the pinned ETag is on the transfer record (and so in its events and list_transfers).
+        assert_eq!(t.etag.as_deref(), Some("\"v1\""));
+        assert_eq!(serde_json::to_value(&t).expect("ser")["etag"], "\"v1\"");
         assert!(tm.start_version_download(s3.client(), "b", "k", "", dir.0.join("x")).is_err(), "empty version id");
 
         // A version that does not exist: HeadObject's bare 404 names the version.
@@ -1504,6 +1513,7 @@ mod tests {
             error: None,
             started_at: now_iso(),
             finished_at: None,
+            etag: None,
         };
         let entry = Arc::new(TransferEntry::new(0, record, CancellationToken::new(), None, Arc::new(Limiter::new(None))));
         let jobs = [

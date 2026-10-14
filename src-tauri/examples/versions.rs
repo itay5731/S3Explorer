@@ -423,7 +423,7 @@ async fn archive_scenarios(c: &Client) -> Res<()> {
         restore: Some(req(tier, 7)),
     };
     let before = snapshot(c, PLAIN).await?;
-    let id = jm.start(job_req(vec![JobItem { from: prefix.into(), to: None, is_prefix: true }], RestoreTier::Bulk), c.clone(), None)?;
+    let id = jm.start(job_req(vec![JobItem { from: prefix.into(), to: None, is_prefix: true, etag: None }], RestoreTier::Bulk), c.clone(), None)?;
     let j = jm.wait(&id).await.ok_or("unknown job")?;
     check(
         j.status == JobStatus::Completed && (j.total_items, j.done_items, j.skipped_items, j.failed_items) == (3, 0, 3, 0),
@@ -435,13 +435,13 @@ async fn archive_scenarios(c: &Client) -> Res<()> {
         ev.first().is_some_and(|e| e.status == JobStatus::Queued) && ev.last().is_some_and(|e| e.phase == JobPhase::Done && e.finished_at.is_some()),
         "first event queued, last carries finishedAt",
     )?;
-    let id = jm.start(job_req(vec![JobItem { from: "cold/".into(), to: None, is_prefix: true }], RestoreTier::Standard), c.clone(), None)?;
+    let id = jm.start(job_req(vec![JobItem { from: "cold/".into(), to: None, is_prefix: true, etag: None }], RestoreTier::Standard), c.clone(), None)?;
     let j = jm.wait(&id).await.ok_or("unknown job")?;
     check(
         j.status == JobStatus::Failed && j.error.as_deref().is_some_and(|e| e.starts_with("Stopped: This server does not support restoring")),
         &format!("restore job on archived objects stops: {:?}", j.error),
     )?;
-    let id = jm.start(job_req(vec![JobItem { from: "cold/d.txt".into(), to: None, is_prefix: false }], RestoreTier::Expedited), c.clone(), None)?;
+    let id = jm.start(job_req(vec![JobItem { from: "cold/d.txt".into(), to: None, is_prefix: false, etag: None }], RestoreTier::Expedited), c.clone(), None)?;
     let j = jm.wait(&id).await.ok_or("unknown job")?;
     check(
         j.failed_items == 1 && j.errors.first().map(|e| e.message.as_str()) == Some(archive::EXPEDITED_DEEP_ARCHIVE),
@@ -511,7 +511,7 @@ async fn disconnect_scenario(endpoint: &str, ak: &str, sk: &str, dir: &Path) -> 
             kind: JobKind::Copy,
             src_bucket: PLAIN.into(),
             dest_bucket: Some(PLAIN.into()),
-            items: vec![JobItem { from: "dc/job/".into(), to: Some("dc/copy/".into()), is_prefix: true }],
+            items: vec![JobItem { from: "dc/job/".into(), to: Some("dc/copy/".into()), is_prefix: true, etag: None }],
             on_conflict: ConflictPolicy::Overwrite,
             tags: None,
             restore: None,

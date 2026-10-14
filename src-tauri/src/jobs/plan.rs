@@ -128,8 +128,9 @@ impl Expansion {
                     self.missing.push(JobError { key: item.from.clone(), message: message.into() });
                 }
             }
+            // A delete item may carry the ETag to delete conditionally on (v0.9.0).
             ItemListing::Unchecked => {
-                push(Listed { key: item.from.clone(), size: 0, etag: None, storage_class: None }, self)
+                push(Listed { key: item.from.clone(), size: 0, etag: item.etag.clone(), storage_class: None }, self)
             }
         }
     }
@@ -300,7 +301,7 @@ mod tests {
         Listed { key: key.into(), size, etag: Some(format!("\"{key}\"")), storage_class: None }
     }
     fn item(from: &str, to: Option<&str>, is_prefix: bool) -> JobItem {
-        JobItem { from: from.into(), to: to.map(Into::into), is_prefix }
+        JobItem { from: from.into(), to: to.map(Into::into), is_prefix, etag: None }
     }
 
     #[test]

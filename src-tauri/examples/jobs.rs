@@ -229,10 +229,10 @@ fn phase_rank(p: JobPhase) -> u8 {
 }
 
 fn obj(from: &str, to: Option<&str>) -> JobItem {
-    JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false }
+    JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false, etag: None }
 }
 fn pre(from: &str, to: Option<&str>) -> JobItem {
-    JobItem { from: from.into(), to: to.map(Into::into), is_prefix: true }
+    JobItem { from: from.into(), to: to.map(Into::into), is_prefix: true, etag: None }
 }
 fn req(kind: JobKind, dest: Option<&str>, items: Vec<JobItem>, on_conflict: ConflictPolicy) -> JobRequest {
     JobRequest { kind, src_bucket: A.into(), dest_bucket: dest.map(Into::into), items, on_conflict, tags: None, restore: None }

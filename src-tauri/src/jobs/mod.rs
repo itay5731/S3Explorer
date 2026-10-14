@@ -462,7 +462,7 @@ mod tests {
     }
 
     fn obj(from: &str, to: Option<&str>) -> JobItem {
-        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false }
+        JobItem { from: from.into(), to: to.map(Into::into), is_prefix: false, etag: None }
     }
 
     fn request(kind: JobKind, items: Vec<JobItem>) -> JobRequest {
@@ -545,7 +545,7 @@ mod tests {
     async fn restore_job_restores_only_what_needs_it() {
         use crate::models::RestoreTier;
         let s3 = archive_server().await;
-        let items = vec![JobItem { from: "p/".into(), to: None, is_prefix: true }, obj("gone", None)];
+        let items = vec![JobItem { from: "p/".into(), to: None, is_prefix: true, etag: None }, obj("gone", None)];
         let (j, _) = run(restore_request(items, RestoreTier::Standard), &s3.client()).await;
         assert_eq!(j.status, JobStatus::Failed, "the missing object fails: {j:?}");
         assert_eq!((j.total_items, j.done_items, j.skipped_items, j.failed_items), (7, 2, 4, 1), "{j:?}");
@@ -859,7 +859,7 @@ mod tests {
             }
         })
         .await;
-        let req = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true }]);
+        let req = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true, etag: None }]);
         let (j, _) = run(req, &s3.client()).await;
         assert_eq!((j.status, j.total_items, j.done_items), (JobStatus::Completed, 2, 2));
         let del = s3.requests().into_iter().find(is_delete).expect("delete");
@@ -874,7 +874,7 @@ mod tests {
             }
         })
         .await;
-        let req = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true }]);
+        let req = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true, etag: None }]);
         let (j, _) = run(req, &s3.client()).await;
         assert_eq!(j.status, JobStatus::Failed);
         assert!(j.error.as_deref().unwrap_or_default().contains("same continuation token"), "{:?}", j.error);
@@ -901,7 +901,7 @@ mod tests {
             _ => Reply::status(500),
         })
         .await;
-        let req = request(JobKind::Move, vec![JobItem { from: "s/".into(), to: Some("d/".into()), is_prefix: true }]);
+        let req = request(JobKind::Move, vec![JobItem { from: "s/".into(), to: Some("d/".into()), is_prefix: true, etag: None }]);
         let (j, _) = run(req, &s3.client()).await;
         (j, s3)
     }
@@ -1016,7 +1016,7 @@ mod tests {
             kind: JobKind::Copy,
             src_bucket: "a".into(),
             dest_bucket: Some("a".into()),
-            items: vec![crate::models::JobItem { from: "x/".into(), to: Some("x/y/".into()), is_prefix: true }],
+            items: vec![crate::models::JobItem { from: "x/".into(), to: Some("x/y/".into()), is_prefix: true, etag: None }],
             on_conflict: ConflictPolicy::Skip,
             tags: None,
             restore: None,
@@ -1084,5 +1084,117 @@ mod tests {
         assert!(t.len() >= 4, "only {} events", t.len());
         let min = t.windows(2).map(|w| w[1].duration_since(w[0])).min().unwrap_or_default();
         assert!(min >= TICK - Duration::from_millis(1), "events {min:?} apart");
+    }
+    // ---- v0.9.0: delete jobs pinned to an ETag (S3 -> local move) ----
+
+    /// A bucket of key -> ETag that honours (or, `conditional: false`, rejects with 501) the
+    /// per-object `<ETag>` of DeleteObjects.
+    async fn conditional_bucket(
+        objects: &[(&str, &str)],
+        conditional: bool,
+    ) -> (FakeS3, Arc<Mutex<std::collections::BTreeMap<String, String>>>) {
+        let bucket: Arc<Mutex<std::collections::BTreeMap<String, String>>> =
+            Arc::new(Mutex::new(objects.iter().map(|(k, e)| (k.to_string(), e.to_string())).collect()));
+        let b = bucket.clone();
+        let s3 = FakeS3::start(move |r| {
+            if !is_delete(r) {
+                return Reply::status(500);
+            }
+            let body = String::from_utf8_lossy(&r.body).replace("&quot;", "\"").replace("&#34;", "\"");
+            let wanted: Vec<(String, Option<String>)> = body
+                .split("<Object>")
+                .skip(1)
+                .filter_map(|o| {
+                    let o = o.split("</Object>").next()?;
+                    let key = o.split("<Key>").nth(1)?.split("</Key>").next()?.to_string();
+                    let etag = o.split("<ETag>").nth(1).and_then(|e| e.split("</ETag>").next()).map(str::to_string);
+                    Some((key, etag))
+                })
+                .collect();
+            if !conditional && wanted.iter().any(|(_, e)| e.is_some()) {
+                return Reply::xml(501, "<Error><Code>NotImplemented</Code><Message>no conditional deletes</Message></Error>");
+            }
+            let mut map = b.lock().expect("bucket");
+            let (mut deleted, mut errors) = (Vec::new(), Vec::new());
+            for (k, etag) in &wanted {
+                match (map.get(k), etag) {
+                    (Some(have), Some(want)) if have != want => errors.push((k.clone(), "PreconditionFailed")),
+                    _ => {
+                        map.remove(k);
+                        deleted.push(k.clone());
+                    }
+                }
+            }
+            let d: Vec<&str> = deleted.iter().map(String::as_str).collect();
+            let e: Vec<(Option<&str>, &str)> = errors.iter().map(|(k, c)| (Some(k.as_str()), *c)).collect();
+            Reply::xml(200, &delete_result(&d, &e))
+        })
+        .await;
+        (s3, bucket)
+    }
+
+    fn pinned(from: &str, etag: Option<&str>) -> JobItem {
+        JobItem { from: from.into(), to: None, is_prefix: false, etag: etag.map(Into::into) }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delete_pinned_to_an_etag_leaves_a_changed_object() {
+        let (s3, bucket) =
+            conditional_bucket(&[("same", "\"v1\""), ("changed", "\"v2\""), ("plain", "\"p\""), ("untouched", "\"u\"")], true).await;
+        let req = request(
+            JobKind::Delete,
+            vec![pinned("same", Some("\"v1\"")), pinned("changed", Some("\"v1\"")), pinned("plain", None)],
+        );
+        let (j, _) = run(req, &s3.client()).await;
+        // A changed object is a per-object failure, not a job failure.
+        assert_eq!(j.error, None, "{j:?}");
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Failed, 2, 1), "{j:?}");
+        assert_eq!((j.errors[0].key.as_str(), j.errors[0].message.as_str()), ("changed", engine::CHANGED_NOT_DELETED));
+        // What survived: the changed object and the one never asked for.
+        let left: Vec<(String, String)> = bucket.lock().expect("bucket").clone().into_iter().collect();
+        assert_eq!(left, [("changed".to_string(), "\"v2\"".to_string()), ("untouched".to_string(), "\"u\"".to_string())]);
+        // The ETag went only with the pinned keys.
+        let sent = s3.requests().into_iter().find(is_delete).expect("delete");
+        let body = String::from_utf8_lossy(&sent.body).replace("&quot;", "\"").replace("&#34;", "\"");
+        assert_eq!(body.matches("<ETag>").count(), 2, "{body}");
+        assert!(body.contains("<Key>plain</Key></Object>"), "{body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_matching_etag_deletes() {
+        let (s3, bucket) = conditional_bucket(&[("a", "\"1\""), ("b", "\"2\"")], true).await;
+        let req = request(JobKind::Delete, vec![pinned("a", Some("\"1\"")), pinned("b", Some("\"2\""))]);
+        let (j, _) = run(req, &s3.client()).await;
+        assert_eq!((j.status, j.done_items, j.failed_items), (JobStatus::Completed, 2, 0), "{j:?}");
+        assert!(bucket.lock().expect("bucket").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_without_conditional_deletes_falls_back() {
+        let (s3, bucket) = conditional_bucket(&[("a", "\"1\""), ("keep", "\"k\"")], false).await;
+        let (j, _) = run(request(JobKind::Delete, vec![pinned("a", Some("\"1\""))]), &s3.client()).await;
+        assert_eq!((j.status, j.done_items), (JobStatus::Completed, 1), "{j:?}");
+        assert_eq!(s3.count(is_delete), 2, "once with the ETag, once without");
+        let left: Vec<String> = bucket.lock().expect("bucket").keys().cloned().collect();
+        assert_eq!(left, ["keep"]);
+    }
+
+    #[test]
+    fn etag_only_on_single_objects_of_a_delete_job() {
+        let ok = request(JobKind::Delete, vec![pinned("a", Some("\"1\"")), pinned("b", None)]);
+        assert!(validate::validate(&ok).is_ok());
+        let prefix = request(JobKind::Delete, vec![JobItem { from: "p/".into(), to: None, is_prefix: true, etag: Some("\"1\"".into()) }]);
+        let copy = request(JobKind::Copy, vec![JobItem { from: "a".into(), to: Some("b".into()), is_prefix: false, etag: Some("\"1\"".into()) }]);
+        let empty = request(JobKind::Delete, vec![pinned("a", Some(""))]);
+        for bad in [prefix, copy, empty] {
+            let e = validate::validate(&bad).expect_err("etag refused");
+            assert!(e.message.contains("etag"), "{}", e.message);
+        }
+        // camelCase on the wire, optional.
+        let item: JobItem = serde_json::from_value(serde_json::json!({"from": "a", "to": null, "isPrefix": false})).expect("de");
+        assert_eq!(item.etag, None);
+        let item: JobItem =
+            serde_json::from_value(serde_json::json!({"from": "a", "to": null, "isPrefix": false, "etag": "\"e\""})).expect("de");
+        assert_eq!(item.etag.as_deref(), Some("\"e\""));
     }
 }

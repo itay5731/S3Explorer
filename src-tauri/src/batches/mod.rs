@@ -630,6 +630,7 @@ mod tests {
             error: error.map(str::to_string),
             started_at: now_iso(),
             finished_at: Some(now_iso()),
+            etag: None,
         }
     }
 

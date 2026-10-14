@@ -213,6 +213,7 @@ mod tests {
             error: None,
             started_at: String::new(),
             finished_at: None,
+            etag: None,
         }
     }
 

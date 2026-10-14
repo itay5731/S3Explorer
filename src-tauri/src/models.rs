@@ -243,6 +243,10 @@ pub struct Transfer {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// v0.9.0: the ETag a download was pinned to (`If-Match` on every part); `None` for uploads
+    /// or when the server sent none.
+    #[serde(default)]
+    pub etag: Option<String>,
 }
 
 pub const TRANSFER_PROGRESS_EVENT: &str = "transfer:progress";
@@ -887,6 +891,10 @@ pub struct JobItem {
     #[serde(default)]
     pub to: Option<String>,
     pub is_prefix: bool,
+    /// v0.9.0, delete jobs and single objects only: delete only if the object still has this ETag
+    /// (`If-Match`); an object that changed is reported "changed on S3, not deleted".
+    #[serde(default)]
+    pub etag: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1501,6 +1509,7 @@ mod tests {
             error: None,
             started_at: now_iso(),
             finished_at: None,
+            etag: None,
         };
         let v = serde_json::to_value(&t).expect("ser");
         assert_eq!(v["kind"], "download");
