@@ -1502,9 +1502,12 @@ uses them, so no key can ever reload or leave the page.
 - An action that is not available right now (no selection, no bucket, no other pane, archived object)
   does nothing and shows the same disabled reason the toolbar shows, as a toast, when the key has no
   other meaning.
-- **Type to search:** a printable character typed in the file list with no modifier (or only `Shift`)
-  that is not bound to an action focuses the search box with that character typed, so searching starts
-  without `Mod+F`.
+- **Type to jump (v0.9.0, replaces type-to-search):** printable characters typed in the file list with no
+  modifier (or only `Shift`) that are not bound to an action build a prefix (reset 1 s after the last key,
+  `Backspace` removes a character, `Escape` clears) and move focus and selection to the first visible row
+  whose name starts with it, case-insensitively, like Windows Explorer; typing the same single letter again
+  cycles through rows starting with it. No match: nothing moves. Works in S3 panes, local panes and search
+  results. The bucket search box is reached with its own keys (`Mod+F`, `/`, `Alt+F7`).
 - `Escape` in the search box clears it and returns focus to the active pane's list (unchanged).
 
 #### Search as you type
@@ -2307,6 +2310,27 @@ interface LaunchRequest {
   selecting the file when a file was given. `launch:open` applies the same way at any time.
 - `--help` prints the usage to stdout and exits 0 (visible when run from a terminal); an invalid command
   line prints the usage and exits 2 before any window opens.
+
+### Source menu type-ahead
+
+In the `Alt+F1` / `Alt+F2` source menu, typing selects: the typed prefix (same rules as type-to-jump) moves the
+highlight to the first entry whose label starts with it (a drive letter like `d` selects `D:\`; `ac` selects the
+first bucket starting with "ac"); `Enter` opens it, `Escape` closes. The same applies to the path-bar source menu.
+
+### Dialog default buttons
+
+Confirmation dialogs for copy, move, folder transfers and cross-pane transfers focus their **action** button
+(Copy / Move / Download / Upload) when they open, so `Enter` confirms; `Escape` cancels. The delete and
+recycle-bin confirmations keep focusing **Cancel** (deleting must never be one accidental `Enter` away).
+
+### Performance budget
+
+Interactions must feel instant on the dev build: switching panes (`Tab`), tabs (`Mod+Tab`) and rows (arrows) run
+no more than one render of the components that actually change (the two pane shells, the two tables' rows that
+gained or lost focus) and under 16 ms of main-thread work in the mock at 10,000 rows; a keydown that is not
+bound costs no store writes and no DOM queries beyond the focused element. Transfer progress events never
+render tables, path bars, tab strips or the sidebar. Measured with the browser harness (CDP Performance
+profile) and asserted in the suite.
 
 ### Scope note
 
